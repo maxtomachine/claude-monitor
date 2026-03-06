@@ -1,0 +1,197 @@
+# Claude Monitor
+
+A btop-style terminal dashboard for monitoring Claude Code sessions in real-time.
+
+![Python](https://img.shields.io/badge/python-3.12+-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+## What it does
+
+Claude Monitor watches your `~/.claude/projects/` session logs and displays a live-updating table of all active sessions. Built for power users running multiple Claude Code instances in parallel.
+
+```
+● WORKING   Build session monitor TUI    maxkirby   Opus 4.6   ██████████ 95%   —   245k   $3.42   0s
+○ WAITING   Delete empty Gmail drafts    maxkirby   Opus 4.6   ████░░░░░░ 38%   ✻✻  1.2M   $676    9m
+◌ IDLE      Refactor auth middleware     Projects   Sonnet 4.6 ██░░░░░░░░ 15%   ✻✻✻ 890k   $12.50  2h
+```
+
+### Features
+
+- **Live session table** — auto-refreshes every 3 seconds
+- **Context bar** — colored progress bar (green → yellow → red as context depletes)
+- **Compaction tracking** — colored ✻ markers show how many times context was compacted
+- **Cost estimation** — per-session cost based on model pricing and token counts
+- **MCP tool call counts** — see which sessions are heavy MCP users
+- **Subagent tree view** — expand sessions to see their subagents indented below
+- **Activity preview** — detail panel shows last tool used and last assistant message
+- **Session duration** — how long each session has been running
+- **Sort modes** — cycle through: last active, status, context %, tokens, cost
+- **Search/filter** — `/` to filter sessions by name, project, status, or model
+- **Column picker** — toggle columns on/off, preferences saved to disk
+- **Context menu** — Enter on any session for: jump to terminal, copy ID, open remote control, reveal transcript
+- **Pause all** — send SIGINT to all working Claude Code processes
+- **Remote control URLs** — open `claude.ai/code/session_*` links directly
+
+### Keyboard shortcuts
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` / ↑ / ↓ | Navigate sessions |
+| `Enter` | Open context menu for selected session |
+| `s` | Cycle sort mode |
+| `t` | Toggle subagent tree view |
+| `c` | Open column picker |
+| `p` | Pause all working sessions |
+| `/` | Search / filter |
+| `Esc` | Clear search |
+| `r` | Manual refresh |
+| `q` | Quit |
+
+## Install
+
+Requires Python 3.12+ and [uv](https://github.com/astral-sh/uv).
+
+```bash
+git clone https://github.com/YOUR_USERNAME/claude-monitor.git
+cd claude-monitor
+uv sync
+```
+
+### Quick launch script
+
+```bash
+cat > ~/.local/bin/claude-monitor << 'EOF'
+#!/usr/bin/env bash
+cd ~/Projects/claude-monitor && uv run python claude_monitor.py "$@"
+EOF
+chmod +x ~/.local/bin/claude-monitor
+```
+
+Then run `claude-monitor` from anywhere.
+
+## How it works
+
+1. **Session discovery** — scans `~/.claude/projects/**/*.jsonl` for files modified in the last 24 hours
+2. **Full file parse** — single-pass scan of each JSONL for tokens, MCP calls, tool activity, timestamps, custom titles
+3. **Status detection** — checks `~/.claude/session-signals/` for hook-based status, falls back to timing heuristics (< 30s = working, < 5min = waiting, else idle)
+4. **Index metadata** — reads `sessions-index.json` for AI-generated summaries and project names
+5. **Subagent detection** — finds `{session_id}/subagents/*.jsonl` directories, counts `agent-acompact-*` files as compactions
+
+### Data sources
+
+| Data | Source |
+|------|--------|
+| Session list | `~/.claude/projects/**/*.jsonl` (by mtime) |
+| Session name | `/rename` → `custom-title` event in JSONL |
+| Session summary | `sessions-index.json` → `summary` field |
+| Status | Signal files or timing heuristics |
+| Tokens / cost | Accumulated from `usage` blocks in assistant messages |
+| MCP calls | Count of `"mcp__"` occurrences in JSONL |
+| Compactions | Count of `agent-acompact-*.jsonl` in subagents dir |
+| Remote URL | `slug` field → `https://claude.ai/code/session_{slug}` |
+| Last activity | Last `tool_use` block + gerund mapping |
+
+### Optional: session state hooks
+
+For more accurate status detection, add hooks to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [{"matcher": "", "hooks": [{"type": "command", "command": "echo working > ~/.claude/session-signals/$CLAUDE_SESSION_ID"}]}],
+    "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "echo stop > ~/.claude/session-signals/$CLAUDE_SESSION_ID"}]}]
+  }
+}
+```
+
+## Configuration
+
+Preferences are saved to `~/.claude/monitor-prefs.json`:
+
+```json
+{
+  "columns": ["status", "session", "project", "model", "context", "compact", "tokens", "cost", "active"]
+}
+```
+
+Use the column picker (`c`) to customize which columns are visible.
+
+### Available columns
+
+| Column | Description | Default |
+|--------|-------------|---------|
+| Status | Working / Waiting / Idle with color | ✓ |
+| Session | Name or AI summary | ✓ |
+| Project | Project directory | ✓ |
+| Model | Opus 4.6, Sonnet 4.6, etc. | ✓ |
+| Context | Colored bar + percentage | ✓ |
+| Compacts | ✻ markers for compaction count | ✓ |
+| Tokens | Total token count | ✓ |
+| Cost | Estimated $ spent | ✓ |
+| MCP | MCP tool call count | |
+| Msgs | Message count | |
+| Duration | Session lifetime | |
+| Active | Time since last activity | ✓ |
+
+## Roadmap
+
+- [ ] AI-generated gerund summaries — "Scanning Gmail", "Refactoring auth"
+- [ ] Exact Ghostty tab focus — match sessions to terminal tabs by cwd
+- [ ] macOS menu bar companion — session count + status in the menu bar
+- [ ] Notification on session completion
+- [ ] Historical cost tracking across sessions
+
+---
+
+# Companion: Custom Statusline
+
+A two-line statusline script for Claude Code that shows session context at a glance.
+
+```
+testing-renaming | maximillian.kirby@gmail.com
+context: 74% left | 89k tokens | $2.05 cost | Opus 4.6
+```
+
+### Statusline features
+
+- **Line 1**: Session name (via `/rename`) or cwd, plus account email (dimmed)
+- **Line 2**: Context remaining, total tokens, cost, model
+- **Color rules**: context turns yellow below 50%, red with ⚠ below 25%
+- **Dynamic**: email from `claude auth status`, session name from JSONL transcript
+
+### Statusline install
+
+Place the script at `~/.claude/statusline.sh` and add to `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "bash ~/.claude/statusline.sh"
+  }
+}
+```
+
+### Statusline JSON input reference
+
+The script receives JSON on stdin:
+
+| Field | Description |
+|-------|-------------|
+| `session_id` | Current session UUID |
+| `transcript_path` | Path to session JSONL |
+| `cwd` | Working directory |
+| `model.id` / `model.display_name` | Model info (object, not string) |
+| `cost.total_cost_usd` | Running cost |
+| `context_window.remaining_percentage` | Context % left |
+| `context_window.total_input_tokens` | Cumulative input tokens |
+| `context_window.total_output_tokens` | Cumulative output tokens |
+| `context_window.context_window_size` | Window size (e.g. 200000) |
+| `version` | Claude Code version |
+| `exceeds_200k_tokens` | Boolean |
+
+**Note**: `session_name` is NOT in the JSON. Custom names set via `/rename` must be read from the JSONL transcript (`custom-title` event type).
+
+---
+
+Built with [Textual](https://textual.textualize.io/) and [Rich](https://rich.readthedocs.io/).
