@@ -1,0 +1,25 @@
+{
+  "columns": [
+    "status",
+    "context",
+    "tokens",
+    "cost",
+    "duration",
+    "doing"
+  ],
+  "column_order": [
+    "status",
+    "session",
+    "project",
+    "model",
+    "context",
+    "compact",
+    "tokens",
+    "cost",
+    "mcp",
+    "msgs",
+    "duration",
+    "active",
+    "doing"
+  ]
+}

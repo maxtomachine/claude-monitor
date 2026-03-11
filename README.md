@@ -49,25 +49,23 @@ Claude Monitor watches your `~/.claude/projects/` session logs and displays a li
 
 ## Install
 
-Requires Python 3.12+ and [uv](https://github.com/astral-sh/uv).
+One command sets up everything — monitor TUI, statusline, launcher, and preferences:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/claude-monitor.git
-cd claude-monitor
-uv sync
+git clone https://github.com/maximilliankirby/claude-monitor.git ~/Projects/claude-monitor
+cd ~/Projects/claude-monitor
+./install.sh
 ```
 
-### Quick launch script
+This will:
+- Install `uv` and `jq` if missing
+- Set up the Python environment (`uv sync`)
+- Symlink the statusline into `~/.claude/statusline.sh`
+- Add `statusLine` config to `~/.claude/settings.json`
+- Copy monitor column preferences to `~/.claude/monitor-prefs.json`
+- Create a `claude-monitor` launcher at `~/.local/bin/claude-monitor`
 
-```bash
-cat > ~/.local/bin/claude-monitor << 'EOF'
-#!/usr/bin/env bash
-cd ~/Projects/claude-monitor && uv run python claude_monitor.py "$@"
-EOF
-chmod +x ~/.local/bin/claude-monitor
-```
-
-Then run `claude-monitor` from anywhere.
+Then restart Claude Code for the statusline, and run `claude-monitor` from anywhere for the TUI.
 
 ## How it works
 
