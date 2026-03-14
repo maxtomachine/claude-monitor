@@ -281,11 +281,9 @@ class TestArchived:
         all_sessions = [active, archived]
         active_only = [active]
 
-        call_count = 0
-
         def _mock_parse(**kwargs):
-            nonlocal call_count
-            call_count += 1
+            # side_effect (not _mock_sessions) because we return different data
+            # depending on include_archived
             if kwargs.get("include_archived"):
                 return all_sessions
             return active_only

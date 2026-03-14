@@ -24,7 +24,9 @@ jq_out=$(echo "$input" | jq -r '
 ' 2>/dev/null) && eval "$jq_out"
 cwd=${cwd##*/}
 # Strip "(1M context)" etc. from model — we already show the context bar
-model=$(echo "$model" | sed 's/ ([0-9]*[KMG] context)//')
+if [[ "$model" =~ ^(.+)\ \([0-9]+[KMG]\ context\)$ ]]; then
+  model="${BASH_REMATCH[1]}"
+fi
 
 tokens=$(awk "BEGIN {
   t = $total_input + $total_output
@@ -112,8 +114,9 @@ fi
 # DO NOT MOVE this below the bar-building sections.
 # ──────────────────────────────────────────────────────────────────────
 tw=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
-# Guard against COLUMNS=0 or other tiny values
-[ "$tw" -lt 20 ] 2>/dev/null && tw=80
+# Guard against COLUMNS=0, empty, or non-numeric values
+[[ "$tw" =~ ^[0-9]+$ ]] || tw=80
+[ "$tw" -lt 20 ] && tw=80
 
 # ──────────────────────────────────────────────────────────────────────
 # SECTION: Context bar (visual gauge)
@@ -172,7 +175,6 @@ usage_ttl=60
 quota_bar=""
 quota_reset=""
 now=$(date +%s)
-stale_usage=$(cat "$usage_cache" 2>/dev/null)
 
 cache_age=999
 if [ -f "$usage_cache" ]; then
@@ -180,7 +182,7 @@ if [ -f "$usage_cache" ]; then
 fi
 
 if [ "$cache_age" -lt "$usage_ttl" ]; then
-  usage_json="$stale_usage"
+  usage_json=$(cat "$usage_cache" 2>/dev/null)
 else
   # jq instead of python3 for keychain JSON extraction
   token=$(security find-generic-password -s "Claude Code-credentials" -a "$(whoami)" -w 2>/dev/null | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
@@ -189,7 +191,7 @@ else
     if echo "$usage_json" | jq -e '.five_hour' >/dev/null 2>&1; then
       echo "$usage_json" > "$usage_cache"
     else
-      usage_json="$stale_usage"
+      usage_json=$(cat "$usage_cache" 2>/dev/null)
     fi
   else
     usage_json="$stale_usage"
@@ -276,6 +278,7 @@ echo "$(date '+%H:%M:%S') OK ctx=${remaining:-?} quota=${quota_used:-?} tokens=$
 # DO NOT replace with wc -m — it will silently break at narrow widths.
 # ──────────────────────────────────────────────────────────────────────
 _vlen() {
+  # printf '%b' expands \033[... escape literals in shell vars into real bytes
   printf '%b' "$1" | perl -CS -e '
     use utf8;
     local $/; my $s = <STDIN>;
@@ -338,19 +341,25 @@ _vlen() {
   [ -n "$quota_bar" ] && all_parts+=("$quota_bar")       # ammo gauge — DO NOT REMOVE
   [ -n "$quota_reset" ] && all_parts+=("$quota_reset")    # reset timer — dropped first
 
-  # Progressive fitting: drop rightmost parts until line fits $tw
-  parts=("${all_parts[@]}")
-  while [ ${#parts[@]} -gt 1 ]; do
-    line=""
-    for ((i=0; i<${#parts[@]}; i++)); do
-      [ $i -gt 0 ] && line+=" │ "
-      line+="${parts[$i]}"
-    done
-    vl=$(_vlen "$line")
-    [ "$vl" -le "$tw" ] && break
-    unset 'parts[${#parts[@]}-1]'
-    parts=("${parts[@]}")  # reindex
+  # Pre-measure each part once, then fit by arithmetic (avoids re-spawning
+  # perl on each loop iteration — _vlen spawns a process per call)
+  declare -a _part_lens=()
+  for p in "${all_parts[@]}"; do
+    _part_lens+=("$(_vlen "$p")")
   done
+  # Accumulate widths: each separator " │ " is 3 visible chars
+  _total=${_part_lens[0]:-0}
+  keep=1
+  for ((i=1; i<${#all_parts[@]}; i++)); do
+    _next=$(( _total + 3 + _part_lens[i] ))
+    if [ "$_next" -le "$tw" ]; then
+      _total=$_next
+      keep=$((i+1))
+    else
+      break
+    fi
+  done
+  parts=("${all_parts[@]:0:$keep}")
 
   if [ ${#parts[@]} -gt 0 ]; then
     printf '%b' "${parts[0]}"

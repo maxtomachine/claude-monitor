@@ -494,6 +494,14 @@ def parse_sessions(include_archived: bool = False) -> list[Session]:
     return sessions
 
 
+def _read_session_cache(kind: str, session_id: str) -> str:
+    """Read /tmp/claude-{kind}-{session_id}, return stripped string or empty."""
+    try:
+        return Path(f"/tmp/claude-{kind}-{session_id}").read_text().strip()
+    except OSError:
+        return ""
+
+
 def build_session(path: str, session_id: str, project: str, idx: dict,
                   mtime: float, is_subagent: bool = False,
                   parent_id: str = "") -> Session | None:
@@ -502,11 +510,9 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
     status = determine_status(session_id, data["last_assistant_time"])
 
     # Context %: prefer ground-truth from statusline cache, fall back to estimate
-    ctx_cache = Path(f"/tmp/claude-ctx-{session_id}")
     try:
-        context_pct = int(ctx_cache.read_text().strip())
-    except (OSError, ValueError):
-        # Estimate from last API call's input tokens
+        context_pct = int(_read_session_cache("ctx", session_id))
+    except ValueError:
         last_input = data["last_input_tokens"]
         if last_input == 0:
             context_pct = 100
@@ -531,25 +537,14 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
     remote_url = ""
     # Slug: prefer live cache from statusline, fall back to transcript
     slug = data["slug"]
-    url_cache = Path(f"/tmp/claude-url-{session_id}")
-    try:
-        cached_url = url_cache.read_text().strip()
-        # Extract slug from URL like https://claude.ai/code/session_XXXX
-        if "/session_" in cached_url:
-            slug = cached_url.split("/session_", 1)[1]
-    except (OSError, ValueError):
-        pass
+    cached_url = _read_session_cache("url", session_id)
+    if "/session_" in cached_url:
+        slug = cached_url.split("/session_", 1)[1]
 
     if slug and not is_subagent:
         remote_url = f"https://claude.ai/code/session_{slug}"
 
-    # Read the exact session_name written by the statusline
-    status_name = ""
-    name_cache = Path(f"/tmp/claude-name-{session_id}")
-    try:
-        status_name = name_cache.read_text().strip()
-    except OSError:
-        pass
+    status_name = _read_session_cache("name", session_id)
 
     return Session(
         session_id=session_id, project=project,
