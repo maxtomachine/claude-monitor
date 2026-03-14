@@ -68,6 +68,20 @@ The statusline (`statusline/statusline.sh`) shares data with the monitor:
 - **Jump to terminal**: uses `AXRaise` + `AXMain` + `proc.frontmost` via System Events (not `tell app to activate`, which re-focuses the monitor's own window).
 - **Debug log**: jump operations log to `/tmp/claude-monitor-jump.log`.
 
+## Careful edits — avoid accidental regressions
+
+This project layers multiple technologies in unusual ways: bash statusline scripts, JXA (JavaScript for Automation) embedded in Python, TUI rendering, and macOS Accessibility APIs. These aren't standard application patterns, so there's no muscle memory for how changes ripple.
+
+**The core failure mode**: when modifying one aspect of a feature (e.g., making a bar width responsive), it's easy to silently break an adjacent feature that was working fine (e.g., the quota ammo bar disappearing). This happens because:
+
+1. **Variable ordering matters in shell scripts.** The statusline is a single-pass bash script. Moving a reference to `$tw` into an earlier section without moving its definition too silently produces empty-string comparisons — no error, just wrong behavior. Always trace where a variable is defined before referencing it in a new location.
+
+2. **No type system or compiler catches these.** Bash, JXA, and ANSI escape sequences are all stringly-typed. A broken bar doesn't throw — it just renders nothing or renders wrong. The only test is visual inspection.
+
+3. **The blast radius is invisible.** Editing the context bar section can break the quota bar section 100 lines away because they share the same responsive variable. Editing a JXA window-raise script can break tab switching because z-order changes between reads.
+
+**Before editing any section**, read the full surrounding context to understand what else depends on the same variables, ordering, or state. After making changes, visually verify ALL parts of the statusline or TUI — not just the part you changed.
+
 ## Key conventions
 
 - **No direct pushes to main** — all changes go through PRs

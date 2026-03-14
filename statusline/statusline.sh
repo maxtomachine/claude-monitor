@@ -7,7 +7,10 @@ fi
 echo "$(date '+%H:%M:%S') CALLED pid=$$" >> "$SL_LOG"
 input=$(cat)
 
-# Single jq call to extract all fields — wrapped so parse errors don't kill statusline
+# ──────────────────────────────────────────────────────────────────────
+# SECTION: JSON extraction
+# Parses the status JSON from Claude Code into shell variables.
+# ──────────────────────────────────────────────────────────────────────
 cwd="" session_name="" remaining="" total_input=0 total_output=0 cost_raw=0 model="" transcript=""
 jq_out=$(echo "$input" | jq -r '
   @sh "cwd=\(.cwd // empty)",
@@ -20,6 +23,8 @@ jq_out=$(echo "$input" | jq -r '
   @sh "transcript=\(.transcript_path // empty)"
 ' 2>/dev/null) && eval "$jq_out"
 cwd=${cwd##*/}
+# Strip "(1M context)" etc. from model — we already show the context bar
+model=$(echo "$model" | sed 's/ ([0-9]*[KMG] context)//')
 
 tokens=$(awk "BEGIN {
   t = $total_input + $total_output
@@ -30,7 +35,12 @@ tokens=$(awk "BEGIN {
 
 cost=$(printf '$%.2f' "$cost_raw")
 
-# Transcript lookups — cached by transcript mtime to avoid grepping large JSONL every render
+# ──────────────────────────────────────────────────────────────────────
+# SECTION: Transcript lookups (cached by mtime)
+# Extracts remote_url and compact_count from the JSONL transcript.
+# DO NOT REMOVE — provides the remote control URL for line 1 and
+# compaction indicators for the context bar.
+# ──────────────────────────────────────────────────────────────────────
 remote_url=""
 compact_count=0
 if [ -n "$transcript" ] && [ -f "$transcript" ]; then
@@ -72,7 +82,11 @@ DIM="\033[90m"
 SEP="\033[38;5;238m│\033[0m"
 RST="\033[0m"
 
-# Compaction indicator: colored ✻ symbols
+# ──────────────────────────────────────────────────────────────────────
+# SECTION: Compaction indicator (colored ✻ symbols)
+# Shows how many context compactions have occurred in this session.
+# DO NOT REMOVE — appended to the context bar, not a standalone part.
+# ──────────────────────────────────────────────────────────────────────
 compact_str=""
 if [ "$compact_count" -gt 0 ]; then
   if [ "$compact_count" -ge 5 ]; then
@@ -91,13 +105,26 @@ if [ "$compact_count" -gt 0 ]; then
   compact_str+="${RST}"
 fi
 
-# Context bar with danger zone
-# 10 blocks total. Last 2 = danger zone (15% ~ auto-compact)
+# ──────────────────────────────────────────────────────────────────────
+# SECTION: Terminal width
+# IMPORTANT: Must be defined BEFORE the context bar and quota bar
+# sections, because they use $tw for responsive sizing.
+# DO NOT MOVE this below the bar-building sections.
+# ──────────────────────────────────────────────────────────────────────
+tw=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
+# Guard against COLUMNS=0 or other tiny values
+[ "$tw" -lt 20 ] 2>/dev/null && tw=80
+
+# ──────────────────────────────────────────────────────────────────────
+# SECTION: Context bar (visual gauge)
+# Shows context window usage as a colored block bar.
+# Responsive: 10 blocks at ≥60 cols, 5 blocks when narrower.
+# DO NOT REMOVE — this is the primary visual indicator on line 2.
+# ──────────────────────────────────────────────────────────────────────
 ctx_bar=""
 if [ -n "$remaining" ]; then
   ctx_used=$(( 100 - remaining ))
-  width=10
-  danger=2
+  if [ "$tw" -ge 60 ]; then width=10; danger=2; else width=5; danger=1; fi
   safe=$((width - danger))
   filled=$(( ctx_used * width / 100 ))
   [ "$filled" -gt "$width" ] && filled=$width
@@ -131,10 +158,19 @@ if [ -n "$remaining" ]; then
   [ -n "$compact_str" ] && ctx_bar="${ctx_bar} ${compact_str}"
 fi
 
-# Usage quota (cached for 60s, stale fallback on API failure)
+# ──────────────────────────────────────────────────────────────────────
+# SECTION: Usage quota / ammo bar (blue gradient energy bar)
+# Shows 5-hour usage quota as a blue gradient ammo countdown.
+# Fetches from Anthropic API (cached 60s), falls back to stale data.
+# DO NOT REMOVE — this is a key visual feature. If editing nearby
+# code, verify the ammo bar still renders at ≥65 col terminals.
+# The ammo bar and reset timer are SEPARATE parts so progressive
+# fitting can drop the timer first, keeping the ammo visible.
+# ──────────────────────────────────────────────────────────────────────
 usage_cache="/tmp/claude-usage-cache.json"
 usage_ttl=60
 quota_bar=""
+quota_reset=""
 now=$(date +%s)
 stale_usage=$(cat "$usage_cache" 2>/dev/null)
 
@@ -188,7 +224,8 @@ if [ -n "$usage_json" ]; then
     fi
 
     # Ammo countdown: blue gradient energy bar (dark left → bright right)
-    rounds=10
+    # Responsive: 10 rounds at ≥60 cols, 5 at narrow
+    if [ "$tw" -ge 60 ]; then rounds=10; else rounds=5; fi
     spent=$(( quota_used * rounds / 100 ))
     [ "$spent" -gt "$rounds" ] && spent=$rounds
     ammo_remaining=$(( rounds - spent ))
@@ -206,51 +243,104 @@ if [ -n "$usage_json" ]; then
       fi
     done
 
-    quota_bar="quota ${ammo} ${quota_used}%"
-    [ -n "$time_str" ] && quota_bar="${quota_bar} resets ${time_str}"
+    # Ammo bar and reset timer are SEPARATE line-2 parts.
+    # Progressive fitting drops "resets Xm" first, keeping ammo visible.
+    quota_bar="${ammo} ${quota_used}%"
+    [ -n "$time_str" ] && quota_reset="resets ${time_str}"
   fi
 fi
 
-# Share context % and slug with claude-monitor via per-session cache
+# ──────────────────────────────────────────────────────────────────────
+# SECTION: Monitor data sharing (per-session cache files)
+# Writes ground-truth context % and remote URL to /tmp/ so the
+# claude-monitor TUI can read them instead of estimating.
+# DO NOT REMOVE — the monitor depends on these files.
+# ──────────────────────────────────────────────────────────────────────
 if [ -n "$transcript" ]; then
   _sid=$(echo "$transcript" | sed -n 's|.*/sessions/\([^/]*\)/.*|\1|p')
   if [ -n "$_sid" ]; then
     [ -n "$remaining" ] && printf '%s' "$remaining" > "/tmp/claude-ctx-${_sid}"
     [ -n "$remote_url" ] && printf '%s' "$remote_url" > "/tmp/claude-url-${_sid}"
+    [ -n "$session_name" ] && printf '%s' "$session_name" > "/tmp/claude-name-${_sid}"
   fi
 fi
 
 echo "$(date '+%H:%M:%S') OK ctx=${remaining:-?} quota=${quota_used:-?} tokens=${tokens}" >> "$SL_LOG"
 
-# Terminal width for responsive layout
-tw=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
-
-# Helper: estimate visible character count (strip all ANSI escapes)
+# ──────────────────────────────────────────────────────────────────────
+# SECTION: _vlen — visible character count
+# Strips ANSI escape sequences and counts Unicode characters.
+# IMPORTANT: Uses perl (not wc -m) because wc -m is locale-dependent
+# and counts BYTES instead of characters in pipe contexts without
+# UTF-8 locale, inflating lengths and causing parts to be dropped.
+# DO NOT replace with wc -m — it will silently break at narrow widths.
+# ──────────────────────────────────────────────────────────────────────
 _vlen() {
-  printf '%b' "$1" | perl -pe 's/\e\[[0-9;]*m//g; s/\e\]8;;[^\e]*\e\\//g' | wc -m | tr -d ' '
+  printf '%b' "$1" | perl -CS -e '
+    use utf8;
+    local $/; my $s = <STDIN>;
+    $s =~ s/\e\[[0-9;]*m//g;
+    $s =~ s/\e\]8;;[^\e]*\e\\//g;
+    print length($s);
+  '
 }
 
-# Render output — subshell so any failure emits fallback instead of nothing
+# ──────────────────────────────────────────────────────────────────────
+# SECTION: Render output
+# Line 1: session name + remote control URL (clickable hyperlink)
+# Line 2: ctx bar │ tokens │ cost │ model │ ammo │ resets
+#
+# Progressive fitting: if line 2 is wider than $tw, parts are dropped
+# from the RIGHT (lowest priority first):
+#   resets → ammo → model → cost → tokens → ctx (never dropped)
+#
+# IMPORTANT: Line 2 must ALWAYS output something. If all parts are
+# dropped, fall back to "ctx XX%". Verify both lines render at widths
+# 40, 60, 80, and 100 after ANY change to this section.
+#
+# DO NOT use wc for measuring — use _vlen (see above).
+# DO NOT remove the quota_bar or quota_reset parts — they are the
+# blue ammo bar that shows usage quota.
+# ──────────────────────────────────────────────────────────────────────
 (
   # Line 1: session name (or cwd fallback) + remote control link
+  _name="${session_name:-${cwd:-~}}"
+  # Truncate session name if wider than half the terminal
+  if [ ${#_name} -gt $(( tw / 2 )) ]; then
+    _name="${_name:0:$(( tw / 2 - 1 ))}…"
+  fi
   if [ -n "$remote_url" ]; then
-    printf '%s %b \033]8;;%s\033\\\033[90m%s\033[0m\033]8;;\033\\\n' "${session_name:-${cwd:-~}}" "$SEP" "$remote_url" "$remote_url"
+    # Truncate visible URL to fit terminal width (keep full URL in hyperlink)
+    _prefix_len=$(( ${#_name} + 3 ))  # "name │ "
+    _url_space=$(( tw - _prefix_len ))
+    _display_url="$remote_url"
+    if [ "$_url_space" -lt ${#remote_url} ] && [ "$_url_space" -gt 10 ]; then
+      _display_url="${remote_url:0:$((_url_space - 1))}…"
+    elif [ "$_url_space" -le 10 ]; then
+      _display_url=""  # too narrow, hide URL entirely
+    fi
+    if [ -n "$_display_url" ]; then
+      printf '%s %b \033]8;;%s\033\\\033[90m%s\033[0m\033]8;;\033\\\n' "$_name" "$SEP" "$remote_url" "$_display_url"
+    else
+      printf '%s\n' "$_name"
+    fi
   else
-    printf '%s %b \033[90mremote control off\033[0m\n' "${session_name:-${cwd:-~}}" "$SEP"
+    printf '%s %b \033[90mremote control off\033[0m\n' "$_name" "$SEP"
   fi
 
-  # Line 2: ctx bar | tokens | cost | model | quota ammo
-  # Priority order: ctx is most important, quota least (dropped first)
+  # Line 2: ctx bar │ tokens │ cost │ model │ ammo │ resets
+  # Parts listed in priority order (rightmost dropped first)
   all_parts=()
   [ -n "$ctx_bar" ] && all_parts+=("$ctx_bar")
   [ -n "$tokens" ] && all_parts+=("${tokens} tok")
   [ -n "$cost" ] && all_parts+=("${cost}")
   [ -n "$model" ] && all_parts+=("$model")
-  [ -n "$quota_bar" ] && all_parts+=("$quota_bar")
+  [ -n "$quota_bar" ] && all_parts+=("$quota_bar")       # ammo gauge — DO NOT REMOVE
+  [ -n "$quota_reset" ] && all_parts+=("$quota_reset")    # reset timer — dropped first
 
-  # Try full line first, drop rightmost parts until it fits
+  # Progressive fitting: drop rightmost parts until line fits $tw
   parts=("${all_parts[@]}")
-  while [ ${#parts[@]} -gt 0 ]; do
+  while [ ${#parts[@]} -gt 1 ]; do
     line=""
     for ((i=0; i<${#parts[@]}; i++)); do
       [ $i -gt 0 ] && line+=" │ "

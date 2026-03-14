@@ -275,6 +275,31 @@ class TestArchived:
                 await pilot.pause()
                 assert pilot.app.show_archived is False
 
+    async def test_archived_sessions_appear_when_toggled(self):
+        active = make_session(session_id="active-1", title="Active")
+        archived = make_session(session_id="old-1", title="Old Session", status="archived")
+        all_sessions = [active, archived]
+        active_only = [active]
+
+        call_count = 0
+
+        def _mock_parse(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if kwargs.get("include_archived"):
+                return all_sessions
+            return active_only
+
+        with patch("claude_monitor.parse_sessions", side_effect=_mock_parse):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                assert table.row_count == 1  # only active
+                await pilot.press("z")
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                assert table.row_count == 2  # active + archived
+
     async def test_archived_menu_shows_resume(self):
         s = make_session(session_id="old-1", title="Old Session", status="archived")
         with _mock_sessions([s]):
