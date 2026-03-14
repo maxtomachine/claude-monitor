@@ -1,6 +1,31 @@
 # Jump to Terminal — Bug Investigation File
 
-## Status: UNSOLVED — Intermittent wrong-window targeting
+## Status: SOLVED (2026-03-14)
+
+### The Fix: Title Matching
+
+The breakthrough was realizing Claude Code already sets terminal titles to `{emoji} session_name` (e.g., `✳ jump-to-claude-fix`). Instead of reading AXTextArea content (fragile, fails for inactive tabs, causes visual cycling), we match on `wins[i].name()` — the window title. This is:
+
+- **Instant** — no content reading, no delays
+- **Tab-safe** — each tab has its own title, readable without AXRaise
+- **No cycling** — single AXRaise on the matched window only
+
+### Strategy (in priority order)
+
+1. **Title match**: Scan all window titles for the session name. If exactly one matches, raise it instantly. If multiple match, disambiguate with AXTextArea content. Works for all renamed sessions including inactive tabs.
+
+2. **Content fallback**: For unrenamed sessions (all titled "Claude Code"), read AXTextArea of each window (no AXRaise) and match `"name │"` in the statusline. Works for separate windows and the active tab.
+
+3. **No speculative cycling**: We do NOT AXRaise tabs speculatively. If both passes miss, we accept the miss rather than jarring the user with window cycling.
+
+### Supporting changes
+
+- **Statusline writes session_name**: `statusline.sh` writes `session_name` to `/tmp/claude-name-{sid}` for the monitor to read as the match string (three-level fallback: fresh file > `session.status_name` > `session.title`).
+- **Skip wins[0]**: The monitor is always frontmost when the user triggers "jump", so wins[0] is always the monitor's own window.
+
+---
+
+## Previous Status: UNSOLVED — Intermittent wrong-window targeting
 
 ## The Problem
 

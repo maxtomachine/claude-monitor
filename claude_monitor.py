@@ -1005,13 +1005,16 @@ def _jump_log(msg: str) -> None:
 def _raise_window_by_content(session: Session, app_name: str) -> bool:
     """Raise the terminal window/tab containing a specific Claude session.
 
-    Matches by the session name visible in the statusline (format:
-    "name │ url"). Uses three-level fallback for the match string:
-    fresh /tmp file > cached status_name > transcript title.
-
-    Skips wins[0] (the monitor's own window — it's frontmost when the
-    user triggers "jump"). Uses window position as stable key for the
-    tab-switching second pass to avoid z-order instability.
+    Strategy (designed for instant cmd-tab feel):
+      1. Title match — Claude Code sets terminal titles to "{emoji} name".
+         Match on window title directly. Instant, no AXRaise cycling,
+         works even for inactive tabs. Handles renamed sessions perfectly.
+      2. AXTextArea fallback — for unrenamed sessions (all titled "Claude
+         Code"), read terminal content and match "name │" in statusline.
+         Only works for the active tab in each physical window.
+      3. No cycling pass — we do NOT AXRaise tabs speculatively. If title
+         match and AXTextArea both miss, we accept the miss rather than
+         jarring the user with window cycling.
 
     Uses AXRaise + AXMain + proc.frontmost (not `tell app to activate`)
     to avoid re-focusing the monitor's own window.
@@ -1026,16 +1029,17 @@ def _raise_window_by_content(session: Session, app_name: str) -> bool:
     except OSError:
         match_name = session.status_name or session.title or ""
 
-    match_str = f"{match_name} \u2502" if match_name else ""
-
-    proc_names = json.dumps(list({app_name.lower(), app_name}))
-    match_json = json.dumps(match_str)
-
-    _jump_log(f"_raise_window_by_content app={app_name} match={match_str!r}")
-
-    if not match_str:
+    if not match_name:
         _jump_log("  no match name — cannot match")
         return False
+
+    match_str = f"{match_name} \u2502"
+
+    proc_names = json.dumps(list({app_name.lower(), app_name}))
+    match_name_json = json.dumps(match_name)
+    match_str_json = json.dumps(match_str)
+
+    _jump_log(f"_raise_window_by_content app={app_name} name={match_name!r}")
 
     jxa = f"""(() => {{
         const se = Application("System Events");
@@ -1049,68 +1053,69 @@ def _raise_window_by_content(session: Session, app_name: str) -> bool:
         const wins = proc.windows();
         if (wins.length === 0) return "no_windows";
 
-        const matchStr = {match_json};
+        const matchName = {match_name_json};
+        const matchStr = {match_str_json};
         const info = [];
 
-        function readStatusline(w) {{
-            try {{
-                const full = w.groups[0].groups[0].textAreas[0].value();
-                return full.substring(full.length - 500);
-            }}
-            catch(e) {{ return ""; }}
-        }}
-
-        // First pass: check each non-frontmost window's statusline.
-        // Skip wins[0] — it's the monitor's own window (user just
-        // interacted with it, so it's frontmost in z-order).
-        const claudePositions = [];
+        // Pass 1: TITLE MATCH (instant, no visual impact)
+        // Claude Code sets terminal title to "{{emoji}} session_name".
+        // Skip wins[0] — the monitor is frontmost when user triggers jump.
+        // For tabs, each tab has its own title — no AXRaise needed.
+        const titleCandidates = [];
         for (let i = 1; i < wins.length; i++) {{
             const title = wins[i].name();
             info.push(i + ":" + title);
-            const text = readStatusline(wins[i]);
-            if (text.includes(matchStr)) {{
-                wins[i].actions["AXRaise"].perform();
-                try {{ wins[i].attributes["AXMain"].value = true; }} catch(e) {{}}
-                proc.frontmost = true;
-                return "matched:" + i + ":" + title + "|info:" + info.join("|");
-            }}
-            // Record Claude-titled windows by position for second pass
-            if (title.toLowerCase().includes("claude")) {{
-                try {{
-                    const pos = wins[i].position();
-                    const sz = wins[i].size();
-                    claudePositions.push({{x: pos[0], y: pos[1], w: sz[0], h: sz[1]}});
-                }} catch(e) {{}}
+            if (title.includes(matchName)) {{
+                titleCandidates.push(wins[i]);
             }}
         }}
 
-        // Second pass: for tabs, AXRaise switches the active tab.
-        // Re-enumerate windows fresh (z-order may have shifted during
-        // first pass) and match by position for stability.
-        if (claudePositions.length > 0) {{
-            const freshWins = proc.windows();
-            for (const cp of claudePositions) {{
-                for (let j = 0; j < freshWins.length; j++) {{
-                    let pos;
-                    try {{ pos = freshWins[j].position(); }} catch(e) {{ continue; }}
-                    if (pos[0] !== cp.x || pos[1] !== cp.y) continue;
+        // If exactly one title match, raise it immediately
+        if (titleCandidates.length === 1) {{
+            const w = titleCandidates[0];
+            w.actions["AXRaise"].perform();
+            try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
+            proc.frontmost = true;
+            return "title_matched:" + w.name() + "|info:" + info.join("|");
+        }}
 
-                    freshWins[j].actions["AXRaise"].perform();
-                    // Poll for content match (AXTextArea may be stale
-                    // after tab switch — give Ghostty time to flush)
-                    let text = "";
-                    for (let attempt = 0; attempt < 3; attempt++) {{
-                        delay(0.2);
-                        text = readStatusline(freshWins[j]);
-                        if (text.includes(matchStr)) {{
-                            try {{ freshWins[j].attributes["AXMain"].value = true; }} catch(e) {{}}
-                            proc.frontmost = true;
-                            return "tab_matched:" + j + ":" + freshWins[j].name() + "|info:" + info.join("|");
-                        }}
+        // If multiple title matches, use AXTextArea to disambiguate
+        // (e.g., two sessions with similar names)
+        if (titleCandidates.length > 1) {{
+            for (const w of titleCandidates) {{
+                try {{
+                    const full = w.groups[0].groups[0].textAreas[0].value();
+                    const tail = full.substring(full.length - 500);
+                    if (tail.includes(matchStr)) {{
+                        w.actions["AXRaise"].perform();
+                        try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
+                        proc.frontmost = true;
+                        return "title+content_matched:" + w.name() + "|info:" + info.join("|");
                     }}
-                    break;
-                }}
+                }} catch(e) {{}}
             }}
+            // Still ambiguous — just take the first one
+            const w = titleCandidates[0];
+            w.actions["AXRaise"].perform();
+            try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
+            proc.frontmost = true;
+            return "title_first:" + w.name() + "|info:" + info.join("|");
+        }}
+
+        // Pass 2: CONTENT MATCH (for unrenamed sessions titled "Claude Code")
+        // Read AXTextArea without AXRaise — works for separate windows
+        // and the active tab, but not inactive tabs.
+        for (let i = 1; i < wins.length; i++) {{
+            try {{
+                const full = wins[i].groups[0].groups[0].textAreas[0].value();
+                const tail = full.substring(full.length - 500);
+                if (tail.includes(matchStr)) {{
+                    wins[i].actions["AXRaise"].perform();
+                    try {{ wins[i].attributes["AXMain"].value = true; }} catch(e) {{}}
+                    proc.frontmost = true;
+                    return "content_matched:" + wins[i].name() + "|info:" + info.join("|");
+                }}
+            }} catch(e) {{}}
         }}
 
         return "no_match|info:" + info.join("|");
@@ -1119,12 +1124,12 @@ def _raise_window_by_content(session: Session, app_name: str) -> bool:
     try:
         result = subprocess.run(
             ["osascript", "-l", "JavaScript", "-e", jxa],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=10,
         )
         out = result.stdout.strip()
         _jump_log(f"  result: {out}")
 
-        if out.startswith("matched:") or out.startswith("tab_matched:"):
+        if "matched:" in out or out.startswith("title_first:"):
             return True
         _jump_log(f"  stderr: {result.stderr.strip()}")
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:

@@ -12,11 +12,12 @@
 - Monitor reads this instead of estimating from `last_input_tokens / 200000`
 - Eliminates the persistent mismatch between statusline and monitor context display
 
-### Jump to terminal
-- Debug logging to `/tmp/claude-monitor-jump.log`
-- Fixed: uses `AXRaise` + `AXMain` + `proc.frontmost` instead of `tell app to activate`
-- Known limitation: can't reliably map TTY→window when multiple Claude windows exist (System Events returns z-order, not creation order). Current heuristic: skip frontmost window, pick first "Claude Code" titled window.
-- Needs real-world testing
+### Jump to terminal ✓
+- **Solved**: matches on Ghostty window titles (`wins[i].name()`) instead of reading AXTextArea content
+- Claude Code sets terminal titles to `{emoji} session_name` — instant match, no cycling, works for inactive tabs
+- Fallback to AXTextArea content match for unrenamed sessions (titled "Claude Code")
+- Statusline writes `session_name` to `/tmp/claude-name-{sid}` for match string resolution
+- Debug log: `/tmp/claude-monitor-jump.log`
 
 ## Planned
 
