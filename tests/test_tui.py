@@ -77,10 +77,10 @@ class TestKeyBindings:
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
                 assert pilot.app.show_subagents is False
-                await pilot.press("t")
+                await pilot.press("a")
                 await pilot.pause()
                 assert pilot.app.show_subagents is True
-                await pilot.press("t")
+                await pilot.press("a")
                 await pilot.pause()
                 assert pilot.app.show_subagents is False
 
@@ -195,7 +195,7 @@ class TestColumnPicker:
                 await pilot.pause()
                 assert len(pilot.app.screen_stack) > 1
 
-    async def test_column_picker_escape_cancels(self, sample_sessions):
+    async def test_column_picker_escape_closes(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
@@ -262,6 +262,47 @@ class TestSearch:
                 assert table.row_count == 0
 
 
+class TestArchived:
+    async def test_archive_toggle(self, sample_sessions):
+        with _mock_sessions(sample_sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                assert pilot.app.show_archived is False
+                await pilot.press("z")
+                await pilot.pause()
+                assert pilot.app.show_archived is True
+                await pilot.press("z")
+                await pilot.pause()
+                assert pilot.app.show_archived is False
+
+    async def test_archived_menu_shows_resume(self):
+        s = make_session(session_id="old-1", title="Old Session", status="archived")
+        with _mock_sessions([s]):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause()
+                screen = pilot.app.screen
+                options = screen.query_one("#menu-options", OptionList)
+                option_ids = [options.get_option_at_index(i).id
+                              for i in range(options.option_count)]
+                assert "resume" in option_ids
+                assert "jump" not in option_ids
+
+    async def test_active_menu_shows_jump(self, sample_sessions):
+        with _mock_sessions(sample_sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause()
+                screen = pilot.app.screen
+                options = screen.query_one("#menu-options", OptionList)
+                option_ids = [options.get_option_at_index(i).id
+                              for i in range(options.option_count)]
+                assert "jump" in option_ids
+                assert "resume" not in option_ids
+
+
 class TestSubagents:
     async def test_subagents_shown_when_toggled(self):
         sub = make_session(session_id="sub-1", title="agent-1", is_subagent=True,
@@ -272,7 +313,7 @@ class TestSubagents:
                 await pilot.pause()
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count == 1
-                await pilot.press("t")
+                await pilot.press("a")
                 await pilot.pause()
                 assert table.row_count == 2
 
@@ -282,9 +323,9 @@ class TestSubagents:
         with _mock_sessions([parent]):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                await pilot.press("t")
+                await pilot.press("a")
                 await pilot.pause()
-                await pilot.press("t")
+                await pilot.press("a")
                 await pilot.pause()
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count == 1

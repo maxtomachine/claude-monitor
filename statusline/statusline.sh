@@ -211,7 +211,24 @@ if [ -n "$usage_json" ]; then
   fi
 fi
 
+# Share context % and slug with claude-monitor via per-session cache
+if [ -n "$transcript" ]; then
+  _sid=$(echo "$transcript" | sed -n 's|.*/sessions/\([^/]*\)/.*|\1|p')
+  if [ -n "$_sid" ]; then
+    [ -n "$remaining" ] && printf '%s' "$remaining" > "/tmp/claude-ctx-${_sid}"
+    [ -n "$remote_url" ] && printf '%s' "$remote_url" > "/tmp/claude-url-${_sid}"
+  fi
+fi
+
 echo "$(date '+%H:%M:%S') OK ctx=${remaining:-?} quota=${quota_used:-?} tokens=${tokens}" >> "$SL_LOG"
+
+# Terminal width for responsive layout
+tw=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
+
+# Helper: estimate visible character count (strip all ANSI escapes)
+_vlen() {
+  printf '%b' "$1" | perl -pe 's/\e\[[0-9;]*m//g; s/\e\]8;;[^\e]*\e\\//g' | wc -m | tr -d ' '
+}
 
 # Render output — subshell so any failure emits fallback instead of nothing
 (
@@ -222,13 +239,28 @@ echo "$(date '+%H:%M:%S') OK ctx=${remaining:-?} quota=${quota_used:-?} tokens=$
     printf '%s %b \033[90mremote control off\033[0m\n' "${session_name:-${cwd:-~}}" "$SEP"
   fi
 
-  # Line 2: ctx bar | quota ammo | tokens | cost | model
-  parts=()
-  [ -n "$ctx_bar" ] && parts+=("$ctx_bar")
-  [ -n "$quota_bar" ] && parts+=("$quota_bar")
-  [ -n "$tokens" ] && parts+=("${tokens} tok")
-  [ -n "$cost" ] && parts+=("${cost}")
-  [ -n "$model" ] && parts+=("$model")
+  # Line 2: ctx bar | tokens | cost | model | quota ammo
+  # Priority order: ctx is most important, quota least (dropped first)
+  all_parts=()
+  [ -n "$ctx_bar" ] && all_parts+=("$ctx_bar")
+  [ -n "$tokens" ] && all_parts+=("${tokens} tok")
+  [ -n "$cost" ] && all_parts+=("${cost}")
+  [ -n "$model" ] && all_parts+=("$model")
+  [ -n "$quota_bar" ] && all_parts+=("$quota_bar")
+
+  # Try full line first, drop rightmost parts until it fits
+  parts=("${all_parts[@]}")
+  while [ ${#parts[@]} -gt 0 ]; do
+    line=""
+    for ((i=0; i<${#parts[@]}; i++)); do
+      [ $i -gt 0 ] && line+=" │ "
+      line+="${parts[$i]}"
+    done
+    vl=$(_vlen "$line")
+    [ "$vl" -le "$tw" ] && break
+    unset 'parts[${#parts[@]}-1]'
+    parts=("${parts[@]}")  # reindex
+  done
 
   if [ ${#parts[@]} -gt 0 ]; then
     printf '%b' "${parts[0]}"

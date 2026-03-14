@@ -4,7 +4,6 @@
 import json
 import os
 import re
-import signal
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -25,6 +24,7 @@ from textual.widgets.option_list import Option
 
 CLAUDE_DIR = Path.home() / ".claude" / "projects"
 SIGNALS_DIR = Path.home() / ".claude" / "session-signals"
+TASKS_DIR = Path.home() / ".claude" / "tasks"
 PREFS_PATH = Path.home() / ".claude" / "monitor-prefs.json"
 DOING_MAX_WIDTH = 40
 
@@ -134,12 +134,13 @@ class SortMode(Enum):
         }[self]
 
 
-STATUS_PRIORITY = {"working": 0, "needs_approval": 1, "waiting": 2, "idle": 3}
+STATUS_PRIORITY = {"working": 0, "needs_approval": 1, "waiting": 2, "idle": 3, "archived": 4}
 STATUS_DISPLAY = {
     "working": ("● WORKING", "green"),
     "needs_approval": ("◉ APPROVE", "yellow"),
     "waiting": ("○ WAITING", "dark_orange"),
     "idle": ("◌ IDLE", "dim"),
+    "archived": ("◇ ARCHIVED", "dim"),
 }
 
 
@@ -254,7 +255,7 @@ def scan_full_file(path: str) -> dict:
                 # Only parse lines that could be assistant messages or have useful data
                 if '"type":"assistant"' not in line and '"type": "assistant"' not in line:
                     # Check for slug and cwd in non-assistant lines too
-                    if '"slug"' in line and not result["slug"]:
+                    if '"slug"' in line:
                         try:
                             msg = json.loads(line)
                             s = msg.get("slug", "")
@@ -283,7 +284,7 @@ def scan_full_file(path: str) -> dict:
 
                 if msg.get("cwd"):
                     result["cwd"] = msg["cwd"]
-                if msg.get("slug") and not result["slug"]:
+                if msg.get("slug"):
                     result["slug"] = msg["slug"]
                 if result["created"] == 0.0 and msg.get("timestamp"):
                     result["created"] = parse_timestamp(msg["timestamp"])
@@ -353,6 +354,68 @@ def find_subagent_paths(parent_path: str) -> list[Path]:
     return sorted(subagent_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
+@dataclass
+class Task:
+    id: str
+    subject: str
+    status: str  # pending, in_progress, completed, deleted
+    active_form: str = ""
+
+
+def load_tasks(session_id: str) -> list[Task]:
+    """Load tasks for a session from ~/.claude/tasks/{session_id}/."""
+    task_dir = TASKS_DIR / session_id
+    if not task_dir.exists():
+        return []
+    tasks = []
+    for f in task_dir.iterdir():
+        if not f.suffix == ".json":
+            continue
+        try:
+            data = json.loads(f.read_text())
+            status = data.get("status", "pending")
+            if status == "deleted":
+                continue
+            tasks.append(Task(
+                id=data.get("id", f.stem),
+                subject=data.get("subject", ""),
+                status=status,
+                active_form=data.get("activeForm", ""),
+            ))
+        except (json.JSONDecodeError, OSError):
+            continue
+    # Sort by ID (numeric)
+    tasks.sort(key=lambda t: int(t.id) if t.id.isdigit() else 0)
+    return tasks
+
+
+def format_plan(tasks: list[Task], max_lines: int = 8) -> str:
+    """Format tasks as a Rich-markup plan checklist."""
+    if not tasks:
+        return ""
+    completed = sum(1 for t in tasks if t.status == "completed")
+    total = len(tasks)
+    in_progress = [t for t in tasks if t.status == "in_progress"]
+
+    header = f"[bold]Plan[/] [dim]{completed}/{total} done[/]"
+    if in_progress:
+        current = in_progress[0].active_form or in_progress[0].subject
+        header += f"  [cyan]→ {current}[/]"
+
+    lines = [header]
+    for t in tasks[:max_lines]:
+        subj = t.subject[:50].replace("[", "\\[").replace("]", "\\]")
+        if t.status == "completed":
+            lines.append(f"  [green]✓[/] [dim]{subj}[/]")
+        elif t.status == "in_progress":
+            lines.append(f"  [cyan]▸[/] [bold]{subj}[/]")
+        else:
+            lines.append(f"  [dim]○[/] {subj}")
+    if total > max_lines:
+        lines.append(f"  [dim]… +{total - max_lines} more[/]")
+    return "\n".join(lines)
+
+
 def load_index_metadata() -> dict[str, dict]:
     meta = {}
     if not CLAUDE_DIR.exists():
@@ -383,9 +446,11 @@ def estimate_cost(model_id: str, tokens_in: int, tokens_out: int) -> float:
     return 0.0
 
 
-def parse_sessions() -> list[Session]:
+def parse_sessions(include_archived: bool = False) -> list[Session]:
     sessions = []
-    cutoff = time.time() - 86400
+    now = time.time()
+    active_cutoff = now - 86400
+    archive_cutoff = now - 86400 * 7  # 7 days for archived
 
     if not CLAUDE_DIR.exists():
         return sessions
@@ -399,7 +464,11 @@ def parse_sessions() -> list[Session]:
             mtime = jsonl_path.stat().st_mtime
         except OSError:
             continue
-        if mtime < cutoff:
+
+        is_archived = mtime < active_cutoff
+        if is_archived and not include_archived:
+            continue
+        if mtime < archive_cutoff:
             continue
 
         session_id = jsonl_path.stem
@@ -408,14 +477,17 @@ def parse_sessions() -> list[Session]:
 
         session = build_session(str(jsonl_path), session_id, project, idx, mtime)
         if session:
+            if is_archived:
+                session.status = "archived"
             session.compact_count = count_compactions(str(jsonl_path))
-            for sub_path in find_subagent_paths(str(jsonl_path)):
-                sub = build_session(
-                    str(sub_path), sub_path.stem, project, {},
-                    sub_path.stat().st_mtime, is_subagent=True, parent_id=session_id,
-                )
-                if sub:
-                    session.subagents.append(sub)
+            if not is_archived:
+                for sub_path in find_subagent_paths(str(jsonl_path)):
+                    sub = build_session(
+                        str(sub_path), sub_path.stem, project, {},
+                        sub_path.stat().st_mtime, is_subagent=True, parent_id=session_id,
+                    )
+                    if sub:
+                        session.subagents.append(sub)
             sessions.append(session)
 
     return sessions
@@ -428,12 +500,17 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
 
     status = determine_status(session_id, data["last_assistant_time"])
 
-    # last_input_tokens = context size of the most recent API call
-    last_input = data["last_input_tokens"]
-    if last_input == 0:
-        context_pct = 100
-    else:
-        context_pct = max(0, 100 - int((last_input / 200000) * 100))
+    # Context %: prefer ground-truth from statusline cache, fall back to estimate
+    ctx_cache = Path(f"/tmp/claude-ctx-{session_id}")
+    try:
+        context_pct = int(ctx_cache.read_text().strip())
+    except (OSError, ValueError):
+        # Estimate from last API call's input tokens
+        last_input = data["last_input_tokens"]
+        if last_input == 0:
+            context_pct = 100
+        else:
+            context_pct = max(0, 100 - int((last_input / 200000) * 100))
 
     cost = estimate_cost(data["model_id"], data["tokens_in"], data["tokens_out"])
 
@@ -451,7 +528,17 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
         )
 
     remote_url = ""
+    # Slug: prefer live cache from statusline, fall back to transcript
     slug = data["slug"]
+    url_cache = Path(f"/tmp/claude-url-{session_id}")
+    try:
+        cached_url = url_cache.read_text().strip()
+        # Extract slug from URL like https://claude.ai/code/session_XXXX
+        if "/session_" in cached_url:
+            slug = cached_url.split("/session_", 1)[1]
+    except (OSError, ValueError):
+        pass
+
     if slug and not is_subagent:
         remote_url = f"https://claude.ai/code/session_{slug}"
 
@@ -707,13 +794,24 @@ def generate_activity(s: Session) -> str:
     if not gerund and s.last_assistant_text:
         gerund = _gerund_from_text(s.last_assistant_text) or ""
 
+    # Fallback: truncate assistant text as summary
+    if not gerund and s.last_assistant_text:
+        text = s.last_assistant_text.strip()
+        # Take first sentence or first N chars
+        for sep in (".", "!", "?", "\n"):
+            idx = text.find(sep)
+            if 0 < idx < 60:
+                text = text[:idx]
+                break
+        gerund = text[:50]
+
     if not gerund:
         return ""
 
     # Apply status-based transformation
     if s.status == "needs_approval":
-        return f"Awaiting approval"
-    elif s.status == "idle":
+        return "Awaiting approval"
+    elif s.status in ("idle", "waiting"):
         return _to_past_tense(gerund)
     else:
         return gerund
@@ -727,7 +825,7 @@ def sort_sessions(sessions: list[Session], mode: SortMode) -> list[Session]:
     elif mode == SortMode.CONTEXT:
         return sorted(sessions, key=lambda s: s.context_pct)
     elif mode == SortMode.TOKENS:
-        return sorted(sessions, key=lambda s: s.tokens_in + s.tokens_out, reverse=True)
+        return sorted(sessions, key=lambda s: s.tokens_out, reverse=True)
     elif mode == SortMode.COST:
         return sorted(sessions, key=lambda s: s.cost, reverse=True)
     return sessions
@@ -755,11 +853,11 @@ def render_row(s: Session, visible_cols: list[str]) -> list[str]:
         elif col == "model":
             cells.append(s.model)
         elif col == "context":
-            cells.append(format_context_bar(s.context_pct))
+            cells.append("" if s.is_subagent else format_context_bar(s.context_pct))
         elif col == "compact":
-            cells.append(format_compactions(s.compact_count))
+            cells.append("" if s.is_subagent else format_compactions(s.compact_count))
         elif col == "tokens":
-            cells.append(format_tokens(s.tokens_in + s.tokens_out))
+            cells.append(format_tokens(s.tokens_out))
         elif col == "cost":
             cells.append(format_cost(s.cost))
         elif col == "mcp":
@@ -784,102 +882,265 @@ def render_row(s: Session, visible_cols: list[str]) -> list[str]:
                     cells.append(activity_escaped)
             else:
                 cells.append("[dim]—[/]")
+
+    # Dim all cells for archived sessions
+    if s.status == "archived":
+        cells = [f"[dim]{c}[/]" if not c.startswith("[dim]") else c for c in cells]
+
     return cells
 
 
 # ── Terminal focus ────────────────────────────────────────────────────────────
 
+SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 
-def find_terminal_for_session(session: Session) -> str | None:
-    """Find which terminal app owns the Claude process for this session.
+_TERMINAL_APPS: dict[str, str] = {
+    "ghostty": "Ghostty", "iterm2": "iTerm2", "iterm": "iTerm2",
+    "terminal": "Terminal", "kitty": "kitty", "alacritty": "Alacritty",
+    "wezterm": "WezTerm", "warp": "Warp",
+}
 
-    Walks up the process tree from the claude process to find the terminal app.
-    Returns the app name (e.g. 'Ghostty', 'iTerm2', 'Terminal') or None.
+
+def _find_claude_pid(session: Session) -> int | None:
+    """Find the Claude CLI PID for a session.
+
+    Strategies (most reliable first):
+    1. PID files in ~/.claude/sessions/<PID>.json
+    2. lsof on the tasks directory for this session
+    3. Match claude processes by session's transcript path
     """
+    sid = session.session_id
+
+    # Strategy 1: PID files
+    if SESSIONS_DIR.is_dir():
+        for path in SESSIONS_DIR.iterdir():
+            if path.suffix != ".json":
+                continue
+            try:
+                data = json.loads(path.read_text())
+                if data.get("sessionId") == sid:
+                    pid = int(data["pid"])
+                    try:
+                        os.kill(pid, 0)
+                        return pid
+                    except OSError:
+                        continue
+            except (json.JSONDecodeError, OSError, KeyError, ValueError):
+                continue
+
+    # Strategy 2: find who has the tasks directory open
+    tasks_path = str(TASKS_DIR / sid)
     try:
-        # Find claude processes and match by cwd
+        result = subprocess.run(
+            ["lsof", "+D", tasks_path],
+            capture_output=True, text=True, timeout=3,
+        )
+        for line in result.stdout.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 2 and "claude" in parts[0].lower():
+                try:
+                    return int(parts[1])
+                except ValueError:
+                    continue
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    # Strategy 3: match claude processes from ps
+    my_pid = os.getpid()
+    try:
         result = subprocess.run(
             ["ps", "-eo", "pid,ppid,comm"],
             capture_output=True, text=True, timeout=3,
         )
-        # Find all claude processes
-        claude_pids = []
-        pid_info: dict[int, tuple[int, str]] = {}  # pid -> (ppid, comm)
-        for line in result.stdout.strip().splitlines()[1:]:
-            parts = line.split(None, 2)
-            if len(parts) >= 3:
-                try:
-                    pid, ppid = int(parts[0]), int(parts[1])
-                    comm = parts[2]
-                    pid_info[pid] = (ppid, comm)
-                    if "claude" in comm.lower() and "monitor" not in comm.lower():
-                        claude_pids.append(pid)
-                except ValueError:
-                    continue
-
-        # For each claude process, check if it's working in the session's cwd
-        for cpid in claude_pids:
-            try:
-                cwd_result = subprocess.run(
-                    ["lsof", "-p", str(cpid), "-Fn", "-d", "cwd"],
-                    capture_output=True, text=True, timeout=2,
-                )
-                for line in cwd_result.stdout.splitlines():
-                    if line.startswith("n") and session.cwd in line:
-                        # Found it — walk up the tree to find the terminal
-                        current = cpid
-                        for _ in range(10):  # max depth
-                            if current not in pid_info:
-                                break
-                            ppid, comm = pid_info[current]
-                            comm_lower = comm.lower()
-                            for app_name in ("ghostty", "iterm2", "terminal", "kitty",
-                                             "alacritty", "wezterm", "warp"):
-                                if app_name in comm_lower:
-                                    return app_name.capitalize()
-                            current = ppid
-                        break
-            except (subprocess.TimeoutExpired, ValueError):
-                continue
     except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+    claude_pids = []
+    for line in result.stdout.strip().splitlines()[1:]:
+        parts = line.split(None, 2)
+        if len(parts) >= 3:
+            try:
+                pid = int(parts[0])
+                comm = parts[2].lower()
+                if pid != my_pid and "claude" in comm and "monitor" not in comm \
+                        and "helper" not in comm and "crashpad" not in comm \
+                        and ".app" not in comm:
+                    claude_pids.append(pid)
+            except ValueError:
+                continue
+
+    # Check which claude process has files related to this session open
+    for cpid in claude_pids:
+        try:
+            result = subprocess.run(
+                ["lsof", "-p", str(cpid)],
+                capture_output=True, text=True, timeout=2,
+            )
+            if sid in result.stdout:
+                return cpid
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            continue
+
+    return None
+
+
+
+_JUMP_LOG = Path("/tmp/claude-monitor-jump.log")
+
+
+def _jump_log(msg: str) -> None:
+    """Append debug line to jump log."""
+    try:
+        with _JUMP_LOG.open("a") as f:
+            f.write(f"{datetime.now():%H:%M:%S} {msg}\n")
+    except OSError:
         pass
+
+
+def _raise_window_by_content(session: Session, app_name: str) -> bool:
+    """Raise the terminal window/tab containing a specific Claude session.
+
+    Matches by the session title/project name visible in the statusline
+    (format: "name │ url"). For tabbed terminals, AXRaise switches to the
+    target tab, then re-reads the AXTextArea to verify the match.
+
+    Uses AXRaise + AXMain + proc.frontmost (not `tell app to activate`)
+    to avoid re-focusing the monitor's own window.
+    """
+    # Match on the session name as it appears in the statusline:
+    # "claude-monitor │ https://..." or "maxkirby │ remote control off"
+    # Use "name │" as the match pattern — the │ separator prevents false
+    # matches against conversation text.
+    match_str = f"{session.title} │" if session.title else ""
+
+    proc_names = json.dumps(list({app_name.lower(), app_name}))
+    match_json = json.dumps(match_str)
+
+    _jump_log(f"_raise_window_by_content app={app_name} match={match_str!r}")
+
+    if not match_str:
+        _jump_log("  no title — cannot match")
+        return False
+
+    # JXA: try each window. For tabs (same position), AXRaise switches to
+    # that tab, then we re-read AXTextArea to verify the match.
+    jxa = f"""(() => {{
+        const se = Application("System Events");
+        const names = {proc_names};
+        let proc = null;
+        for (const n of names) {{
+            try {{ proc = se.processes.byName(n); proc.name(); break; }}
+            catch(e) {{ proc = null; }}
+        }}
+        if (!proc) return "notfound";
+        const wins = proc.windows();
+        if (wins.length === 0) return "no_windows";
+
+        const matchStr = {match_json};
+        const info = [];
+
+        function readStatusline(w) {{
+            try {{
+                const full = w.groups[0].groups[0].textAreas[0].value();
+                return full.substring(full.length - 500);
+            }}
+            catch(e) {{ return ""; }}
+        }}
+
+        // First pass: check each window's statusline (fast, no tab switching)
+        for (let i = 0; i < wins.length; i++) {{
+            const text = readStatusline(wins[i]);
+            info.push(i + ":" + wins[i].name());
+            if (text.includes(matchStr)) {{
+                wins[i].actions["AXRaise"].perform();
+                try {{ wins[i].attributes["AXMain"].value = true; }} catch(e) {{}}
+                proc.frontmost = true;
+                return "matched:" + i + ":" + wins[i].name() + "|info:" + info.join("|");
+            }}
+        }}
+
+        // Second pass: for tabs, AXRaise switches the active tab.
+        // Raise each Claude-titled window, re-read statusline.
+        for (let i = 0; i < wins.length; i++) {{
+            const title = wins[i].name().toLowerCase();
+            if (!title.includes("claude")) continue;
+
+            wins[i].actions["AXRaise"].perform();
+            delay(0.15);
+
+            const text = readStatusline(wins[i]);
+            if (text.includes(matchStr)) {{
+                try {{ wins[i].attributes["AXMain"].value = true; }} catch(e) {{}}
+                proc.frontmost = true;
+                return "tab_matched:" + i + ":" + wins[i].name() + "|info:" + info.join("|");
+            }}
+        }}
+
+        return "no_match|info:" + info.join("|");
+    }})()"""
+
+    try:
+        result = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", jxa],
+            capture_output=True, text=True, timeout=10,
+        )
+        out = result.stdout.strip()
+        _jump_log(f"  result: {out}")
+
+        if out.startswith("matched:") or out.startswith("tab_matched:"):
+            return True
+        _jump_log(f"  stderr: {result.stderr.strip()}")
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        _jump_log(f"  error: {e}")
+
+    return False
+
+
+def find_terminal_for_session(session: Session) -> str | None:
+    """Find which terminal app owns the Claude process for this session."""
+    pid = _find_claude_pid(session)
+    if pid is None:
+        return None
+    # Walk up the process tree to find the terminal app
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid,ppid,comm"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+    pid_table: dict[int, tuple[int, str]] = {}
+    for line in result.stdout.strip().splitlines()[1:]:
+        parts = line.split(None, 2)
+        if len(parts) >= 3:
+            try:
+                pid_table[int(parts[0])] = (int(parts[1]), parts[2])
+            except ValueError:
+                continue
+
+    current = pid
+    for _ in range(15):
+        if current not in pid_table:
+            break
+        ppid, comm = pid_table[current]
+        for substr, app_name in _TERMINAL_APPS.items():
+            if substr in comm.lower():
+                return app_name
+        current = ppid
     return None
 
 
 def focus_terminal_session(session: Session) -> bool:
-    """Find and activate the terminal containing this session. Returns True if successful."""
+    """Find and activate the terminal window containing this session."""
+    _jump_log(f"--- focus_terminal_session sid={session.session_id[:12]}...")
     terminal = find_terminal_for_session(session)
-
-    if not terminal:
-        # Fallback: try common terminals
-        for app in ("Ghostty", "iTerm2", "Terminal"):
-            try:
-                result = subprocess.run(
-                    ["pgrep", "-x", app],
-                    capture_output=True, text=True, timeout=2,
-                )
-                if result.stdout.strip():
-                    terminal = app
-                    break
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                continue
+    _jump_log(f"  terminal={terminal}")
 
     if terminal:
-        # Map common names to macOS app names
-        app_names = {
-            "Ghostty": "Ghostty", "Iterm2": "iTerm2", "Iterm": "iTerm2",
-            "Terminal": "Terminal", "Kitty": "kitty",
-            "Wezterm": "WezTerm", "Warp": "Warp",
-        }
-        app = app_names.get(terminal, terminal)
-        try:
-            subprocess.run(
-                ["osascript", "-e", f'tell application "{app}" to activate'],
-                capture_output=True, timeout=3,
-            )
-            return True
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
+        return _raise_window_by_content(session, terminal)
+
+    _jump_log("  failed: no terminal found")
     return False
 
 
@@ -888,6 +1149,64 @@ def copy_to_clipboard(text: str) -> None:
         subprocess.run(["pbcopy"], input=text.encode(), timeout=2)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
+
+
+def resume_session(session: Session) -> bool:
+    """Open a new terminal tab and resume the given Claude session."""
+    cmd = f"claude --resume {session.session_id}"
+    cwd = session.cwd or str(Path.home())
+
+    # Try common terminal apps via AppleScript
+    for app in ("Ghostty", "iTerm2", "Terminal"):
+        try:
+            result = subprocess.run(
+                ["pgrep", "-x", app],
+                capture_output=True, text=True, timeout=2,
+            )
+            if not result.stdout.strip():
+                continue
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            continue
+
+        if app == "Ghostty":
+            script = (
+                f'tell application "Ghostty" to activate\n'
+                f'delay 0.3\n'
+                f'tell application "System Events" to keystroke "t" using command down\n'
+                f'delay 0.3\n'
+                f'tell application "System Events" to keystroke "cd {cwd} && {cmd}"\n'
+                f'tell application "System Events" to key code 36'  # Enter
+            )
+        elif app == "iTerm2":
+            script = (
+                f'tell application "iTerm2"\n'
+                f'  activate\n'
+                f'  tell current window\n'
+                f'    create tab with default profile\n'
+                f'    tell current session\n'
+                f'      write text "cd {cwd} && {cmd}"\n'
+                f'    end tell\n'
+                f'  end tell\n'
+                f'end tell'
+            )
+        else:  # Terminal.app
+            script = (
+                f'tell application "Terminal"\n'
+                f'  activate\n'
+                f'  do script "cd {cwd} && {cmd}"\n'
+                f'end tell'
+            )
+
+        try:
+            subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, timeout=5,
+            )
+            return True
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            continue
+
+    return False
 
 
 # ── Screens ───────────────────────────────────────────────────────────────────
@@ -914,13 +1233,15 @@ class SessionMenu(ModalScreen[str]):
 
     def compose(self) -> ComposeResult:
         s = self.session
-        options = [
-            Option("🖥   Jump to terminal", id="jump"),
-            Option(f"📋  Copy session ID ({s.session_id[:8]}…)", id="copy_id"),
-        ]
+        options = []
+        if s.status == "archived":
+            options.append(Option("▶   Resume session", id="resume"))
+        else:
+            options.append(Option("🖥   Jump to terminal", id="jump"))
+        options.append(Option(f"📋  Copy session ID ({s.session_id[:8]}…)", id="copy_id"))
         if s.remote_url:
             options.append(Option("🔗  Open remote control", id="remote"))
-        options.append(Option("📂  Reveal transcript", id="transcript"))
+        options.append(Option("📂  Open transcript", id="transcript"))
         options.append(Option("─" * 26, id="sep", disabled=True))
         options.append(Option("❌  Close", id="close"))
 
@@ -937,8 +1258,8 @@ class SessionMenu(ModalScreen[str]):
 
 class ColumnPicker(ModalScreen[list[str]]):
     BINDINGS = [
-        Binding("escape", "cancel", "Cancel"),
-        Binding("s", "save", "Save"),
+        Binding("escape", "done", "Done"),
+        Binding("enter", "toggle_col", "Toggle"),
         Binding("space", "toggle_col", "Toggle", show=False),
         Binding("shift+up", "move_up", "Move Up", show=False),
         Binding("shift+down", "move_down", "Move Down", show=False),
@@ -968,7 +1289,7 @@ class ColumnPicker(ModalScreen[list[str]]):
         with Vertical(id="picker-container"):
             yield Label("[bold]Column Picker[/]", id="picker-title")
             yield OptionList(*options, id="picker-list")
-            yield Label("[dim]Enter/Space toggle · Shift+↑↓ reorder · s save · Esc cancel[/]", id="picker-hint")
+            yield Label("[dim]Enter/Space toggle · Shift+↑↓ reorder · Esc done[/]", id="picker-hint")
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         """Enter key on OptionList fires this — use it to toggle."""
@@ -1014,13 +1335,10 @@ class ColumnPicker(ModalScreen[list[str]]):
             return
         self._swap_options(idx, idx + 1)
 
-    def action_save(self) -> None:
+    def action_done(self) -> None:
         # Return columns in their current order, filtered to selected
         cols = [k for k in self._col_keys if k in self.selected_cols]
         self.dismiss(cols)
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
 
 
 # ── Main App ──────────────────────────────────────────────────────────────────
@@ -1057,8 +1375,9 @@ class ClaudeMonitor(App):
     StatsBar Label { width: auto; }
     #session-table { height: 1fr; }
     #detail-panel {
-        height: 12; padding: 0 2;
+        height: auto; max-height: 35%; min-height: 5; padding: 0 2;
         background: $boost; dock: bottom; border-top: solid $primary;
+        overflow-y: auto;
     }
     #search-bar {
         height: 1; dock: bottom; display: none;
@@ -1069,9 +1388,9 @@ class ClaudeMonitor(App):
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
         Binding("s", "cycle_sort", "Sort"),
-        Binding("t", "toggle_subagents", "Tree"),
+        Binding("a", "toggle_subagents", "Agents"),
+        Binding("z", "toggle_archived", "Archive"),
         Binding("c", "pick_columns", "Columns"),
-        Binding("p", "pause_all", "Pause All"),
         Binding("slash", "start_search", "Search"),
         Binding("escape", "clear_search", "Clear", show=False),
         Binding("j", "cursor_down", "↓", show=False),
@@ -1080,6 +1399,7 @@ class ClaudeMonitor(App):
 
     sort_mode: reactive[SortMode] = reactive(SortMode.ACTIVITY)
     show_subagents: reactive[bool] = reactive(False)
+    show_archived: reactive[bool] = reactive(False)
     sessions: list[Session] = []
     _flat_rows: list[Session] = []
     _selected_key: str | None = None
@@ -1094,8 +1414,8 @@ class ClaudeMonitor(App):
         yield Input(placeholder="Filter sessions...", id="search-bar")
         yield Static(
             "[dim]↑↓/jk navigate · [bold]Enter[/] menu · "
-            "[bold]s[/] sort · [bold]t[/] tree · "
-            "[bold]c[/] columns · [bold]p[/] pause · "
+            "[bold]s[/] sort · [bold]a[/] agents · "
+            "[bold]z[/] archive · [bold]c[/] columns · "
             "[bold]/[/] search[/]",
             id="detail-panel"
         )
@@ -1134,7 +1454,7 @@ class ClaudeMonitor(App):
         saved_scroll_x = table.scroll_x
         saved_scroll_y = table.scroll_y
 
-        self.sessions = parse_sessions()
+        self.sessions = parse_sessions(include_archived=self.show_archived)
         filtered = self._filter_sessions(self.sessions)
         sorted_sessions = sort_sessions(filtered, self.sort_mode)
 
@@ -1174,6 +1494,11 @@ class ClaudeMonitor(App):
             if action == "jump":
                 if not focus_terminal_session(s):
                     self.notify("Could not find terminal", timeout=2)
+            elif action == "resume":
+                if resume_session(s):
+                    self.notify(f"Resuming {s.title[:20]}…", timeout=2)
+                else:
+                    self.notify("Could not open terminal", timeout=2)
             elif action == "copy_id":
                 copy_to_clipboard(s.session_id)
                 self.notify("Copied", timeout=1)
@@ -1191,17 +1516,28 @@ class ClaudeMonitor(App):
             return
 
         icon, color = STATUS_DISPLAY.get(s.status, ("?", "white"))
+        header = f"[bold]{s.title}[/] [{color}]{icon}[/]"
 
-        if s.last_assistant_text:
+        # Build detail content: archived summary, plan, or last assistant text
+        detail_parts = [header]
+
+        if s.status == "archived":
+            detail_parts.append(
+                f"[dim]Project:[/] {s.project}  "
+                f"[dim]Cost:[/] ${s.cost:.2f}  "
+                f"[dim]Output:[/] {format_tokens(s.tokens_out)}  "
+                f"[dim]Messages:[/] {s.message_count}"
+            )
+            detail_parts.append("[dim]Press Enter → Resume to continue this session[/]")
+
+        tasks = load_tasks(s.session_id)
+        if tasks:
+            detail_parts.append(format_plan(tasks))
+        elif s.last_assistant_text:
             preview = s.last_assistant_text[:400].replace("[", "\\[").replace("]", "\\]")
-            self.query_one("#detail-panel", Static).update(
-                f"[bold]{s.title}[/] [{color}]{icon}[/]\n"
-                f"[italic]{preview}[/italic]"
-            )
-        else:
-            self.query_one("#detail-panel", Static).update(
-                f"[bold]{s.title}[/] [{color}]{icon}[/]"
-            )
+            detail_parts.append(f"[italic]{preview}[/italic]")
+
+        self.query_one("#detail-panel", Static).update("\n".join(detail_parts))
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "search-bar":
@@ -1244,6 +1580,11 @@ class ClaudeMonitor(App):
         self.refresh_sessions()
         self.notify(f"Subagents {'shown' if self.show_subagents else 'hidden'}", timeout=1)
 
+    def action_toggle_archived(self) -> None:
+        self.show_archived = not self.show_archived
+        self.refresh_sessions()
+        self.notify(f"Archived sessions {'shown' if self.show_archived else 'hidden'}", timeout=1)
+
     def action_pick_columns(self) -> None:
         picker = ColumnPicker(self._visible_cols, self._col_order)
 
@@ -1260,28 +1601,6 @@ class ClaudeMonitor(App):
                 self.notify("Columns updated", timeout=1)
 
         self.push_screen(picker, on_dismiss)
-
-    def action_pause_all(self) -> None:
-        working = [s for s in self.sessions if s.status == "working"]
-        if not working:
-            self.notify("No working sessions", timeout=1)
-            return
-        paused = 0
-        try:
-            result = subprocess.run(
-                ["pgrep", "-f", "claude.*--dangerously-skip-permissions"],
-                capture_output=True, text=True, timeout=2,
-            )
-            for line in result.stdout.strip().splitlines():
-                try:
-                    pid = int(line.strip())
-                    os.kill(pid, signal.SIGINT)
-                    paused += 1
-                except (ValueError, ProcessLookupError, PermissionError):
-                    continue
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
-        self.notify(f"Paused {paused} process(es)", timeout=2)
 
     def action_cursor_down(self) -> None:
         self.query_one("#session-table", DataTable).action_cursor_down()

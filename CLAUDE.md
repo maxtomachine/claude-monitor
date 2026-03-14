@@ -47,6 +47,27 @@ Single file: `claude_monitor.py`. Key sections:
 5. **Screens** — `SessionMenu` (action menu on Enter), `ColumnPicker` (column toggle + reorder)
 6. **Main app** — `ClaudeMonitor(App)` with keybindings, refresh loop, search, sort
 
+## Current keybindings
+
+| Key | Action |
+|-----|--------|
+| `q` | Quit |
+| `r` | Refresh |
+| `s` | Cycle sort mode |
+| `a` | Toggle subagent rows |
+| `z` | Toggle archived/resumable sessions |
+| `c` | Column picker |
+| `/` | Search/filter |
+| `j`/`k` | Vim navigation |
+| `Enter` | Session context menu |
+
+## Statusline integration
+
+The statusline (`statusline/statusline.sh`) shares data with the monitor:
+- **Context %**: statusline writes ground-truth `remaining_percentage` to `/tmp/claude-ctx-{session_id}`, which the monitor reads instead of estimating from token counts.
+- **Jump to terminal**: uses `AXRaise` + `AXMain` + `proc.frontmost` via System Events (not `tell app to activate`, which re-focuses the monitor's own window).
+- **Debug log**: jump operations log to `/tmp/claude-monitor-jump.log`.
+
 ## Key conventions
 
 - **No direct pushes to main** — all changes go through PRs

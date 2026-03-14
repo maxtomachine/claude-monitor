@@ -6,6 +6,8 @@ from claude_monitor import (
     get_visible_columns,
     get_column_order,
     DOING_MAX_WIDTH,
+    Task,
+    format_plan,
 )
 from tests.helpers import make_session
 
@@ -57,7 +59,7 @@ class TestRenderRow:
     def test_tokens_column(self):
         s = make_session(tokens_in=50_000, tokens_out=10_000)
         cells = render_row(s, ["tokens"])
-        assert "60k" in cells[0]
+        assert "10k" in cells[0]
 
     def test_context_column(self):
         s = make_session(context_pct=75)
@@ -127,3 +129,49 @@ class TestColumnConfig:
     def test_column_order_has_all(self):
         order = get_column_order()
         assert set(order) == set(ALL_COLUMNS.keys())
+
+
+class TestFormatPlan:
+    def test_empty_tasks(self):
+        assert format_plan([]) == ""
+
+    def test_all_pending(self):
+        tasks = [
+            Task(id="1", subject="Step one", status="pending"),
+            Task(id="2", subject="Step two", status="pending"),
+        ]
+        result = format_plan(tasks)
+        assert "0/2 done" in result
+        assert "○" in result
+
+    def test_partial_progress(self):
+        tasks = [
+            Task(id="1", subject="Done step", status="completed"),
+            Task(id="2", subject="Current step", status="in_progress", active_form="Doing current"),
+            Task(id="3", subject="Future step", status="pending"),
+        ]
+        result = format_plan(tasks)
+        assert "1/3 done" in result
+        assert "✓" in result
+        assert "▸" in result
+        assert "Doing current" in result
+
+    def test_all_completed(self):
+        tasks = [
+            Task(id="1", subject="Step one", status="completed"),
+            Task(id="2", subject="Step two", status="completed"),
+        ]
+        result = format_plan(tasks)
+        assert "2/2 done" in result
+
+    def test_truncation(self):
+        tasks = [Task(id=str(i), subject=f"Step {i}", status="pending") for i in range(12)]
+        result = format_plan(tasks, max_lines=5)
+        assert "+7 more" in result
+
+    def test_in_progress_shown_in_header(self):
+        tasks = [
+            Task(id="1", subject="Active task", status="in_progress", active_form="Working on it"),
+        ]
+        result = format_plan(tasks)
+        assert "Working on it" in result
