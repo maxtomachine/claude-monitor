@@ -217,7 +217,7 @@ def get_column_order() -> list[str]:
 def parse_timestamp(ts: str) -> float:
     try:
         return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
         return 0.0
 
 
@@ -584,7 +584,7 @@ def _to_gerund(verb: str) -> str:
         return verb.capitalize()
     if verb.endswith("e") and not verb.endswith("ee"):
         return (verb[:-1] + "ing").capitalize()
-    if re.match(r'.*[^aeiou][aeiou][^aeiouwy]$', verb) and len(verb) <= 5:
+    if re.match(r'.*[^aeiou][aeiou][^aeiouwxy]$', verb) and len(verb) <= 5:
         return (verb + verb[-1] + "ing").capitalize()
     return (verb + "ing").capitalize()
 
