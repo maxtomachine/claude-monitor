@@ -26,6 +26,7 @@ from textual.widgets.option_list import Option
 CLAUDE_DIR = Path.home() / ".claude" / "projects"
 SIGNALS_DIR = Path.home() / ".claude" / "session-signals"
 PREFS_PATH = Path.home() / ".claude" / "monitor-prefs.json"
+DOING_MAX_WIDTH = 40
 
 MODEL_PRICING = {
     "claude-opus-4-6": (15.0, 75.0),
@@ -196,6 +197,20 @@ def get_visible_columns() -> list[str]:
     return [k for k, v in ALL_COLUMNS.items() if v["default"]]
 
 
+def get_column_order() -> list[str]:
+    """Get the full column order (including hidden columns)."""
+    prefs = load_prefs()
+    saved = prefs.get("column_order")
+    if saved:
+        # Ensure all columns present (new ones appended at end)
+        known = [c for c in saved if c in ALL_COLUMNS]
+        for k in ALL_COLUMNS:
+            if k not in known:
+                known.append(k)
+        return known
+    return list(ALL_COLUMNS.keys())
+
+
 # ── Data parsing ──────────────────────────────────────────────────────────────
 
 
@@ -211,6 +226,7 @@ def scan_full_file(path: str) -> dict:
     result = {
         "custom_title": "", "slug": "", "mcp_calls": 0,
         "tokens_in": 0, "tokens_out": 0,
+        "last_input_tokens": 0,
         "model_id": "", "created": 0.0, "last_assistant_time": 0.0,
         "cwd": "", "last_tool": "", "last_tool_input": {},
         "last_assistant_text": "", "message_count": 0,
@@ -289,6 +305,12 @@ def scan_full_file(path: str) -> dict:
                     result["tokens_in"] += usage.get("cache_read_input_tokens", 0)
                     result["tokens_in"] += usage.get("cache_creation_input_tokens", 0)
                     result["tokens_out"] += usage.get("output_tokens", 0)
+                    # Current context = all input tokens for this API call
+                    ctx = (usage.get("input_tokens", 0)
+                           + usage.get("cache_read_input_tokens", 0)
+                           + usage.get("cache_creation_input_tokens", 0))
+                    if ctx > 0:
+                        result["last_input_tokens"] = ctx
 
                 # Extract last tool use and last text
                 content = inner.get("content", [])
@@ -305,7 +327,7 @@ def scan_full_file(path: str) -> dict:
                         elif block.get("type") == "text":
                             text = block.get("text", "").strip()
                             if text:
-                                result["last_assistant_text"] = text[:120]
+                                result["last_assistant_text"] = text[:500]
 
                 result["message_count"] += 1
 
@@ -406,12 +428,12 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
 
     status = determine_status(session_id, data["last_assistant_time"])
 
-    total_tokens = data["tokens_in"] + data["tokens_out"]
-    if total_tokens == 0:
+    # last_input_tokens = context size of the most recent API call
+    last_input = data["last_input_tokens"]
+    if last_input == 0:
         context_pct = 100
     else:
-        used = min(total_tokens, 200000)
-        context_pct = max(0, 100 - int((used / 200000) * 100))
+        context_pct = max(0, 100 - int((last_input / 200000) * 100))
 
     cost = estimate_cost(data["model_id"], data["tokens_in"], data["tokens_out"])
 
@@ -550,11 +572,7 @@ def format_compactions(count: int) -> str:
 
 
 def format_cost(cost: float) -> str:
-    if cost >= 10:
-        return f"[red]${cost:.2f}[/]"
-    elif cost >= 5:
-        return f"[yellow]${cost:.2f}[/]"
-    elif cost > 0:
+    if cost > 0:
         return f"${cost:.2f}"
     return "[dim]—[/]"
 
@@ -755,6 +773,8 @@ def render_row(s: Session, visible_cols: list[str]) -> list[str]:
         elif col == "doing":
             activity = generate_activity(s)
             if activity:
+                if len(activity) > DOING_MAX_WIDTH:
+                    activity = activity[:DOING_MAX_WIDTH - 1] + "…"
                 activity_escaped = activity.replace("[", "\\[").replace("]", "\\]")
                 if s.status == "idle":
                     cells.append(f"[dim]{activity_escaped}[/]")
@@ -767,35 +787,58 @@ def render_row(s: Session, visible_cols: list[str]) -> list[str]:
     return cells
 
 
-# ── Ghostty tab focus ─────────────────────────────────────────────────────────
+# ── Terminal focus ────────────────────────────────────────────────────────────
 
 
-def find_ghostty_tab_for_cwd(target_cwd: str) -> int | None:
-    """Find a Ghostty tab whose shell is in the target cwd."""
+def find_terminal_for_session(session: Session) -> str | None:
+    """Find which terminal app owns the Claude process for this session.
+
+    Walks up the process tree from the claude process to find the terminal app.
+    Returns the app name (e.g. 'Ghostty', 'iTerm2', 'Terminal') or None.
+    """
     try:
-        # Get all Ghostty child process PIDs
+        # Find claude processes and match by cwd
         result = subprocess.run(
-            ["pgrep", "-P", "1", "-f", "ghostty"],
-            capture_output=True, text=True, timeout=2,
+            ["ps", "-eo", "pid,ppid,comm"],
+            capture_output=True, text=True, timeout=3,
         )
-        ghostty_pids = result.stdout.strip().splitlines()
+        # Find all claude processes
+        claude_pids = []
+        pid_info: dict[int, tuple[int, str]] = {}  # pid -> (ppid, comm)
+        for line in result.stdout.strip().splitlines()[1:]:
+            parts = line.split(None, 2)
+            if len(parts) >= 3:
+                try:
+                    pid, ppid = int(parts[0]), int(parts[1])
+                    comm = parts[2]
+                    pid_info[pid] = (ppid, comm)
+                    if "claude" in comm.lower() and "monitor" not in comm.lower():
+                        claude_pids.append(pid)
+                except ValueError:
+                    continue
 
-        # Find shell processes under ghostty
-        for gp in ghostty_pids:
+        # For each claude process, check if it's working in the session's cwd
+        for cpid in claude_pids:
             try:
-                children = subprocess.run(
-                    ["pgrep", "-P", gp.strip()],
+                cwd_result = subprocess.run(
+                    ["lsof", "-p", str(cpid), "-Fn", "-d", "cwd"],
                     capture_output=True, text=True, timeout=2,
                 )
-                for child_pid in children.stdout.strip().splitlines():
-                    # Check cwd of child process
-                    cwd_result = subprocess.run(
-                        ["lsof", "-p", child_pid.strip(), "-Fn"],
-                        capture_output=True, text=True, timeout=2,
-                    )
-                    for lsof_line in cwd_result.stdout.splitlines():
-                        if lsof_line.startswith("n") and target_cwd in lsof_line:
-                            return int(child_pid.strip())
+                for line in cwd_result.stdout.splitlines():
+                    if line.startswith("n") and session.cwd in line:
+                        # Found it — walk up the tree to find the terminal
+                        current = cpid
+                        for _ in range(10):  # max depth
+                            if current not in pid_info:
+                                break
+                            ppid, comm = pid_info[current]
+                            comm_lower = comm.lower()
+                            for app_name in ("ghostty", "iterm2", "terminal", "kitty",
+                                             "alacritty", "wezterm", "warp"):
+                                if app_name in comm_lower:
+                                    return app_name.capitalize()
+                            current = ppid
+                        break
             except (subprocess.TimeoutExpired, ValueError):
                 continue
     except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -803,18 +846,41 @@ def find_ghostty_tab_for_cwd(target_cwd: str) -> int | None:
     return None
 
 
-def focus_ghostty_session(session: Session) -> None:
-    """Focus Ghostty and attempt to find the correct tab."""
-    # First just activate Ghostty
-    script = 'tell application "Ghostty" to activate'
-    try:
-        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=3)
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
+def focus_terminal_session(session: Session) -> bool:
+    """Find and activate the terminal containing this session. Returns True if successful."""
+    terminal = find_terminal_for_session(session)
 
-    # TODO: Ghostty doesn't yet expose per-tab focus via AppleScript.
-    # When ghostty +list-surfaces or the AppleScript API matures,
-    # we can match by cwd and focus the exact tab.
+    if not terminal:
+        # Fallback: try common terminals
+        for app in ("Ghostty", "iTerm2", "Terminal"):
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-x", app],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if result.stdout.strip():
+                    terminal = app
+                    break
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                continue
+
+    if terminal:
+        # Map common names to macOS app names
+        app_names = {
+            "Ghostty": "Ghostty", "Iterm2": "iTerm2", "Iterm": "iTerm2",
+            "Terminal": "Terminal", "Kitty": "kitty",
+            "Wezterm": "WezTerm", "Warp": "Warp",
+        }
+        app = app_names.get(terminal, terminal)
+        try:
+            subprocess.run(
+                ["osascript", "-e", f'tell application "{app}" to activate'],
+                capture_output=True, timeout=3,
+            )
+            return True
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+    return False
 
 
 def copy_to_clipboard(text: str) -> None:
@@ -833,12 +899,13 @@ class SessionMenu(ModalScreen[str]):
         Binding("q", "dismiss_menu", "Close", show=False),
     ]
     CSS = """
-    SessionMenu { align: center middle; }
+    SessionMenu { background: rgba(0, 0, 0, 0.5); align: center middle; }
     #menu-container {
-        width: 50; max-height: 20;
+        width: 44; max-height: 18;
         background: $surface; border: solid $primary; padding: 1 2;
     }
     #menu-title { text-align: center; text-style: bold; padding-bottom: 1; }
+    #menu-options { height: auto; }
     """
 
     def __init__(self, session: Session) -> None:
@@ -848,13 +915,13 @@ class SessionMenu(ModalScreen[str]):
     def compose(self) -> ComposeResult:
         s = self.session
         options = [
-            Option("🖥  Jump to terminal", id="jump"),
+            Option("🖥   Jump to terminal", id="jump"),
             Option(f"📋  Copy session ID ({s.session_id[:8]}…)", id="copy_id"),
         ]
         if s.remote_url:
             options.append(Option("🔗  Open remote control", id="remote"))
         options.append(Option("📂  Reveal transcript", id="transcript"))
-        options.append(Option("─" * 30, id="sep", disabled=True))
+        options.append(Option("─" * 26, id="sep", disabled=True))
         options.append(Option("❌  Close", id="close"))
 
         with Vertical(id="menu-container"):
@@ -871,31 +938,85 @@ class SessionMenu(ModalScreen[str]):
 class ColumnPicker(ModalScreen[list[str]]):
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
-        Binding("enter", "confirm", "Save"),
+        Binding("s", "save", "Save"),
+        Binding("space", "toggle_col", "Toggle", show=False),
+        Binding("shift+up", "move_up", "Move Up", show=False),
+        Binding("shift+down", "move_down", "Move Down", show=False),
     ]
     CSS = """
-    ColumnPicker { align: center middle; }
+    ColumnPicker { background: rgba(0, 0, 0, 0.5); align: center middle; }
     #picker-container {
-        width: 40; max-height: 24;
+        width: 38; height: auto; max-height: 22;
         background: $surface; border: solid $primary; padding: 1 2;
     }
     #picker-title { text-align: center; text-style: bold; padding-bottom: 1; }
-    #picker-hint { text-align: center; padding-top: 1; }
+    #picker-hint { text-align: center; color: $text-muted; padding-top: 1; }
+    #picker-list { height: auto; max-height: 14; }
     """
 
-    def __init__(self, visible: list[str]) -> None:
+    def __init__(self, visible: list[str], col_order: list[str]) -> None:
         super().__init__()
-        self.visible = set(visible)
+        self.selected_cols = set(visible)
+        self._col_keys = list(col_order)
 
     def compose(self) -> ComposeResult:
+        options = []
+        for key in self._col_keys:
+            info = ALL_COLUMNS[key]
+            check = "✓" if key in self.selected_cols else " "
+            options.append(Option(f"[green]{check}[/]  {info['label']}", id=key))
         with Vertical(id="picker-container"):
             yield Label("[bold]Column Picker[/]", id="picker-title")
-            for key, info in ALL_COLUMNS.items():
-                yield Checkbox(info["label"], value=key in self.visible, id=f"col-{key}")
-            yield Label("[dim]Enter to save · Escape to cancel[/]", id="picker-hint")
+            yield OptionList(*options, id="picker-list")
+            yield Label("[dim]Enter/Space toggle · Shift+↑↓ reorder · s save · Esc cancel[/]", id="picker-hint")
 
-    def action_confirm(self) -> None:
-        cols = [k for k in ALL_COLUMNS if self.query_one(f"#col-{k}", Checkbox).value]
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        """Enter key on OptionList fires this — use it to toggle."""
+        event.stop()
+        self.action_toggle_col()
+
+    def action_toggle_col(self) -> None:
+        ol = self.query_one("#picker-list", OptionList)
+        if ol.highlighted is None:
+            return
+        key = self._col_keys[ol.highlighted]
+        if key in self.selected_cols:
+            self.selected_cols.discard(key)
+        else:
+            self.selected_cols.add(key)
+        info = ALL_COLUMNS[key]
+        check = "✓" if key in self.selected_cols else " "
+        ol.replace_option_prompt(key, f"[green]{check}[/]  {info['label']}")
+
+    def _swap_options(self, idx_a: int, idx_b: int) -> None:
+        """Swap two items in the list and update the OptionList display."""
+        self._col_keys[idx_a], self._col_keys[idx_b] = self._col_keys[idx_b], self._col_keys[idx_a]
+        # Rebuild the whole list (OptionList doesn't have a swap API)
+        ol = self.query_one("#picker-list", OptionList)
+        ol.clear_options()
+        for key in self._col_keys:
+            info = ALL_COLUMNS[key]
+            check = "✓" if key in self.selected_cols else " "
+            ol.add_option(Option(f"[green]{check}[/]  {info['label']}", id=key))
+        ol.highlighted = idx_b
+
+    def action_move_up(self) -> None:
+        ol = self.query_one("#picker-list", OptionList)
+        idx = ol.highlighted
+        if idx is None or idx == 0:
+            return
+        self._swap_options(idx, idx - 1)
+
+    def action_move_down(self) -> None:
+        ol = self.query_one("#picker-list", OptionList)
+        idx = ol.highlighted
+        if idx is None or idx >= len(self._col_keys) - 1:
+            return
+        self._swap_options(idx, idx + 1)
+
+    def action_save(self) -> None:
+        # Return columns in their current order, filtered to selected
+        cols = [k for k in self._col_keys if k in self.selected_cols]
         self.dismiss(cols)
 
     def action_cancel(self) -> None:
@@ -936,7 +1057,7 @@ class ClaudeMonitor(App):
     StatsBar Label { width: auto; }
     #session-table { height: 1fr; }
     #detail-panel {
-        height: 7; padding: 0 2;
+        height: 12; padding: 0 2;
         background: $boost; dock: bottom; border-top: solid $primary;
     }
     #search-bar {
@@ -947,7 +1068,6 @@ class ClaudeMonitor(App):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
-        Binding("enter", "open_menu", "Actions"),
         Binding("s", "cycle_sort", "Sort"),
         Binding("t", "toggle_subagents", "Tree"),
         Binding("c", "pick_columns", "Columns"),
@@ -964,6 +1084,7 @@ class ClaudeMonitor(App):
     _flat_rows: list[Session] = []
     _selected_key: str | None = None
     _visible_cols: list[str] = []
+    _col_order: list[str] = []
     _filter: str = ""
 
     def compose(self) -> ComposeResult:
@@ -972,7 +1093,7 @@ class ClaudeMonitor(App):
         yield DataTable(id="session-table", cursor_type="row")
         yield Input(placeholder="Filter sessions...", id="search-bar")
         yield Static(
-            "[dim]↑↓/jk navigate · [bold]Enter[/] actions · "
+            "[dim]↑↓/jk navigate · [bold]Enter[/] menu · "
             "[bold]s[/] sort · [bold]t[/] tree · "
             "[bold]c[/] columns · [bold]p[/] pause · "
             "[bold]/[/] search[/]",
@@ -982,6 +1103,7 @@ class ClaudeMonitor(App):
 
     def on_mount(self) -> None:
         self._visible_cols = get_visible_columns()
+        self._col_order = get_column_order()
         self._rebuild_table_columns()
         self.refresh_sessions()
         self.set_interval(3, self.refresh_sessions)
@@ -1008,6 +1130,10 @@ class ClaudeMonitor(App):
         if table.cursor_row is not None and table.cursor_row < len(self._flat_rows):
             self._selected_key = self._flat_rows[table.cursor_row].session_id
 
+        # Preserve scroll position across refresh
+        saved_scroll_x = table.scroll_x
+        saved_scroll_y = table.scroll_y
+
         self.sessions = parse_sessions()
         filtered = self._filter_sessions(self.sessions)
         sorted_sessions = sort_sessions(filtered, self.sort_mode)
@@ -1031,7 +1157,31 @@ class ClaudeMonitor(App):
                     table.move_cursor(row=idx)
                     break
 
+        # Restore scroll position
+        table.scroll_to(saved_scroll_x, saved_scroll_y, animate=False)
+
         self.query_one(StatsBar).update_stats(self.sessions, self.sort_mode)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Enter key pressed on a row — open context menu."""
+        if not (event.row_key and event.row_key.value):
+            return
+        s = next((s for s in self._flat_rows if s.session_id == event.row_key.value), None)
+        if not s:
+            return
+
+        def handle_action(action: str | None) -> None:
+            if action == "jump":
+                if not focus_terminal_session(s):
+                    self.notify("Could not find terminal", timeout=2)
+            elif action == "copy_id":
+                copy_to_clipboard(s.session_id)
+                self.notify("Copied", timeout=1)
+            elif action == "remote" and s.remote_url:
+                subprocess.run(["open", s.remote_url], capture_output=True)
+            elif action == "transcript":
+                subprocess.run(["open", "-R", s.transcript_path], capture_output=True)
+        self.push_screen(SessionMenu(s), handle_action)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if not (event.row_key and event.row_key.value):
@@ -1041,32 +1191,17 @@ class ClaudeMonitor(App):
             return
 
         icon, color = STATUS_DISPLAY.get(s.status, ("?", "white"))
-        remote = f"\n[dim]remote:[/] {s.remote_url}" if s.remote_url else ""
-        compact_info = f"  [dim]compactions:[/] {s.compact_count}" if s.compact_count else ""
-        mcp_info = f"  [dim]MCP:[/] {s.mcp_calls}" if s.mcp_calls else ""
 
-        activity = generate_activity(s)
-        activity_line = f"\n[dim]doing:[/] {activity}" if activity else ""
-        text_preview = ""
         if s.last_assistant_text:
-            preview = s.last_assistant_text[:100].replace("[", "\\[").replace("]", "\\]")
-            text_preview = f"\n[dim]said:[/] [italic]{preview}[/italic]"
-
-        dur = format_duration(s.created, s.last_activity)
-
-        self.query_one("#detail-panel", Static).update(
-            f"[bold]{s.title}[/] [{color}]{icon}[/]  "
-            f"[dim]id:[/] {s.session_id[:12]}  "
-            f"[dim]cost:[/] ${s.cost:.2f}  "
-            f"[dim]duration:[/] {dur}\n"
-            f"[dim]dir:[/] {s.cwd}\n"
-            f"[dim]tokens:[/] {format_tokens(s.tokens_in)} in / "
-            f"{format_tokens(s.tokens_out)} out  "
-            f"[dim]model:[/] {s.model}"
-            f"{compact_info}{mcp_info}"
-            f"{activity_line}{text_preview}"
-            f"{remote}"
-        )
+            preview = s.last_assistant_text[:400].replace("[", "\\[").replace("]", "\\]")
+            self.query_one("#detail-panel", Static).update(
+                f"[bold]{s.title}[/] [{color}]{icon}[/]\n"
+                f"[italic]{preview}[/italic]"
+            )
+        else:
+            self.query_one("#detail-panel", Static).update(
+                f"[bold]{s.title}[/] [{color}]{icon}[/]"
+            )
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "search-bar":
@@ -1110,16 +1245,21 @@ class ClaudeMonitor(App):
         self.notify(f"Subagents {'shown' if self.show_subagents else 'hidden'}", timeout=1)
 
     def action_pick_columns(self) -> None:
-        def on_result(cols: list[str] | None) -> None:
+        picker = ColumnPicker(self._visible_cols, self._col_order)
+
+        def on_dismiss(cols: list[str] | None) -> None:
             if cols is not None and cols:
+                self._col_order = picker._col_keys
                 self._visible_cols = cols
                 prefs = load_prefs()
                 prefs["columns"] = cols
+                prefs["column_order"] = self._col_order
                 save_prefs(prefs)
                 self._rebuild_table_columns()
                 self.refresh_sessions()
                 self.notify("Columns updated", timeout=1)
-        self.push_screen(ColumnPicker(self._visible_cols), on_result)
+
+        self.push_screen(picker, on_dismiss)
 
     def action_pause_all(self) -> None:
         working = [s for s in self.sessions if s.status == "working"]
@@ -1142,24 +1282,6 @@ class ClaudeMonitor(App):
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
         self.notify(f"Paused {paused} process(es)", timeout=2)
-
-    def action_open_menu(self) -> None:
-        table = self.query_one("#session-table", DataTable)
-        if table.cursor_row is None or table.cursor_row >= len(self._flat_rows):
-            return
-        session = self._flat_rows[table.cursor_row]
-
-        def handle_action(action: str | None) -> None:
-            if action == "jump":
-                focus_ghostty_session(session)
-            elif action == "copy_id":
-                copy_to_clipboard(session.session_id)
-                self.notify("Copied", timeout=1)
-            elif action == "remote" and session.remote_url:
-                subprocess.run(["open", session.remote_url], capture_output=True)
-            elif action == "transcript":
-                subprocess.run(["open", "-R", session.transcript_path], capture_output=True)
-        self.push_screen(SessionMenu(session), handle_action)
 
     def action_cursor_down(self) -> None:
         self.query_one("#session-table", DataTable).action_cursor_down()

@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
+SL_LOG="/tmp/claude-statusline.log"
+# Keep log from growing unbounded — truncate at 500 lines
+if [ -f "$SL_LOG" ] && [ "$(wc -l < "$SL_LOG")" -gt 500 ]; then
+  tail -250 "$SL_LOG" > "${SL_LOG}.tmp" && mv "${SL_LOG}.tmp" "$SL_LOG"
+fi
+echo "$(date '+%H:%M:%S') CALLED pid=$$" >> "$SL_LOG"
 input=$(cat)
 
-# Single jq call to extract all fields
-eval "$(echo "$input" | jq -r '
+# Single jq call to extract all fields — wrapped so parse errors don't kill statusline
+cwd="" session_name="" remaining="" total_input=0 total_output=0 cost_raw=0 model="" transcript=""
+jq_out=$(echo "$input" | jq -r '
   @sh "cwd=\(.cwd // empty)",
   @sh "session_name=\(.session_name // empty)",
   @sh "remaining=\(.context_window.remaining_percentage // empty)",
@@ -11,7 +18,7 @@ eval "$(echo "$input" | jq -r '
   @sh "cost_raw=\(.cost.total_cost_usd // 0)",
   @sh "model=\(if .model | type == "object" then .model.display_name // .model.id else .model // empty end)",
   @sh "transcript=\(.transcript_path // empty)"
-')"
+' 2>/dev/null) && eval "$jq_out"
 cwd=${cwd##*/}
 
 tokens=$(awk "BEGIN {
@@ -37,7 +44,8 @@ if [ -n "$transcript" ] && [ -f "$transcript" ]; then
 
   if [ "$tcache_stale" = true ]; then
     # Single awk pass over transcript instead of two greps
-    eval "$(awk -F'"' '
+    _url="" _compact=0
+    awk_out=$(awk -F'"' '
       /\"url\":\"https:\/\/claude\.ai\/code\/session_/ {
         for (i=1; i<=NF; i++) {
           if ($i ~ /^https:\/\/claude\.ai\/code\/session_/) { url = $i }
@@ -45,7 +53,7 @@ if [ -n "$transcript" ] && [ -f "$transcript" ]; then
       }
       /\"subtype\":\"compact_boundary\"/ { count++ }
       END { printf "_url=%s\n_compact=%d\n", url, count+0 }
-    ' "$transcript")"
+    ' "$transcript" 2>/dev/null) && eval "$awk_out"
     printf '%s\n%s' "$_url" "$_compact" > "$tcache"
     remote_url="$_url"
     compact_count="$_compact"
@@ -153,11 +161,12 @@ else
 fi
 
 if [ -n "$usage_json" ]; then
-  # Single jq call for both fields
-  eval "$(echo "$usage_json" | jq -r '
+  # Single jq call for both fields — fail-safe
+  five_hour_pct="" five_hour_reset=""
+  usage_jq_out=$(echo "$usage_json" | jq -r '
     @sh "five_hour_pct=\(.five_hour.utilization // empty)",
     @sh "five_hour_reset=\(.five_hour.resets_at // empty)"
-  ' 2>/dev/null)"
+  ' 2>/dev/null) && eval "$usage_jq_out"
 
   if [ -n "$five_hour_pct" ]; then
     quota_used=$(printf '%.0f' "$five_hour_pct")
@@ -202,21 +211,28 @@ if [ -n "$usage_json" ]; then
   fi
 fi
 
-# Line 1: session name (or cwd fallback) + remote control link
-if [ -n "$remote_url" ]; then
-  printf '%s %b \033]8;;%s\033\\\033[90m%s\033[0m\033]8;;\033\\\n' "${session_name:-${cwd:-~}}" "$SEP" "$remote_url" "$remote_url"
-else
-  printf '%s %b \033[90mremote control off\033[0m\n' "${session_name:-${cwd:-~}}" "$SEP"
-fi
+echo "$(date '+%H:%M:%S') OK ctx=${remaining:-?} quota=${quota_used:-?} tokens=${tokens}" >> "$SL_LOG"
 
-# Line 2: ctx bar | quota ammo | tokens | cost | model
-parts=()
-[ -n "$ctx_bar" ] && parts+=("$ctx_bar")
-[ -n "$quota_bar" ] && parts+=("$quota_bar")
-parts+=("${tokens} tok")
-parts+=("${cost}")
-[ -n "$model" ] && parts+=("$model")
+# Render output — subshell so any failure emits fallback instead of nothing
+(
+  # Line 1: session name (or cwd fallback) + remote control link
+  if [ -n "$remote_url" ]; then
+    printf '%s %b \033]8;;%s\033\\\033[90m%s\033[0m\033]8;;\033\\\n' "${session_name:-${cwd:-~}}" "$SEP" "$remote_url" "$remote_url"
+  else
+    printf '%s %b \033[90mremote control off\033[0m\n' "${session_name:-${cwd:-~}}" "$SEP"
+  fi
 
-printf '%b' "${parts[0]}"
-for p in "${parts[@]:1}"; do printf ' %b %b' "$SEP" "$p"; done
-printf '\n'
+  # Line 2: ctx bar | quota ammo | tokens | cost | model
+  parts=()
+  [ -n "$ctx_bar" ] && parts+=("$ctx_bar")
+  [ -n "$quota_bar" ] && parts+=("$quota_bar")
+  [ -n "$tokens" ] && parts+=("${tokens} tok")
+  [ -n "$cost" ] && parts+=("${cost}")
+  [ -n "$model" ] && parts+=("$model")
+
+  if [ ${#parts[@]} -gt 0 ]; then
+    printf '%b' "${parts[0]}"
+    for p in "${parts[@]:1}"; do printf ' %b %b' "$SEP" "$p"; done
+  fi
+  printf '\n'
+) 2>/dev/null || printf '%s\n---\n' "${session_name:-${cwd:-~}}"
