@@ -658,7 +658,7 @@ def _scan_terminal_titles() -> list[str]:
     jxa = """(() => {
         const se = Application("System Events");
         const t = [];
-        const apps = ["ghostty", "Terminal"];
+        const apps = ["Ghostty", "ghostty", "Terminal"];
         for (const app of apps) {
             try {
                 const proc = se.processes.byName(app);
@@ -1387,7 +1387,12 @@ def session_has_debrief(transcript_path: str) -> bool:
 
 
 def _send_to_terminal_session(session: Session, text: str) -> bool:
-    """Find the session's terminal window, raise it, and type text + Enter."""
+    """Find the session's terminal window, raise it, and type text + Enter.
+
+    Uses the same title+content matching strategy as _raise_window_by_content:
+    1. Title match (works for renamed sessions, including inactive tabs)
+    2. AXTextArea content match (works for unrenamed sessions titled "Claude Code")
+    """
     terminal = find_terminal_for_session(session)
     if not terminal:
         return False
@@ -1399,8 +1404,10 @@ def _send_to_terminal_session(session: Session, text: str) -> bool:
     if not match_name:
         return False
 
+    match_str = f"{match_name} \u2502"
     proc_names = json.dumps(list({terminal.lower(), terminal}))
     match_name_json = json.dumps(match_name)
+    match_str_json = json.dumps(match_str)
     text_json = json.dumps(text)
 
     jxa = f"""(() => {{
@@ -1414,20 +1421,54 @@ def _send_to_terminal_session(session: Session, text: str) -> bool:
         if (!proc) return "notfound";
         const wins = proc.windows();
         const matchName = {match_name_json};
+        const matchStr = {match_str_json};
+
+        // Pass 1: title match (instant, works for renamed sessions)
+        const titleCandidates = [];
         for (let i = 0; i < wins.length; i++) {{
-            const title = wins[i].name();
-            if (title.includes(matchName)) {{
-                wins[i].actions["AXRaise"].perform();
-                try {{ wins[i].attributes["AXMain"].value = true; }} catch(e) {{}}
-                proc.frontmost = true;
-                delay(0.3);
-                se.keystroke({text_json});
-                delay(0.1);
-                se.keyCode(36);
-                return "sent:" + title;
+            if (wins[i].name().includes(matchName)) {{
+                titleCandidates.push(wins[i]);
             }}
         }}
-        return "no_match";
+
+        let target = null;
+        if (titleCandidates.length === 1) {{
+            target = titleCandidates[0];
+        }} else if (titleCandidates.length > 1) {{
+            // Disambiguate with content
+            for (const w of titleCandidates) {{
+                try {{
+                    const full = w.groups[0].groups[0].textAreas[0].value();
+                    if (full.substring(full.length - 500).includes(matchStr)) {{
+                        target = w; break;
+                    }}
+                }} catch(e) {{}}
+            }}
+            if (!target) target = titleCandidates[0];
+        }}
+
+        // Pass 2: content match (for unrenamed sessions titled "Claude Code")
+        if (!target) {{
+            for (let i = 0; i < wins.length; i++) {{
+                try {{
+                    const full = wins[i].groups[0].groups[0].textAreas[0].value();
+                    if (full.substring(full.length - 500).includes(matchStr)) {{
+                        target = wins[i]; break;
+                    }}
+                }} catch(e) {{}}
+            }}
+        }}
+
+        if (!target) return "no_match";
+
+        target.actions["AXRaise"].perform();
+        try {{ target.attributes["AXMain"].value = true; }} catch(e) {{}}
+        proc.frontmost = true;
+        delay(0.3);
+        se.keystroke({text_json});
+        delay(0.1);
+        se.keyCode(36);
+        return "sent:" + target.name();
     }})()"""
 
     try:
@@ -1905,6 +1946,7 @@ class ClaudeMonitor(App):
         self.refresh_sessions()
         self.set_interval(3, self.refresh_sessions)
         self.set_interval(600, self._audit_stats)  # Every 10 minutes
+        self.query_one("#session-table", DataTable).focus()
         mlog("app", "started")
 
     def _rebuild_table_columns(self) -> None:
