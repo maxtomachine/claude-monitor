@@ -1999,6 +1999,9 @@ class ClaudeMonitor(App):
                 ok = resume_session(s)
                 if ok:
                     self.notify(f"Resuming {s.title[:20]}…", timeout=4)
+                    # Force PID map refresh so next cycle picks up the new process
+                    global _pid_map_ts
+                    _pid_map_ts = 0
                 else:
                     self.notify("Could not open terminal", timeout=4)
                 mlog("menu", "resume_result", sid=s.session_id[:12], success=ok)
