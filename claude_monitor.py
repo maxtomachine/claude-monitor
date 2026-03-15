@@ -621,6 +621,7 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
 
 
 _liveness_logged: set[str] = set()  # Track which sessions we've logged about
+_confirmed_dead: set[str] = set()  # Sessions confirmed dead (PID died or debrief done)
 _terminal_titles: list[str] = []  # Cached window titles from last scan
 _terminal_titles_ts: float = 0  # When we last scanned
 
@@ -707,17 +708,24 @@ def _is_session_alive(session_id: str, display_title: str = "") -> bool | None:
     Uses the PID map (built once per refresh) for O(1) lookup instead of
     scanning the sessions directory per-session.
     """
+    # Sessions confirmed dead should stay dead (don't let stale window titles
+    # resurrect them). Cleared on manual refresh ('r').
+    if session_id in _confirmed_dead:
+        return False
+
     _refresh_pid_map()
 
     # Strategy 1: PID map lookup (O(1), no I/O)
     if session_id in _pid_map:
         pid = _pid_map[session_id]
         if pid is not None:
+            _confirmed_dead.discard(session_id)  # Came back (resumed)
             if session_id not in _liveness_logged:
                 mlog("status", "pid_alive", sid=session_id[:12], pid=pid)
                 _liveness_logged.add(session_id)
             return True
         else:
+            _confirmed_dead.add(session_id)
             _liveness_logged.discard(session_id)
             return False
 
@@ -1472,6 +1480,9 @@ def _poll_debrief_done_signals(sessions: list[Session]) -> list[str]:
         else:
             mlog("signal", "debrief_orphan", sid=sid[:12])
 
+        # Mark as confirmed dead so window title doesn't resurrect it
+        _confirmed_dead.add(sid)
+
         # Clean up the signal file regardless
         try:
             signal_file.unlink()
@@ -2213,6 +2224,7 @@ class ClaudeMonitor(App):
         _terminal_titles_ts = 0  # Force fresh window title scan
         _pid_map_ts = 0  # Force fresh PID map
         _liveness_logged.clear()  # Re-evaluate all sessions
+        _confirmed_dead.clear()  # Allow dead sessions to be re-detected
         _scan_cache.clear()  # Force re-read all transcripts
         _subagent_cache.clear()
         self._refresh_pending = False  # Allow immediate refresh
