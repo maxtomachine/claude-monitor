@@ -1437,13 +1437,47 @@ def copy_to_clipboard(text: str) -> None:
         pass
 
 
+def _derive_cwd_from_transcript(transcript_path: str) -> str:
+    """Derive the original launch cwd from the transcript's project directory.
+
+    Claude CLI encodes: /Users/max/proj → -Users-max-proj
+    Reverse: strip leading dash, dashes back to slashes, validate.
+    For paths with dashes in names, greedy-resolve against the filesystem.
+    """
+    name = Path(transcript_path).parent.name
+    if not name.startswith("-"):
+        return ""
+    # Simple reversal (works when no directory names contain dashes)
+    simple = "/" + name[1:].replace("-", "/")
+    if Path(simple).is_dir():
+        return simple
+    # Greedy: resolve segments against filesystem for dash-in-name dirs
+    parts = name[1:].split("-")
+    path = "/"
+    i = 0
+    while i < len(parts):
+        for j in range(len(parts), i, -1):  # longest match first
+            candidate = path + "-".join(parts[i:j])
+            if Path(candidate).is_dir():
+                path = candidate + "/"
+                i = j
+                break
+        else:
+            break
+    return path.rstrip("/") or ""
+
+
 def resume_session(session: Session) -> bool:
     """Resume a Claude session in Terminal.app via AppleScript `do script`."""
     cmd = f"claude --dangerously-skip-permissions --resume {session.session_id}"
-    # Use the original project path (from sessions-index) for resume —
-    # Claude CLI resolves sessions by hashing the cwd, so we need the
-    # directory where `claude` was originally launched, not the last cwd.
-    cwd = session.project_path or session.cwd or str(Path.home())
+    # Claude CLI resolves sessions by hashing the cwd. Use the original
+    # launch directory: sessions-index projectPath > transcript path > last cwd.
+    cwd = (
+        session.project_path
+        or _derive_cwd_from_transcript(session.transcript_path)
+        or session.cwd
+        or str(Path.home())
+    )
 
     # Verify the JSONL transcript exists before trying to resume
     jsonl_exists = bool(session.transcript_path) and Path(session.transcript_path).exists()
