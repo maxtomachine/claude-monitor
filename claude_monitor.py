@@ -180,6 +180,7 @@ class Session:
     last_tool_input: dict = field(default_factory=dict)
     last_assistant_text: str = ""
     status_name: str = ""
+    project_path: str = ""  # Original launch directory (for resume)
 
 
 # ── Preferences ───────────────────────────────────────────────────────────────
@@ -476,6 +477,7 @@ def load_index_metadata() -> dict[str, dict]:
                     "summary": entry.get("summary", ""),
                     "firstPrompt": entry.get("firstPrompt", ""),
                     "messageCount": entry.get("messageCount", 0),
+                    "projectPath": entry.get("projectPath", project_path),
                 }
     return meta
 
@@ -617,6 +619,7 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
         last_tool_input=data["last_tool_input"],
         last_assistant_text=data["last_assistant_text"],
         status_name=status_name,
+        project_path=idx.get("projectPath", ""),
     )
 
 
@@ -1437,7 +1440,10 @@ def copy_to_clipboard(text: str) -> None:
 def resume_session(session: Session) -> bool:
     """Resume a Claude session in Terminal.app via AppleScript `do script`."""
     cmd = f"claude --dangerously-skip-permissions --resume {session.session_id}"
-    cwd = session.cwd or str(Path.home())
+    # Use the original project path (from sessions-index) for resume —
+    # Claude CLI resolves sessions by hashing the cwd, so we need the
+    # directory where `claude` was originally launched, not the last cwd.
+    cwd = session.project_path or session.cwd or str(Path.home())
 
     # Verify the JSONL transcript exists before trying to resume
     jsonl_exists = bool(session.transcript_path) and Path(session.transcript_path).exists()
