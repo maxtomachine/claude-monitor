@@ -1491,26 +1491,10 @@ class SessionMenu(ModalScreen[str]):
         super().__init__()
         self.session = session
 
-    def _has_reachable_name(self) -> bool:
-        """Check if the session has a name we can match in terminal titles."""
-        s = self.session
-        if _read_session_cache("name", s.session_id):
-            return True
-        # Fall back to status_name from statusline
-        if s.status_name:
-            return True
-        # If title is just the cwd basename, it's a default — won't match any window
-        cwd_name = Path(s.cwd).name if s.cwd else ""
-        if s.title == cwd_name or s.title == "Claude Code":
-            return False
-        return True
-
     def compose(self) -> ComposeResult:
         s = self.session
         options = []
         if s.status in ("archived", "closed"):
-            options.append(Option("▶   Resume session", id="resume"))
-        elif not self._has_reachable_name():
             options.append(Option("▶   Resume session", id="resume"))
         else:
             options.append(Option("🖥   Jump to terminal", id="jump"))
