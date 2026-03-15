@@ -1519,7 +1519,7 @@ class SessionMenu(ModalScreen[str]):
             options.append(Option("🔗  Open remote control", id="remote"))
         options.append(Option("📂  Open transcript", id="transcript"))
         if s.status not in ("archived", "closed", "debriefing"):
-            options.append(Option("🚪  Dismiss session", id="dismiss"))
+            options.append(Option("📝  Debrief & close", id="dismiss"))
         if s.status not in ("archived", "closed"):
             options.append(Option("💀  Kill process", id="kill"))
         options.append(Option("─" * 26, id="sep", disabled=True))
@@ -2056,7 +2056,7 @@ class ClaudeMonitor(App):
             if not sent:
                 self._dismiss_failed.add(sid)
                 self.call_from_thread(
-                    self.notify, "Could not find terminal to dismiss", timeout=3,
+                    self.notify, "Could not find terminal to debrief", timeout=3,
                 )
                 self._dismissing_sessions.pop(sid, None)
                 self.call_from_thread(self.refresh_sessions)
@@ -2083,7 +2083,7 @@ class ClaudeMonitor(App):
         if poll_count >= max_polls:
             mlog("dismiss", "timeout", sid=sid[:12])
             self._dismissing_sessions.pop(sid, None)
-            self.call_from_thread(self.notify, "Dismiss timed out", timeout=5)
+            self.call_from_thread(self.notify, "Debrief timed out", timeout=5)
             self.call_from_thread(self.refresh_sessions)
             return
 
@@ -2098,7 +2098,7 @@ class ClaudeMonitor(App):
 
         self._dismissing_sessions.pop(sid, None)
         title = session.title[:20]
-        self.call_from_thread(self.notify, f"Dismissed {title}", timeout=4)
+        self.call_from_thread(self.notify, f"Debriefed {title}", timeout=4)
         self.call_from_thread(self.refresh_sessions)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
