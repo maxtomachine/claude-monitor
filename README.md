@@ -1,6 +1,6 @@
 # Claude Monitor
 
-A btop-style terminal dashboard for monitoring Claude Code sessions in real-time.
+A btop-style terminal dashboard for monitoring Claude Code sessions in real-time, plus a custom two-line HUD statusline that lives inside every Claude Code session.
 
 ![Python](https://img.shields.io/badge/python-3.14+-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -19,7 +19,7 @@ Claude Monitor watches your `~/.claude/projects/` session logs and displays a li
 
 - **Live session table** — auto-refreshes every 3 seconds
 - **Activity tracking** — "Doing" column shows what each session is up to (gerund when working, past tense when idle)
-- **Context bar** — colored progress bar based on last API call input tokens (green → yellow → red as context depletes)
+- **Context bar** — colored progress bar (green → yellow → red as context depletes)
 - **Compaction tracking** — colored ✻ markers show how many times context was compacted
 - **Cost estimation** — per-session cost based on model pricing and token counts
 - **MCP tool call counts** — see which sessions are heavy MCP users
@@ -29,7 +29,8 @@ Claude Monitor watches your `~/.claude/projects/` session logs and displays a li
 - **Multi-terminal support** — jump to terminal works across Ghostty, iTerm2, Terminal, Kitty, Alacritty, WezTerm, and Warp
 - **Sort modes** — cycle through: last active, status, context %, tokens, cost
 - **Search/filter** — `/` to filter sessions by name, project, status, or model
-- **Column picker** — toggle columns on/off, reorder with Shift+↑↓, preferences saved to disk
+- **Column picker** — toggle columns on/off, reorder with Shift+arrows, preferences saved to disk
+- **Statusline config** — configure the in-session HUD statusline with a live preview
 - **Pause all** — send SIGINT to all working Claude Code processes
 - **Remote control URLs** — open `claude.ai/code/session_*` links directly
 
@@ -37,16 +38,60 @@ Claude Monitor watches your `~/.claude/projects/` session logs and displays a li
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` / ↑ / ↓ | Navigate sessions |
+| `j` / `k` / arrows | Navigate sessions |
 | `Enter` | Open action menu for selected session |
 | `s` | Cycle sort mode |
 | `t` | Toggle subagent tree view |
-| `c` | Open column picker (Enter/Space toggle, Shift+↑↓ reorder, `s` save) |
+| `c` | Open column picker |
+| `l` | Open statusline config with live preview |
 | `p` | Pause all working sessions |
 | `/` | Search / filter |
 | `Esc` | Clear search |
 | `r` | Manual refresh |
 | `q` | Quit |
+
+---
+
+## The Statusline
+
+A two-line HUD that lives inside every Claude Code session, showing context usage, rate limits, effort/speed modes, and session costs at a glance.
+
+```
+ctx ██░░░░░░▒▒  22%  🧠 high   113k tok
+use ▮▮▮▮▮▮▮▮▮▮   8%  ⚡ fast    24   $
+```
+
+### What each part shows
+
+**Line 1 — Context window:**
+- 10-block colored bar (green → yellow → red → blink red at 90%+)
+- Effort level indicator (🧠) — only when `/effort` is set to non-auto
+- Total token count
+
+**Line 2 — Usage quota:**
+- 10-block blue gradient ammo bar showing 5-hour rate limit usage
+- Fast mode indicator (⚡) — only when `/fast` is active
+- Session cost (rounded integer)
+
+### Design principles
+
+- **Most important info is leftmost** — bars and indicators survive even the narrowest terminal widths
+- **Columns align vertically** — tokens over cost, effort emoji over fast emoji, all lined up
+- **No truncation** — the terminal clips naturally; no complex width detection needed
+- **Indicators only when active** — 🧠 and ⚡ hide when effort is "auto" and fast is off, keeping the HUD clean
+- **Configurable** — press `l` in the monitor TUI to toggle parts on/off with a live preview
+
+### Color tiers (context bar)
+
+| Usage | Color |
+|-------|-------|
+| < 50% | Green |
+| 50-74% | Yellow |
+| 75-79% | Red |
+| 80-89% | Bold red |
+| 90%+ | Blinking red |
+
+---
 
 ## Install
 
@@ -79,6 +124,8 @@ git pull
 
 No reinstall required.
 
+---
+
 ## How it works
 
 1. **Session discovery** — scans `~/.claude/projects/**/*.jsonl` for files modified in the last 24 hours
@@ -96,12 +143,15 @@ No reinstall required.
 | Session name | `/rename` → `custom-title` event in JSONL |
 | Session summary | `sessions-index.json` → `summary` field |
 | Status | Signal files or timing heuristics |
-| Context % | Last API call's input tokens vs 200k window |
+| Context % | Ground-truth from statusline or token estimation |
 | Tokens / cost | Accumulated from `usage` blocks in assistant messages |
 | MCP calls | Count of `"mcp__"` occurrences in JSONL |
 | Compactions | Count of `agent-acompact-*.jsonl` in subagents dir |
 | Remote URL | `slug` field → `https://claude.ai/code/session_{slug}` |
 | Activity | Last `tool_use` block + gerund mapping, or text pattern extraction |
+| Effort level | Parsed from transcript (`/effort` command output) |
+| Fast mode | `output_style.name` from statusline JSON |
+| Usage quota | Anthropic API (`/api/oauth/usage`), cached 60s |
 
 ### Optional: session state hooks
 
@@ -116,6 +166,8 @@ For more accurate status detection, add hooks to `~/.claude/settings.json`:
 }
 ```
 
+---
+
 ## Configuration
 
 Preferences are saved to `~/.claude/monitor-prefs.json`:
@@ -123,43 +175,53 @@ Preferences are saved to `~/.claude/monitor-prefs.json`:
 ```json
 {
   "columns": ["status", "session", "project", "model", "context", "compact", "tokens", "cost", "active", "doing"],
-  "column_order": ["status", "session", "project", "model", "context", "compact", "tokens", "cost", "mcp", "msgs", "duration", "active", "doing"]
+  "column_order": ["status", "session", "project", "model", "context", "compact", "tokens", "cost", "mcp", "msgs", "duration", "active", "doing"],
+  "statusline": {
+    "quota_bar": true,
+    "fast_mode": true
+  }
 }
 ```
 
-Use the column picker (`c`) to customize which columns are visible and their order.
+### Column picker (`c`)
 
-### Available columns
+Toggle columns on/off and reorder them with Shift+arrows. Preferences persist across sessions.
 
 | Column | Description | Default |
 |--------|-------------|---------|
-| Status | Working / Waiting / Idle with color | ✓ |
-| Session | Name or AI summary | ✓ |
-| Project | Project directory | ✓ |
-| Model | Opus 4.6, Sonnet 4.6, etc. | ✓ |
-| Context | Colored bar + percentage | ✓ |
-| Compacts | ✻ markers for compaction count | ✓ |
-| Tokens | Total token count | ✓ |
-| Cost | Estimated $ spent | ✓ |
-| MCP | MCP tool call count | |
-| Msgs | Message count | |
-| Duration | Session lifetime | |
-| Active | Time since last activity | ✓ |
-| Doing | Current activity / last action | ✓ |
+| Status | Working / Waiting / Idle with color | on |
+| Session | Name or AI summary | on |
+| Project | Project directory | on |
+| Model | Opus 4.6, Sonnet 4.6, etc. | on |
+| Context | Colored bar + percentage | on |
+| Compacts | ✻ markers for compaction count | on |
+| Tokens | Total token count | on |
+| Cost | Estimated $ spent | on |
+| MCP | MCP tool call count | off |
+| Msgs | Message count | off |
+| Duration | Session lifetime | off |
+| Active | Time since last activity | on |
+| Doing | Current activity / last action | on |
+
+### Statusline config (`l`)
+
+Toggle statusline parts with a live mock preview. Currently active toggles:
+
+| Part | Description | Default |
+|------|-------------|---------|
+| Quota bar | Usage quota ammo bar on line 2 | on |
+| Fast mode | ⚡ indicator when /fast is active | on |
+
+---
 
 ## Testing
 
-The test suite covers pure functions, rendering, transcript parsing, and full TUI interactions using Textual's headless test framework.
+150 tests covering pure functions, rendering, transcript parsing, and full TUI interactions.
 
 ```bash
-# Install dev dependencies
 uv sync --group dev
-
-# Run all tests
 uv run pytest tests/ -v
 ```
-
-### Test structure
 
 | File | Tests | What it covers |
 |------|-------|----------------|
@@ -169,16 +231,13 @@ uv run pytest tests/ -v
 | `test_rendering.py` | 20 | Row rendering, column config, truncation, subagent display |
 | `test_tui.py` | 28 | Full app: keybindings, session menu, column picker, search, subagents |
 
+---
+
 ## Contributing
 
-The repo uses branch protection — all changes go through PRs.
-
 ```bash
-# Fork or clone
 git clone https://github.com/maxtomachine/claude-monitor.git
 cd claude-monitor
-
-# Create a branch
 git checkout -b my-feature
 
 # Make changes, run tests
@@ -191,60 +250,15 @@ gh pr create
 
 When adding new features, add corresponding tests. The TUI tests use Textual's `run_test()` pilot to simulate the full app headlessly — no terminal required.
 
+---
+
 ## Roadmap
 
+- [ ] Convert hot-path parsing to compiled language (Rust/Go) for performance
 - [ ] macOS menu bar companion — session count + status in the menu bar
 - [ ] Notification on session completion
 - [ ] Historical cost tracking across sessions
 - [ ] GitHub Actions CI for tests on PR
-
----
-
-# Companion: Custom Statusline
-
-A two-line statusline script for Claude Code that shows session context at a glance.
-
-```
-my-session | https://claude.ai/code/session_abc123
-▓▓▓▓▓▓░░ 74% | ●●●●○ 80% | 89k tok | $2.05 | Opus 4.6
-```
-
-### Statusline features
-
-- **Line 1**: Session name (via `/rename`) or cwd, plus remote control link
-- **Line 2**: Context remaining bar, usage quota bar, total tokens, cost, model
-- **Color rules**: context turns yellow below 50%, red with ⚠ below 25%
-- **Fail-safe**: subshell rendering with fallback, log rotation at `/tmp/claude-statusline.log`
-
-### Statusline install
-
-Handled automatically by `./install.sh`. To install manually, place the script at `~/.claude/statusline.sh` and add to `~/.claude/settings.json`:
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "bash ~/.claude/statusline.sh"
-  }
-}
-```
-
-### Statusline JSON input reference
-
-The script receives JSON on stdin:
-
-| Field | Description |
-|-------|-------------|
-| `session_id` | Current session UUID |
-| `session_name` | Custom session name (if set via `/rename`) |
-| `transcript_path` | Path to session JSONL |
-| `cwd` | Working directory |
-| `model.id` / `model.display_name` | Model info (object, not string) |
-| `cost.total_cost_usd` | Running cost |
-| `context_window.remaining_percentage` | Context % left |
-| `context_window.total_input_tokens` | Cumulative input tokens |
-| `context_window.total_output_tokens` | Cumulative output tokens |
-| `context_window.context_window_size` | Window size (e.g. 200000) |
 
 ---
 
