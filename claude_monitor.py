@@ -1856,7 +1856,7 @@ class ClaudeMonitor(App):
         Binding("a", "toggle_subagents", "Agents"),
         Binding("z", "toggle_archived", "All"),
         Binding("c", "pick_columns", "Columns"),
-        Binding("l", "statusline_config", "Statusline"),
+        # Binding("l", "statusline_config", "Statusline"),  # TODO: re-enable after statusline merge
         Binding("d", "toggle_debug", "Debug"),
         Binding("slash", "start_search", "Search"),
         Binding("escape", "clear_search", "Clear", show=False),
