@@ -620,8 +620,6 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
     )
 
 
-_liveness_logged: set[str] = set()  # Track which sessions we've logged about
-_confirmed_dead: set[str] = set()  # Sessions confirmed dead (PID died or debrief done)
 _terminal_titles: list[str] = []  # Cached window titles from last scan
 _terminal_titles_ts: float = 0  # When we last scanned
 
@@ -689,112 +687,47 @@ def _scan_terminal_titles() -> list[str]:
     return _terminal_titles
 
 
-def _count_unnamed_windows() -> int:
-    """Count terminal windows that could be unnamed Claude sessions.
 
-    Unnamed sessions show as '{emoji} Claude Code' in the title bar.
-    Named sessions show as '{emoji} session-name'.
-    Monitor shows as '/Users/...' or 'Claude Monitor'.
-    """
-    titles = _scan_terminal_titles()
-    return sum(1 for t in titles if t.endswith("Claude Code"))
-
-
-def _is_session_alive(session_id: str, display_title: str = "") -> bool | None:
+def _is_session_alive(session_id: str, display_title: str = "") -> bool:
     """Check if the Claude process for this session is still running.
 
-    Returns True (alive), False (confirmed dead), or None (unnamed/unknown).
-
-    Uses the PID map (built once per refresh) for O(1) lookup instead of
-    scanning the sessions directory per-session.
+    Single source of truth: PID files in ~/.claude/sessions/.
+    No PID file with a live process = not running.
     """
-    # Sessions confirmed dead should stay dead (don't let stale window titles
-    # resurrect them). Cleared on manual refresh ('r').
-    if session_id in _confirmed_dead:
-        return False
-
     _refresh_pid_map()
 
-    # Strategy 1: PID map lookup (O(1), no I/O)
     if session_id in _pid_map:
         pid = _pid_map[session_id]
         if pid is not None:
-            _confirmed_dead.discard(session_id)  # Came back (resumed)
-            if session_id not in _liveness_logged:
-                mlog("status", "pid_alive", sid=session_id[:12], pid=pid)
-                _liveness_logged.add(session_id)
             return True
-        else:
-            _confirmed_dead.add(session_id)
-            _liveness_logged.discard(session_id)
-            # Clean up stale name cache so window title can't resurrect it
-            try:
-                Path(f"/tmp/claude-name-{session_id}").unlink()
-            except OSError:
-                pass
-            return False
+        return False
 
-    # Strategy 2: check if session name appears in any terminal window title
-    match_name = _read_session_cache("name", session_id)
-
-    if match_name:
-        titles = _scan_terminal_titles()
-        found = any(match_name in t for t in titles)
-        if not found and session_id not in _liveness_logged:
-            mlog("status", "window_gone", sid=session_id[:12], name=match_name)
-            _liveness_logged.add(session_id)
-        if not found:
-            return False
-        return True
-
-    # No name cache — try display title against window titles
-    if display_title and display_title != "Claude Code":
-        cwd_name = Path.home().name  # "maxkirby"
-        if display_title != cwd_name:
-            titles = _scan_terminal_titles()
-            found = any(display_title in t for t in titles)
-            if not found and session_id not in _liveness_logged:
-                mlog("status", "window_gone_title", sid=session_id[:12], title=display_title)
-                _liveness_logged.add(session_id)
-            if not found:
-                return False
-            return True
-
-    # Unnamed session — can't match by title.
-    # Return None to signal "unknown, needs unnamed window budget"
-    if session_id not in _liveness_logged:
-        mlog("status", "unnamed_unresolved", sid=session_id[:12])
-        _liveness_logged.add(session_id)
-    return None
+    # No PID file at all — process is not running
+    return False
 
 
 def determine_status(session_id: str, last_assistant_time: float,
                      display_title: str = "") -> str:
-    alive = _is_session_alive(session_id, display_title)
-    # alive: True = confirmed alive, False = confirmed dead, None = unnamed/unknown
+    alive = _is_session_alive(session_id)
+    if not alive:
+        return "closed"
+    # Process is running — determine activity state
     if SIGNALS_DIR.exists():
         signal_file = SIGNALS_DIR / session_id
         if signal_file.exists():
             try:
                 s = signal_file.read_text().strip()
-                status = {"working": "working", "permission": "needs_approval",
-                          "stop": "waiting"}.get(s, "idle")
-                if status in ("working", "needs_approval", "waiting") and alive is False:
-                    return "closed"
-                return status
+                return {"working": "working", "permission": "needs_approval",
+                        "stop": "waiting"}.get(s, "idle")
             except OSError:
                 pass
     now = time.time()
     if last_assistant_time > 0:
         elapsed = now - last_assistant_time
         if elapsed < 30:
-            return "closed" if alive is False else "working"
+            return "working"
         elif elapsed < 300:
-            return "closed" if alive is False else "waiting"
-    if alive is False:
-        return "closed"
-    if alive is None:
-        return "unnamed_idle"  # Needs unnamed window budget resolution
+            return "waiting"
     return "idle"
 
 
@@ -1485,15 +1418,6 @@ def _poll_debrief_done_signals(sessions: list[Session]) -> list[str]:
         else:
             mlog("signal", "debrief_orphan", sid=sid[:12])
 
-        # Mark as confirmed dead and clean up stale cache files so
-        # window title matching can't resurrect the session (survives restart)
-        _confirmed_dead.add(sid)
-        for suffix in ("name", "ctx", "url"):
-            try:
-                Path(f"/tmp/claude-{suffix}-{sid}").unlink()
-            except OSError:
-                pass
-
         # Clean up the signal file
         try:
             signal_file.unlink()
@@ -1969,14 +1893,6 @@ class ClaudeMonitor(App):
         try:
             sessions = parse_sessions(include_archived=self.show_archived)
 
-            # Resolve unnamed_idle sessions using window budget
-            unnamed = [s for s in sessions if s.status == "unnamed_idle"]
-            if unnamed:
-                budget = _count_unnamed_windows()
-                unnamed.sort(key=lambda s: s.last_activity, reverse=True)
-                for i, s in enumerate(unnamed):
-                    s.status = "idle" if i < budget else "closed"
-
             # Hide closed sessions unless "All" is toggled
             if not self.show_archived:
                 sessions = [s for s in sessions if s.status != "closed"]
@@ -2231,11 +2147,9 @@ class ClaudeMonitor(App):
         self.query_one("#session-table", DataTable).focus()
 
     def action_refresh(self) -> None:
-        global _terminal_titles_ts, _liveness_logged, _pid_map_ts
+        global _terminal_titles_ts, _pid_map_ts
         _terminal_titles_ts = 0  # Force fresh window title scan
         _pid_map_ts = 0  # Force fresh PID map
-        _liveness_logged.clear()  # Re-evaluate all sessions
-        _confirmed_dead.clear()  # Allow dead sessions to be re-detected
         _scan_cache.clear()  # Force re-read all transcripts
         _subagent_cache.clear()
         self._refresh_pending = False  # Allow immediate refresh
