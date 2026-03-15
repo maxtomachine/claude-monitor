@@ -727,6 +727,11 @@ def _is_session_alive(session_id: str, display_title: str = "") -> bool | None:
         else:
             _confirmed_dead.add(session_id)
             _liveness_logged.discard(session_id)
+            # Clean up stale name cache so window title can't resurrect it
+            try:
+                Path(f"/tmp/claude-name-{session_id}").unlink()
+            except OSError:
+                pass
             return False
 
     # Strategy 2: check if session name appears in any terminal window title
@@ -1480,10 +1485,16 @@ def _poll_debrief_done_signals(sessions: list[Session]) -> list[str]:
         else:
             mlog("signal", "debrief_orphan", sid=sid[:12])
 
-        # Mark as confirmed dead so window title doesn't resurrect it
+        # Mark as confirmed dead and clean up stale cache files so
+        # window title matching can't resurrect the session (survives restart)
         _confirmed_dead.add(sid)
+        for suffix in ("name", "ctx", "url"):
+            try:
+                Path(f"/tmp/claude-{suffix}-{sid}").unlink()
+            except OSError:
+                pass
 
-        # Clean up the signal file regardless
+        # Clean up the signal file
         try:
             signal_file.unlink()
         except OSError:
