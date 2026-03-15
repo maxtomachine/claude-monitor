@@ -1520,6 +1520,8 @@ class SessionMenu(ModalScreen[str]):
         options.append(Option("📂  Open transcript", id="transcript"))
         if s.status not in ("archived", "closed", "debriefing"):
             options.append(Option("🚪  Dismiss session", id="dismiss"))
+        if s.status not in ("archived", "closed"):
+            options.append(Option("💀  Kill process", id="kill"))
         options.append(Option("─" * 26, id="sep", disabled=True))
         options.append(Option("❌  Close", id="close"))
 
@@ -2004,6 +2006,18 @@ class ClaudeMonitor(App):
                 subprocess.run(["open", "-R", s.transcript_path], capture_output=True)
             elif action == "dismiss":
                 self._start_dismiss(s)
+            elif action == "kill":
+                pid = _find_claude_pid(s)
+                if pid:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                        mlog("menu", "kill", sid=s.session_id[:12], pid=pid)
+                        self.notify(f"Killed {s.title[:20]} (PID {pid})", timeout=4)
+                    except OSError as e:
+                        mlog("menu", "kill_error", sid=s.session_id[:12], error=str(e))
+                        self.notify(f"Kill failed: {e}", timeout=4)
+                else:
+                    self.notify("No process found", timeout=4)
         self.push_screen(SessionMenu(s), handle_action)
 
     def _start_dismiss(self, session: Session) -> None:
