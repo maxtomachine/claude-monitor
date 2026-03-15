@@ -1438,33 +1438,14 @@ def copy_to_clipboard(text: str) -> None:
 
 
 def _derive_cwd_from_transcript(transcript_path: str) -> str:
-    """Derive the original launch cwd from the transcript's project directory.
+    """Derive the launch cwd from the project directory name.
 
     Claude CLI encodes: /Users/max/proj → -Users-max-proj
-    Reverse: strip leading dash, dashes back to slashes, validate.
-    For paths with dashes in names, greedy-resolve against the filesystem.
     """
     name = Path(transcript_path).parent.name
     if not name.startswith("-"):
         return ""
-    # Simple reversal (works when no directory names contain dashes)
-    simple = "/" + name[1:].replace("-", "/")
-    if Path(simple).is_dir():
-        return simple
-    # Greedy: resolve segments against filesystem for dash-in-name dirs
-    parts = name[1:].split("-")
-    path = "/"
-    i = 0
-    while i < len(parts):
-        for j in range(len(parts), i, -1):  # longest match first
-            candidate = path + "-".join(parts[i:j])
-            if Path(candidate).is_dir():
-                path = candidate + "/"
-                i = j
-                break
-        else:
-            break
-    return path.rstrip("/") or ""
+    return "/" + name[1:].replace("-", "/")
 
 
 def resume_session(session: Session) -> bool:
