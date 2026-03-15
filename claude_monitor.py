@@ -1366,6 +1366,8 @@ def focus_terminal_session(session: Session) -> bool:
     if match_name:
         titles = _scan_terminal_titles()
         if any(match_name in t for t in titles):
+            # IMPORTANT: Must try BOTH apps. Sessions can run in either
+            # Ghostty or Terminal.app — do NOT "simplify" to one app.
             for app in ("Ghostty", "Terminal"):
                 mlog("jump", "fast_path_try", sid=session.session_id[:12],
                      name=match_name, app=app)
@@ -2010,6 +2012,12 @@ class ClaudeMonitor(App):
         self._flat_rows = flat
 
         table = self.query_one("#session-table", DataTable)
+        # Snapshot cursor and scroll right before clear (user may have navigated
+        # since refresh_sessions() dispatched the worker)
+        if table.cursor_row is not None and table.cursor_row < len(flat):
+            selected_key = self._flat_rows[table.cursor_row].session_id if table.cursor_row < len(self._flat_rows) else self._selected_key
+        else:
+            selected_key = self._selected_key
         saved_scroll_x = table.scroll_x
         saved_scroll_y = table.scroll_y
 
@@ -2017,9 +2025,9 @@ class ClaudeMonitor(App):
         for s, cells in rendered:
             table.add_row(*cells, key=s.session_id)
 
-        if self._selected_key:
+        if selected_key:
             for idx, s in enumerate(flat):
-                if s.session_id == self._selected_key:
+                if s.session_id == selected_key:
                     table.move_cursor(row=idx)
                     break
 
