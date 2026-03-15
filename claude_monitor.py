@@ -4,6 +4,7 @@
 import json
 import os
 import re
+import signal
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 
+from rich.markup import escape as rich_escape
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -25,6 +27,7 @@ from textual.widgets.option_list import Option
 CLAUDE_DIR = Path.home() / ".claude" / "projects"
 SIGNALS_DIR = Path.home() / ".claude" / "session-signals"
 TASKS_DIR = Path.home() / ".claude" / "tasks"
+SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 PREFS_PATH = Path.home() / ".claude" / "monitor-prefs.json"
 DOING_MAX_WIDTH = 40
 
@@ -134,12 +137,17 @@ class SortMode(Enum):
         }[self]
 
 
-STATUS_PRIORITY = {"working": 0, "needs_approval": 1, "waiting": 2, "idle": 3, "archived": 4}
+STATUS_PRIORITY = {
+    "working": 0, "debriefing": 1, "needs_approval": 2,
+    "waiting": 3, "idle": 4, "closed": 5, "archived": 6,
+}
 STATUS_DISPLAY = {
     "working": ("● WORKING", "green"),
+    "debriefing": ("⏳ DEBRIEFING", "magenta"),
     "needs_approval": ("◉ APPROVE", "yellow"),
     "waiting": ("○ WAITING", "dark_orange"),
     "idle": ("◌ IDLE", "dim"),
+    "closed": ("⊘ CLOSED", "rgb(100,100,100)"),
     "archived": ("◇ ARCHIVED", "dim"),
 }
 
@@ -223,8 +231,22 @@ def parse_timestamp(ts: str) -> float:
         return 0.0
 
 
+_scan_cache: dict[str, tuple[float, dict]] = {}  # path -> (mtime, result)
+
+
 def scan_full_file(path: str) -> dict:
-    """Single-pass full file scan: tokens, MCP, title, slug, created, last activity."""
+    """Single-pass full file scan: tokens, MCP, title, slug, created, last activity.
+
+    Results are cached by (path, mtime) — unchanged files return instantly.
+    """
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0
+    cached = _scan_cache.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
     result = {
         "custom_title": "", "slug": "", "mcp_calls": 0,
         "tokens_in": 0, "tokens_out": 0,
@@ -336,23 +358,41 @@ def scan_full_file(path: str) -> dict:
     except OSError:
         pass
 
+    _scan_cache[path] = (mtime, result)
     return result
 
 
-def count_compactions(parent_path: str) -> int:
+_subagent_cache: dict[str, tuple[float, int, list[Path]]] = {}  # dir -> (mtime, compacts, paths)
+
+
+def _scan_subagent_dir(parent_path: str) -> tuple[int, list[Path]]:
+    """Scan subagent directory, cached by directory mtime."""
     parent = Path(parent_path)
     subagent_dir = parent.parent / parent.stem / "subagents"
     if not subagent_dir.exists():
-        return 0
-    return len(list(subagent_dir.glob("agent-acompact-*.jsonl")))
+        return 0, []
+    try:
+        mtime = subagent_dir.stat().st_mtime
+    except OSError:
+        return 0, []
+    key = str(subagent_dir)
+    cached = _subagent_cache.get(key)
+    if cached and cached[0] == mtime:
+        return cached[1], cached[2]
+
+    all_jsonl = sorted(subagent_dir.glob("*.jsonl"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    compacts = sum(1 for p in all_jsonl if p.name.startswith("agent-acompact-"))
+    _subagent_cache[key] = (mtime, compacts, all_jsonl)
+    return compacts, all_jsonl
+
+
+def count_compactions(parent_path: str) -> int:
+    return _scan_subagent_dir(parent_path)[0]
 
 
 def find_subagent_paths(parent_path: str) -> list[Path]:
-    parent = Path(parent_path)
-    subagent_dir = parent.parent / parent.stem / "subagents"
-    if not subagent_dir.exists():
-        return []
-    return sorted(subagent_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return _scan_subagent_dir(parent_path)[1]
 
 
 @dataclass
@@ -405,7 +445,7 @@ def format_plan(tasks: list[Task], max_lines: int = 8) -> str:
 
     lines = [header]
     for t in tasks[:max_lines]:
-        subj = t.subject[:50].replace("[", "\\[").replace("]", "\\]")
+        subj = rich_escape(t.subject[:50])
         if t.status == "completed":
             lines.append(f"  [green]✓[/] [dim]{subj}[/]")
         elif t.status == "in_progress":
@@ -478,6 +518,11 @@ def parse_sessions(include_archived: bool = False) -> list[Session]:
 
         session = build_session(str(jsonl_path), session_id, project, idx, mtime)
         if session:
+            # Hide ghost sessions: ≤20 output tokens = just the greeting
+            # Keep only if we can confirm a live process
+            if session.tokens_out <= 20:
+                if _is_session_alive(session_id) is not True:
+                    continue
             if is_archived:
                 session.status = "archived"
             session.compact_count = count_compactions(str(jsonl_path))
@@ -507,25 +552,11 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
                   parent_id: str = "") -> Session | None:
     data = scan_full_file(path)
 
-    status = determine_status(session_id, data["last_assistant_time"])
-
-    # Context %: prefer ground-truth from statusline cache, fall back to estimate
-    try:
-        context_pct = int(_read_session_cache("ctx", session_id))
-    except ValueError:
-        last_input = data["last_input_tokens"]
-        if last_input == 0:
-            context_pct = 100
-        else:
-            context_pct = max(0, 100 - int((last_input / 200000) * 100))
-
-    cost = estimate_cost(data["model_id"], data["tokens_in"], data["tokens_out"])
-
+    # Compute display title first — needed for both rendering and status check
     if is_subagent:
         parts = Path(path).stem.split("-")
         display_title = "-".join(parts[:2]) if len(parts) >= 2 else session_id[:12]
     else:
-        # Priority: custom title > index summary > first prompt > cwd
         display_title = (
             data["custom_title"]
             or idx.get("summary", "")
@@ -533,6 +564,22 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
             or Path(data["cwd"]).name
             or session_id[:8]
         )
+
+    status = determine_status(session_id, data["last_assistant_time"], display_title)
+
+    # Context %: how much context is USED (burnt).
+    # Statusline cache stores remaining %, so we flip it.
+    try:
+        remaining = int(_read_session_cache("ctx", session_id))
+        context_pct = 100 - remaining
+    except ValueError:
+        last_input = data["last_input_tokens"]
+        if last_input == 0:
+            context_pct = 0  # Nothing used yet
+        else:
+            context_pct = min(100, int((last_input / 200000) * 100))
+
+    cost = estimate_cost(data["model_id"], data["tokens_in"], data["tokens_out"])
 
     remote_url = ""
     # Slug: prefer live cache from statusline, fall back to transcript
@@ -565,23 +612,168 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
     )
 
 
-def determine_status(session_id: str, last_assistant_time: float) -> str:
+_liveness_logged: set[str] = set()  # Track which sessions we've logged about
+_terminal_titles: list[str] = []  # Cached window titles from last scan
+_terminal_titles_ts: float = 0  # When we last scanned
+
+# PID map: built once per refresh cycle to avoid re-scanning ~/.claude/sessions/
+# per-session. Maps sessionId -> alive PID (int) or None (dead/not found).
+_pid_map: dict[str, int | None] = {}
+_pid_map_ts: float = 0
+
+
+def _refresh_pid_map() -> None:
+    """Rebuild the PID map from ~/.claude/sessions/*.json files."""
+    global _pid_map, _pid_map_ts
+    now = time.time()
+    if now - _pid_map_ts < 2:
+        return
+    _pid_map = {}
+    if SESSIONS_DIR.is_dir():
+        for path in SESSIONS_DIR.iterdir():
+            if path.suffix != ".json":
+                continue
+            try:
+                data = json.loads(path.read_text())
+                sid = data.get("sessionId", "")
+                pid = int(data["pid"])
+                try:
+                    os.kill(pid, 0)
+                    _pid_map[sid] = pid  # Alive
+                except OSError:
+                    if sid not in _pid_map:  # Don't overwrite alive with dead
+                        _pid_map[sid] = None
+            except (json.JSONDecodeError, OSError, KeyError, ValueError):
+                continue
+    _pid_map_ts = now
+
+
+def _scan_terminal_titles() -> list[str]:
+    """Get window titles from all terminal apps. Cached for 3 seconds."""
+    global _terminal_titles, _terminal_titles_ts
+    now = time.time()
+    if now - _terminal_titles_ts < 3:
+        return _terminal_titles
+
+    jxa = """(() => {
+        const se = Application("System Events");
+        const t = [];
+        const apps = ["ghostty", "Terminal"];
+        for (const app of apps) {
+            try {
+                const proc = se.processes.byName(app);
+                const wins = proc.windows();
+                for (let i = 0; i < wins.length; i++) t.push(wins[i].name());
+            } catch(e) {}
+        }
+        return t.join("\\n");
+    })()"""
+    try:
+        result = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", jxa],
+            capture_output=True, text=True, timeout=3,
+        )
+        _terminal_titles = result.stdout.strip().splitlines() if result.stdout.strip() else []
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        _terminal_titles = []
+    _terminal_titles_ts = now
+    return _terminal_titles
+
+
+def _count_unnamed_windows() -> int:
+    """Count terminal windows that could be unnamed Claude sessions.
+
+    Unnamed sessions show as '{emoji} Claude Code' in the title bar.
+    Named sessions show as '{emoji} session-name'.
+    Monitor shows as '/Users/...' or 'Claude Monitor'.
+    """
+    titles = _scan_terminal_titles()
+    return sum(1 for t in titles if t.endswith("Claude Code"))
+
+
+def _is_session_alive(session_id: str, display_title: str = "") -> bool | None:
+    """Check if the Claude process for this session is still running.
+
+    Returns True (alive), False (confirmed dead), or None (unnamed/unknown).
+
+    Uses the PID map (built once per refresh) for O(1) lookup instead of
+    scanning the sessions directory per-session.
+    """
+    _refresh_pid_map()
+
+    # Strategy 1: PID map lookup (O(1), no I/O)
+    if session_id in _pid_map:
+        pid = _pid_map[session_id]
+        if pid is not None:
+            if session_id not in _liveness_logged:
+                mlog("status", "pid_alive", sid=session_id[:12], pid=pid)
+                _liveness_logged.add(session_id)
+            return True
+        else:
+            _liveness_logged.discard(session_id)
+            return False
+
+    # Strategy 2: check if session name appears in any terminal window title
+    match_name = _read_session_cache("name", session_id)
+
+    if match_name:
+        titles = _scan_terminal_titles()
+        found = any(match_name in t for t in titles)
+        if not found and session_id not in _liveness_logged:
+            mlog("status", "window_gone", sid=session_id[:12], name=match_name)
+            _liveness_logged.add(session_id)
+        if not found:
+            return False
+        return True
+
+    # No name cache — try display title against window titles
+    if display_title and display_title != "Claude Code":
+        cwd_name = Path.home().name  # "maxkirby"
+        if display_title != cwd_name:
+            titles = _scan_terminal_titles()
+            found = any(display_title in t for t in titles)
+            if not found and session_id not in _liveness_logged:
+                mlog("status", "window_gone_title", sid=session_id[:12], title=display_title)
+                _liveness_logged.add(session_id)
+            if not found:
+                return False
+            return True
+
+    # Unnamed session — can't match by title.
+    # Return None to signal "unknown, needs unnamed window budget"
+    if session_id not in _liveness_logged:
+        mlog("status", "unnamed_unresolved", sid=session_id[:12])
+        _liveness_logged.add(session_id)
+    return None
+
+
+def determine_status(session_id: str, last_assistant_time: float,
+                     display_title: str = "") -> str:
+    alive = _is_session_alive(session_id, display_title)
+    # alive: True = confirmed alive, False = confirmed dead, None = unnamed/unknown
     if SIGNALS_DIR.exists():
         signal_file = SIGNALS_DIR / session_id
         if signal_file.exists():
             try:
                 s = signal_file.read_text().strip()
-                return {"working": "working", "permission": "needs_approval",
-                        "stop": "waiting"}.get(s, "idle")
+                status = {"working": "working", "permission": "needs_approval",
+                          "stop": "waiting"}.get(s, "idle")
+                if status in ("working", "needs_approval", "waiting") and alive is False:
+                    return "closed"
+                return status
             except OSError:
                 pass
     now = time.time()
     if last_assistant_time > 0:
         elapsed = now - last_assistant_time
         if elapsed < 30:
-            return "working"
+            return "closed" if alive is False else "working"
         elif elapsed < 300:
-            return "waiting"
+            return "closed" if alive is False else "waiting"
+    if alive is False:
+        return "closed"
+    if alive is None:
+        return "unnamed_idle"  # Needs unnamed window budget resolution
     return "idle"
 
 
@@ -633,16 +825,17 @@ def format_duration(created: float, last_activity: float) -> str:
 
 
 def format_context_bar(pct: int, width: int = 10) -> str:
+    """Render context usage bar. pct = % of context USED (higher = worse)."""
     filled = round(pct / 100 * width)
     empty = width - filled
     if pct < 25:
-        color = "red"
-    elif pct < 50:
-        color = "yellow"
-    elif pct < 75:
-        color = "green"
-    else:
         color = "bright_green"
+    elif pct < 50:
+        color = "green"
+    elif pct < 75:
+        color = "yellow"
+    else:
+        color = "red"
     return f"[{color}]{'█' * filled}[/][dim]{'░' * empty}[/] {pct}%"
 
 
@@ -816,7 +1009,7 @@ def generate_activity(s: Session) -> str:
     # Apply status-based transformation
     if s.status == "needs_approval":
         return "Awaiting approval"
-    elif s.status in ("idle", "waiting"):
+    elif s.status in ("idle", "waiting", "closed"):
         return _to_past_tense(gerund)
     else:
         return gerund
@@ -878,7 +1071,7 @@ def render_row(s: Session, visible_cols: list[str]) -> list[str]:
             if activity:
                 if len(activity) > DOING_MAX_WIDTH:
                     activity = activity[:DOING_MAX_WIDTH - 1] + "…"
-                activity_escaped = activity.replace("[", "\\[").replace("]", "\\]")
+                activity_escaped = rich_escape(activity)
                 if s.status == "idle":
                     cells.append(f"[dim]{activity_escaped}[/]")
                 elif s.status == "needs_approval":
@@ -897,8 +1090,6 @@ def render_row(s: Session, visible_cols: list[str]) -> list[str]:
 
 # ── Terminal focus ────────────────────────────────────────────────────────────
 
-SESSIONS_DIR = Path.home() / ".claude" / "sessions"
-
 _TERMINAL_APPS: dict[str, str] = {
     "ghostty": "Ghostty", "iterm2": "iTerm2", "iterm": "iTerm2",
     "terminal": "Terminal", "kitty": "kitty", "alacritty": "Alacritty",
@@ -910,28 +1101,17 @@ def _find_claude_pid(session: Session) -> int | None:
     """Find the Claude CLI PID for a session.
 
     Strategies (most reliable first):
-    1. PID files in ~/.claude/sessions/<PID>.json
+    1. PID map (O(1) lookup, no I/O)
     2. lsof on the tasks directory for this session
     3. Match claude processes by session's transcript path
     """
     sid = session.session_id
 
-    # Strategy 1: PID files
-    if SESSIONS_DIR.is_dir():
-        for path in SESSIONS_DIR.iterdir():
-            if path.suffix != ".json":
-                continue
-            try:
-                data = json.loads(path.read_text())
-                if data.get("sessionId") == sid:
-                    pid = int(data["pid"])
-                    try:
-                        os.kill(pid, 0)
-                        return pid
-                    except OSError:
-                        continue
-            except (json.JSONDecodeError, OSError, KeyError, ValueError):
-                continue
+    # Strategy 1: PID map
+    _refresh_pid_map()
+    pid = _pid_map.get(sid)
+    if pid is not None:
+        return pid
 
     # Strategy 2: find who has the tasks directory open
     tasks_path = str(TASKS_DIR / sid)
@@ -990,16 +1170,8 @@ def _find_claude_pid(session: Session) -> int | None:
 
 
 
-_JUMP_LOG = Path("/tmp/claude-monitor-jump.log")
-
-
-def _jump_log(msg: str) -> None:
-    """Append debug line to jump log."""
-    try:
-        with _JUMP_LOG.open("a") as f:
-            f.write(f"{datetime.now():%H:%M:%S} {msg}\n")
-    except OSError:
-        pass
+import monitor_log
+from monitor_log import log as mlog
 
 
 def _raise_window_by_content(session: Session, app_name: str) -> bool:
@@ -1023,14 +1195,12 @@ def _raise_window_by_content(session: Session, app_name: str) -> bool:
     # 1. Fresh file (handles renames since last refresh)
     # 2. Cached status_name (from build_session)
     # 3. Transcript-derived title (last resort)
-    name_file = Path(f"/tmp/claude-name-{session.session_id}")
-    try:
-        match_name = name_file.read_text().strip()
-    except OSError:
-        match_name = session.status_name or session.title or ""
-
+    match_name = (
+        _read_session_cache("name", session.session_id)
+        or session.status_name or session.title or ""
+    )
     if not match_name:
-        _jump_log("  no match name — cannot match")
+        mlog("jump", "no_match_name", sid=session.session_id[:12])
         return False
 
     match_str = f"{match_name} \u2502"
@@ -1039,7 +1209,7 @@ def _raise_window_by_content(session: Session, app_name: str) -> bool:
     match_name_json = json.dumps(match_name)
     match_str_json = json.dumps(match_str)
 
-    _jump_log(f"_raise_window_by_content app={app_name} name={match_name!r}")
+    mlog("jump", "raise_attempt", app=app_name, name=match_name, sid=session.session_id[:12])
 
     jxa = f"""(() => {{
         const se = Application("System Events");
@@ -1127,13 +1297,13 @@ def _raise_window_by_content(session: Session, app_name: str) -> bool:
             capture_output=True, text=True, timeout=10,
         )
         out = result.stdout.strip()
-        _jump_log(f"  result: {out}")
+        mlog("jump", "jxa_result", result=out, sid=session.session_id[:12])
 
         if "matched:" in out or out.startswith("title_first:"):
             return True
-        _jump_log(f"  stderr: {result.stderr.strip()}")
+        mlog("jump", "jxa_miss", stderr=result.stderr.strip(), sid=session.session_id[:12])
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        _jump_log(f"  error: {e}")
+        mlog("jump", "jxa_error", error=str(e), sid=session.session_id[:12])
 
     return False
 
@@ -1175,80 +1345,181 @@ def find_terminal_for_session(session: Session) -> str | None:
 
 def focus_terminal_session(session: Session) -> bool:
     """Find and activate the terminal window containing this session."""
-    _jump_log(f"--- focus_terminal_session sid={session.session_id[:12]}...")
+    mlog("jump", "focus_start", sid=session.session_id[:12], title=session.title)
+
+    # Fast path: if session name is in a Ghostty window title, jump directly
+    # without needing to find the PID first
+    match_name = _read_session_cache("name", session.session_id) or session.status_name or ""
+
+    if match_name:
+        titles = _scan_terminal_titles()
+        if any(match_name in t for t in titles):
+            # Try each terminal app — Ghostty first (most common), then Terminal
+            for app in ("Ghostty", "Terminal"):
+                mlog("jump", "fast_path_try", sid=session.session_id[:12],
+                     name=match_name, app=app)
+                if _raise_window_by_content(session, app):
+                    return True
+
+    # Standard path: find PID → terminal app → raise window
     terminal = find_terminal_for_session(session)
-    _jump_log(f"  terminal={terminal}")
+    mlog("jump", "terminal_lookup", sid=session.session_id[:12], terminal=terminal or "none")
 
     if terminal:
         return _raise_window_by_content(session, terminal)
 
-    _jump_log("  failed: no terminal found")
+    mlog("jump", "no_terminal", sid=session.session_id[:12])
     return False
+
+
+def session_has_debrief(transcript_path: str) -> bool:
+    """Check if /debrief was already run by scanning the tail of the transcript."""
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            chunk = min(size, 50_000)
+            f.seek(size - chunk)
+            tail = f.read()
+    except OSError:
+        return False
+    return b"/debrief" in tail or b'"skill":"debrief"' in tail
+
+
+def _send_to_terminal_session(session: Session, text: str) -> bool:
+    """Find the session's terminal window, raise it, and type text + Enter."""
+    terminal = find_terminal_for_session(session)
+    if not terminal:
+        return False
+
+    match_name = (
+        _read_session_cache("name", session.session_id)
+        or session.status_name or session.title or ""
+    )
+    if not match_name:
+        return False
+
+    proc_names = json.dumps(list({terminal.lower(), terminal}))
+    match_name_json = json.dumps(match_name)
+    text_json = json.dumps(text)
+
+    jxa = f"""(() => {{
+        const se = Application("System Events");
+        const names = {proc_names};
+        let proc = null;
+        for (const n of names) {{
+            try {{ proc = se.processes.byName(n); proc.name(); break; }}
+            catch(e) {{ proc = null; }}
+        }}
+        if (!proc) return "notfound";
+        const wins = proc.windows();
+        const matchName = {match_name_json};
+        for (let i = 0; i < wins.length; i++) {{
+            const title = wins[i].name();
+            if (title.includes(matchName)) {{
+                wins[i].actions["AXRaise"].perform();
+                try {{ wins[i].attributes["AXMain"].value = true; }} catch(e) {{}}
+                proc.frontmost = true;
+                delay(0.3);
+                se.keystroke({text_json});
+                delay(0.1);
+                se.keyCode(36);
+                return "sent:" + title;
+            }}
+        }}
+        return "no_match";
+    }})()"""
+
+    try:
+        result = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", jxa],
+            capture_output=True, text=True, timeout=10,
+        )
+        return "sent:" in result.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def _close_terminal_tab(session: Session) -> bool:
+    """Close the terminal tab for a session by sending 'exit' + Enter."""
+    return _send_to_terminal_session(session, "exit")
+
+
+DEBRIEF_DONE_PREFIX = Path("/tmp")
+DEBRIEF_DONE_PATTERN = "claude-debrief-done-*"
+
+
+def _poll_debrief_done_signals(sessions: list[Session]) -> list[str]:
+    """Check for debrief-done signal files and close matching terminal tabs.
+
+    Returns list of session IDs that were cleaned up.
+    """
+    cleaned = []
+    for signal_file in DEBRIEF_DONE_PREFIX.glob(DEBRIEF_DONE_PATTERN):
+        sid = signal_file.name.removeprefix("claude-debrief-done-")
+        if not sid:
+            continue
+
+        # Find the matching session to get its name for tab closing
+        session = next((s for s in sessions if s.session_id == sid), None)
+        mlog("signal", "debrief_done", sid=sid[:12], found_session=session is not None)
+        if session:
+            closed = _close_terminal_tab(session)
+            mlog("close", "tab_close_attempt", sid=sid[:12], title=session.title, success=closed)
+            if closed:
+                cleaned.append(sid)
+        else:
+            mlog("signal", "debrief_orphan", sid=sid[:12])
+
+        # Clean up the signal file regardless
+        try:
+            signal_file.unlink()
+        except OSError:
+            pass
+
+    return cleaned
 
 
 def copy_to_clipboard(text: str) -> None:
     try:
-        subprocess.run(["pbcopy"], input=text.encode(), timeout=2)
+        subprocess.run(["pbcopy"], input=text.encode(), timeout=4)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
 
 def resume_session(session: Session) -> bool:
-    """Open a new terminal tab and resume the given Claude session."""
-    cmd = f"claude --resume {session.session_id}"
+    """Resume a Claude session in Terminal.app via AppleScript `do script`."""
+    cmd = f"claude --dangerously-skip-permissions --resume {session.session_id}"
     cwd = session.cwd or str(Path.home())
 
-    # Try common terminal apps via AppleScript
-    for app in ("Ghostty", "iTerm2", "Terminal"):
-        try:
-            result = subprocess.run(
-                ["pgrep", "-x", app],
-                capture_output=True, text=True, timeout=2,
-            )
-            if not result.stdout.strip():
-                continue
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            continue
+    # Verify the JSONL transcript exists before trying to resume
+    jsonl_exists = bool(session.transcript_path) and Path(session.transcript_path).exists()
+    mlog("resume", "attempt", sid=session.session_id[:12], title=session.title,
+         cwd=cwd, jsonl_exists=jsonl_exists)
+    if not jsonl_exists:
+        mlog("resume", "no_jsonl", sid=session.session_id[:12],
+             path=session.transcript_path)
+        return False
 
-        if app == "Ghostty":
-            script = (
-                f'tell application "Ghostty" to activate\n'
-                f'delay 0.3\n'
-                f'tell application "System Events" to keystroke "t" using command down\n'
-                f'delay 0.3\n'
-                f'tell application "System Events" to keystroke "cd {cwd} && {cmd}"\n'
-                f'tell application "System Events" to key code 36'  # Enter
-            )
-        elif app == "iTerm2":
-            script = (
-                f'tell application "iTerm2"\n'
-                f'  activate\n'
-                f'  tell current window\n'
-                f'    create tab with default profile\n'
-                f'    tell current session\n'
-                f'      write text "cd {cwd} && {cmd}"\n'
-                f'    end tell\n'
-                f'  end tell\n'
-                f'end tell'
-            )
-        else:  # Terminal.app
-            script = (
-                f'tell application "Terminal"\n'
-                f'  activate\n'
-                f'  do script "cd {cwd} && {cmd}"\n'
-                f'end tell'
-            )
+    script = (
+        f'tell application "Terminal"\n'
+        f'  activate\n'
+        f'  do script "cd {cwd} && {cmd}"\n'
+        f'end tell'
+    )
 
-        try:
-            subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True, timeout=5,
-            )
-            return True
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            continue
-
-    return False
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=5,
+        )
+        mlog("resume", "launched", sid=session.session_id[:12],
+             rc=result.returncode,
+             stderr=result.stderr.strip() if result.stderr.strip() else None)
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        mlog("resume", "launch_error", sid=session.session_id[:12], error=str(e))
+        return False
 
 
 # ── Screens ───────────────────────────────────────────────────────────────────
@@ -1273,10 +1544,26 @@ class SessionMenu(ModalScreen[str]):
         super().__init__()
         self.session = session
 
+    def _has_reachable_name(self) -> bool:
+        """Check if the session has a name we can match in terminal titles."""
+        s = self.session
+        if _read_session_cache("name", s.session_id):
+            return True
+        # Fall back to status_name from statusline
+        if s.status_name:
+            return True
+        # If title is just the cwd basename, it's a default — won't match any window
+        cwd_name = Path(s.cwd).name if s.cwd else ""
+        if s.title == cwd_name or s.title == "Claude Code":
+            return False
+        return True
+
     def compose(self) -> ComposeResult:
         s = self.session
         options = []
-        if s.status == "archived":
+        if s.status in ("archived", "closed"):
+            options.append(Option("▶   Resume session", id="resume"))
+        elif not self._has_reachable_name():
             options.append(Option("▶   Resume session", id="resume"))
         else:
             options.append(Option("🖥   Jump to terminal", id="jump"))
@@ -1284,6 +1571,8 @@ class SessionMenu(ModalScreen[str]):
         if s.remote_url:
             options.append(Option("🔗  Open remote control", id="remote"))
         options.append(Option("📂  Open transcript", id="transcript"))
+        if s.status not in ("archived", "closed", "debriefing"):
+            options.append(Option("🚪  Dismiss session", id="dismiss"))
         options.append(Option("─" * 26, id="sep", disabled=True))
         options.append(Option("❌  Close", id="close"))
 
@@ -1383,6 +1672,133 @@ class ColumnPicker(ModalScreen[list[str]]):
         self.dismiss(cols)
 
 
+# ── Statusline parts inventory ───────────────────────────────────────────────
+
+STATUSLINE_PARTS = {
+    "compact_str": {"label": "Compaction indicators (✻)", "line": 1, "default": True},
+    "ctx_warn":    {"label": "Compaction warning (⚠)",    "line": 1, "default": True},
+    "fast_mode":   {"label": "/fast indicator",           "line": 1, "default": True},
+    "quota_bar":   {"label": "Usage quota ammo bar",      "line": 2, "default": True},
+    "quota_reset": {"label": "Quota reset timer",         "line": 2, "default": False},
+    "tokens":      {"label": "Token count",               "line": 2, "default": False},
+    "cost":        {"label": "Session cost ($)",           "line": 2, "default": False},
+    "model":       {"label": "Model name",                "line": 2, "default": False},
+}
+
+STATUSLINE_DEFAULTS = {k: v["default"] for k, v in STATUSLINE_PARTS.items()}
+
+
+def load_statusline_prefs() -> dict[str, bool]:
+    """Load statusline prefs, falling back to defaults for missing keys."""
+    prefs = load_prefs()
+    saved = prefs.get("statusline", {})
+    merged = dict(STATUSLINE_DEFAULTS)
+    merged.update({k: v for k, v in saved.items() if k in STATUSLINE_DEFAULTS})
+    return merged
+
+
+def _render_mock_preview(sl_prefs: dict[str, bool]) -> str:
+    """Return a Rich-markup mock preview of the statusline."""
+    # Line 1: ctx bar (always on) + optional parts
+    ctx_bar = "ctx [green]████[/][yellow]██[/][dim]░░[/][red]▒▒[/] 47%"
+    line1_extras = []
+    if sl_prefs.get("compact_str"):
+        line1_extras.append("[yellow]✻✻[/]")
+    if sl_prefs.get("ctx_warn"):
+        line1_extras.append("[bold red]⚠ compact soon[/]")
+    if sl_prefs.get("fast_mode"):
+        line1_extras.append("[cyan]/fast[/]")
+
+    line1 = ctx_bar
+    if line1_extras:
+        # compact_str appends directly (no separator), others get separator
+        for i, extra in enumerate(line1_extras):
+            if i == 0 and sl_prefs.get("compact_str") and extra.startswith("[yellow]✻"):
+                line1 += f" {extra}"
+            else:
+                line1 += f" [dim]│[/] {extra}"
+
+    # Line 2: quota bar (if enabled) + optional parts
+    line2_parts = []
+    if sl_prefs.get("quota_bar"):
+        line2_parts.append("[blue]▮▮▮▮▮▮▮▮[/][dim]▯▯[/]  8%")
+    if sl_prefs.get("quota_reset"):
+        line2_parts.append("resets 4h32m")
+    if sl_prefs.get("tokens"):
+        line2_parts.append("15k tok")
+    if sl_prefs.get("cost"):
+        line2_parts.append("$1.23")
+    if sl_prefs.get("model"):
+        line2_parts.append("Opus 4.6")
+
+    lines = [line1]
+    if line2_parts:
+        line2 = "use " + (" [dim]│[/] ".join(line2_parts))
+        lines.append(line2)
+
+    return "\n".join(lines)
+
+
+class StatuslineConfig(ModalScreen[dict[str, bool] | None]):
+    BINDINGS = [
+        Binding("escape", "done", "Done"),
+        Binding("enter", "toggle_part", "Toggle"),
+        Binding("space", "toggle_part", "Toggle", show=False),
+    ]
+    CSS = """
+    StatuslineConfig { background: rgba(0, 0, 0, 0.5); align: center middle; }
+    #sl-container {
+        width: 52; height: auto; max-height: 28;
+        background: $surface; border: solid $primary; padding: 1 2;
+    }
+    #sl-title { text-align: center; text-style: bold; padding-bottom: 1; }
+    #sl-preview {
+        padding: 0 1; margin-bottom: 1;
+        background: $boost; border: solid $accent;
+    }
+    #sl-hint { text-align: center; color: $text-muted; padding-top: 1; }
+    #sl-list { height: auto; max-height: 12; }
+    """
+
+    def __init__(self, sl_prefs: dict[str, bool]) -> None:
+        super().__init__()
+        self.sl_prefs = dict(sl_prefs)
+        self._part_keys = list(STATUSLINE_PARTS.keys())
+
+    def compose(self) -> ComposeResult:
+        options = []
+        for key in self._part_keys:
+            info = STATUSLINE_PARTS[key]
+            check = "✓" if self.sl_prefs.get(key) else " "
+            line_tag = f"L{info['line']}"
+            options.append(Option(f"[green]{check}[/]  {info['label']}  [dim]{line_tag}[/]", id=key))
+        with Vertical(id="sl-container"):
+            yield Label("[bold]Statusline Config[/]", id="sl-title")
+            yield Static(_render_mock_preview(self.sl_prefs), id="sl-preview")
+            yield OptionList(*options, id="sl-list")
+            yield Label("[dim]Enter/Space toggle · Esc done[/]", id="sl-hint")
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self.action_toggle_part()
+
+    def action_toggle_part(self) -> None:
+        ol = self.query_one("#sl-list", OptionList)
+        if ol.highlighted is None:
+            return
+        key = self._part_keys[ol.highlighted]
+        self.sl_prefs[key] = not self.sl_prefs.get(key, False)
+        info = STATUSLINE_PARTS[key]
+        check = "✓" if self.sl_prefs[key] else " "
+        line_tag = f"L{info['line']}"
+        ol.replace_option_prompt(key, f"[green]{check}[/]  {info['label']}  [dim]{line_tag}[/]")
+        # Update preview
+        self.query_one("#sl-preview", Static).update(_render_mock_preview(self.sl_prefs))
+
+    def action_done(self) -> None:
+        self.dismiss(self.sl_prefs)
+
+
 # ── Main App ──────────────────────────────────────────────────────────────────
 
 
@@ -1391,38 +1807,45 @@ class StatsBar(Horizontal):
         yield Label("", id="stats-working")
         yield Label("", id="stats-waiting")
         yield Label("", id="stats-idle")
+        yield Label("", id="stats-closed")
         yield Label("", id="stats-total-cost")
         yield Label("", id="stats-sort")
+        yield Input(placeholder="🔍 filter...", id="search-bar")
 
     def update_stats(self, sessions: list[Session], sort_mode: SortMode) -> None:
         working = sum(1 for s in sessions if s.status == "working")
         waiting = sum(1 for s in sessions if s.status in ("waiting", "needs_approval"))
         idle = sum(1 for s in sessions if s.status == "idle")
+        closed = sum(1 for s in sessions if s.status == "closed")
         total_cost = sum(s.cost for s in sessions)
 
         self.query_one("#stats-working", Label).update(f" [green]● {working} working[/]  ")
         self.query_one("#stats-waiting", Label).update(f" [dark_orange]○ {waiting} waiting[/]  ")
         self.query_one("#stats-idle", Label).update(f" [dim]◌ {idle} idle[/]  ")
+        self.query_one("#stats-closed", Label).update(f" [rgb(100,100,100)]⊘ {closed} closed[/]  " if closed else "")
         self.query_one("#stats-total-cost", Label).update(f" [cyan]Σ ${total_cost:.2f}[/]  ")
         self.query_one("#stats-sort", Label).update(f" [magenta]sort: {sort_mode.label}[/]")
 
 
 class ClaudeMonitor(App):
     TITLE = "Claude Monitor"
+    ENABLE_COMMAND_PALETTE = False
     CSS = """
     Screen { background: $surface; }
     StatsBar {
         height: 1; padding: 0 1; background: $boost; dock: top;
     }
     StatsBar Label { width: auto; }
+    #search-bar {
+        width: 22; height: 1; border: none; padding: 0; margin-left: 2;
+        background: transparent; display: none;
+    }
+    #search-bar:focus { display: block; background: $boost; }
     #session-table { height: 1fr; }
     #detail-panel {
         height: auto; max-height: 35%; min-height: 5; padding: 0 2;
         background: $boost; dock: bottom; border-top: solid $primary;
         overflow-y: auto;
-    }
-    #search-bar {
-        height: 1; dock: bottom; display: none;
     }
     """
 
@@ -1431,8 +1854,10 @@ class ClaudeMonitor(App):
         Binding("r", "refresh", "Refresh"),
         Binding("s", "cycle_sort", "Sort"),
         Binding("a", "toggle_subagents", "Agents"),
-        Binding("z", "toggle_archived", "Archive"),
+        Binding("z", "toggle_archived", "All"),
         Binding("c", "pick_columns", "Columns"),
+        Binding("l", "statusline_config", "Statusline"),
+        Binding("d", "toggle_debug", "Debug"),
         Binding("slash", "start_search", "Search"),
         Binding("escape", "clear_search", "Clear", show=False),
         Binding("j", "cursor_down", "↓", show=False),
@@ -1442,23 +1867,31 @@ class ClaudeMonitor(App):
     sort_mode: reactive[SortMode] = reactive(SortMode.ACTIVITY)
     show_subagents: reactive[bool] = reactive(False)
     show_archived: reactive[bool] = reactive(False)
+    debug_logging: reactive[bool] = reactive(True)  # ON by default
     sessions: list[Session] = []
     _flat_rows: list[Session] = []
     _selected_key: str | None = None
     _visible_cols: list[str] = []
     _col_order: list[str] = []
     _filter: str = ""
+    _dismissing_sessions: dict[str, str] = {}  # sid -> "debriefing" | "closing"
+    _dismiss_failed: set[str] = set()  # sids where dismiss failed (can't reach terminal)
+    _prev_statuses: dict[str, str] = {}  # sid -> previous status (for transition logging)
+
+    def notify(self, message, *, timeout=5, **kwargs):
+        """Override to log every toast notification."""
+        mlog("toast", "notify", message=str(message))
+        super().notify(message, timeout=timeout, **kwargs)
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield StatsBar()
         yield DataTable(id="session-table", cursor_type="row")
-        yield Input(placeholder="Filter sessions...", id="search-bar")
         yield Static(
             "[dim]↑↓/jk navigate · [bold]Enter[/] menu · "
             "[bold]s[/] sort · [bold]a[/] agents · "
-            "[bold]z[/] archive · [bold]c[/] columns · "
-            "[bold]/[/] search[/]",
+            "[bold]z[/] all · [bold]c[/] columns · "
+            "[bold]d[/] debug · [bold]/[/] search[/]",
             id="detail-panel"
         )
         yield Footer()
@@ -1467,8 +1900,12 @@ class ClaudeMonitor(App):
         self._visible_cols = get_visible_columns()
         self._col_order = get_column_order()
         self._rebuild_table_columns()
+        # Set terminal window title (overrides Ghostty's cwd-based title)
+        print("\033]2;Claude Monitor\007", end="", flush=True)
         self.refresh_sessions()
         self.set_interval(3, self.refresh_sessions)
+        self.set_interval(600, self._audit_stats)  # Every 10 minutes
+        mlog("app", "started")
 
     def _rebuild_table_columns(self) -> None:
         table = self.query_one("#session-table", DataTable)
@@ -1487,30 +1924,97 @@ class ClaudeMonitor(App):
             or f in s.model.lower()
         )]
 
+    _refresh_pending: bool = False
+
     def refresh_sessions(self) -> None:
+        """Schedule a refresh — heavy work runs in a background thread."""
+        if self._refresh_pending:
+            return  # Previous refresh still running, skip
+        self._refresh_pending = True
+        # Snapshot UI state before background work
         table = self.query_one("#session-table", DataTable)
         if table.cursor_row is not None and table.cursor_row < len(self._flat_rows):
             self._selected_key = self._flat_rows[table.cursor_row].session_id
+        self.run_worker(
+            lambda: self._refresh_compute(),
+            thread=True,
+        )
 
-        # Preserve scroll position across refresh
+    def _refresh_compute(self) -> None:
+        """Background thread: parse, sort, filter — no UI access."""
+        try:
+            sessions = parse_sessions(include_archived=self.show_archived)
+
+            # Resolve unnamed_idle sessions using window budget
+            unnamed = [s for s in sessions if s.status == "unnamed_idle"]
+            if unnamed:
+                budget = _count_unnamed_windows()
+                unnamed.sort(key=lambda s: s.last_activity, reverse=True)
+                for i, s in enumerate(unnamed):
+                    s.status = "idle" if i < budget else "closed"
+
+            # Hide closed sessions unless "All" is toggled
+            if not self.show_archived:
+                sessions = [s for s in sessions if s.status != "closed"]
+
+            # Auto-close terminal tabs for debriefed sessions
+            cleaned = _poll_debrief_done_signals(sessions)
+
+            filtered = self._filter_sessions(sessions)
+            sorted_sessions = sort_sessions(filtered, self.sort_mode)
+
+            flat: list[Session] = []
+            for s in sorted_sessions:
+                flat.append(s)
+                if self.show_subagents and s.subagents:
+                    flat.extend(s.subagents)
+
+            # Override status for sessions being dismissed
+            for s in flat:
+                if s.session_id in self._dismissing_sessions:
+                    s.status = self._dismissing_sessions[s.session_id]
+
+            # Pre-render rows in background thread (Rich markup generation)
+            visible_cols = self._visible_cols
+            rendered = [(s, render_row(s, visible_cols)) for s in flat]
+
+            # Post to main thread for UI update
+            self.call_from_thread(
+                self._refresh_apply, sessions, flat, rendered, cleaned,
+            )
+        finally:
+            self._refresh_pending = False
+
+    def _refresh_apply(self, sessions: list[Session], flat: list[Session],
+                       rendered: list[tuple[Session, list[str]]],
+                       cleaned: list[str]) -> None:
+        """Main thread: apply computed results to UI."""
+        self.sessions = sessions
+
+        if cleaned:
+            self.notify(
+                f"Auto-closed {len(cleaned)} debriefed session{'s' if len(cleaned) > 1 else ''}",
+                timeout=3,
+            )
+
+        # Log status transitions
+        for s in flat:
+            if s.is_subagent:
+                continue
+            prev = self._prev_statuses.get(s.session_id)
+            if prev and prev != s.status:
+                mlog("status", "transition", sid=s.session_id[:12],
+                     title=s.title, prev=prev, new=s.status)
+            self._prev_statuses[s.session_id] = s.status
+
+        self._flat_rows = flat
+
+        table = self.query_one("#session-table", DataTable)
         saved_scroll_x = table.scroll_x
         saved_scroll_y = table.scroll_y
 
-        self.sessions = parse_sessions(include_archived=self.show_archived)
-        filtered = self._filter_sessions(self.sessions)
-        sorted_sessions = sort_sessions(filtered, self.sort_mode)
-
-        flat: list[Session] = []
-        for s in sorted_sessions:
-            flat.append(s)
-            if self.show_subagents and s.subagents:
-                for sub in s.subagents:
-                    flat.append(sub)
-        self._flat_rows = flat
-
         table.clear()
-        for s in flat:
-            cells = render_row(s, self._visible_cols)
+        for s, cells in rendered:
             table.add_row(*cells, key=s.session_id)
 
         if self._selected_key:
@@ -1519,9 +2023,7 @@ class ClaudeMonitor(App):
                     table.move_cursor(row=idx)
                     break
 
-        # Restore scroll position
         table.scroll_to(saved_scroll_x, saved_scroll_y, animate=False)
-
         self.query_one(StatsBar).update_stats(self.sessions, self.sort_mode)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -1533,22 +2035,112 @@ class ClaudeMonitor(App):
             return
 
         def handle_action(action: str | None) -> None:
+            mlog("menu", "action", action=action, sid=s.session_id[:12],
+                 title=s.title, status=s.status)
             if action == "jump":
-                if not focus_terminal_session(s):
-                    self.notify("Could not find terminal", timeout=2)
+                ok = focus_terminal_session(s)
+                if not ok:
+                    self.notify("Could not find terminal", timeout=4)
+                mlog("menu", "jump_result", sid=s.session_id[:12], success=ok)
             elif action == "resume":
-                if resume_session(s):
-                    self.notify(f"Resuming {s.title[:20]}…", timeout=2)
+                ok = resume_session(s)
+                if ok:
+                    self.notify(f"Resuming {s.title[:20]}…", timeout=4)
                 else:
-                    self.notify("Could not open terminal", timeout=2)
+                    self.notify("Could not open terminal", timeout=4)
+                mlog("menu", "resume_result", sid=s.session_id[:12], success=ok)
             elif action == "copy_id":
                 copy_to_clipboard(s.session_id)
-                self.notify("Copied", timeout=1)
+                self.notify("Copied", timeout=3)
             elif action == "remote" and s.remote_url:
                 subprocess.run(["open", s.remote_url], capture_output=True)
             elif action == "transcript":
                 subprocess.run(["open", "-R", s.transcript_path], capture_output=True)
+            elif action == "dismiss":
+                self._start_dismiss(s)
         self.push_screen(SessionMenu(s), handle_action)
+
+    def _start_dismiss(self, session: Session) -> None:
+        sid = session.session_id
+        if sid in self._dismissing_sessions:
+            mlog("dismiss", "already_in_progress", sid=sid[:12])
+            return
+        if sid in self._dismiss_failed:
+            self.notify("Can't reach this session's terminal", timeout=4)
+            return
+        has_debrief = session_has_debrief(session.transcript_path)
+        phase = "closing" if has_debrief else "debriefing"
+        mlog("dismiss", "start", sid=sid[:12], title=session.title,
+             has_debrief=has_debrief, phase=phase)
+        self._dismissing_sessions[sid] = phase
+        self.refresh_sessions()
+        self.run_worker(
+            lambda s=session, hd=has_debrief: self._dismiss_sync(s, hd),
+            thread=True,
+        )
+
+    def _dismiss_sync(self, session: Session, has_debrief: bool) -> None:
+        """Background worker: debrief (if needed), wait for exit, close tab."""
+        sid = session.session_id
+
+        if has_debrief:
+            pid = _find_claude_pid(session)
+            mlog("dismiss", "kill_existing", sid=sid[:12], pid=pid)
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError as e:
+                    mlog("dismiss", "kill_error", sid=sid[:12], pid=pid, error=str(e))
+        else:
+            sent = _send_to_terminal_session(session, "/debrief")
+            mlog("dismiss", "send_debrief", sid=sid[:12], success=sent)
+            if not sent:
+                self._dismiss_failed.add(sid)
+                self.call_from_thread(
+                    self.notify, "Could not find terminal to dismiss", timeout=3,
+                )
+                self._dismissing_sessions.pop(sid, None)
+                self.call_from_thread(self.refresh_sessions)
+                return
+
+        # Poll until the Claude process exits (10 min timeout)
+        # Cache the PID to avoid re-running lsof/ps every poll
+        poll_count = 0
+        max_polls = 200  # 200 * 3s = 10 minutes
+        cached_pid = _find_claude_pid(session)
+        while poll_count < max_polls:
+            if cached_pid:
+                try:
+                    os.kill(cached_pid, 0)
+                except OSError:
+                    break  # Process exited
+            elif _find_claude_pid(session) is None:
+                break
+            poll_count += 1
+            if poll_count % 10 == 0:  # Log every 30s
+                mlog("dismiss", "waiting_for_exit", sid=sid[:12], polls=poll_count)
+            time.sleep(3)
+
+        if poll_count >= max_polls:
+            mlog("dismiss", "timeout", sid=sid[:12])
+            self._dismissing_sessions.pop(sid, None)
+            self.call_from_thread(self.notify, "Dismiss timed out", timeout=5)
+            self.call_from_thread(self.refresh_sessions)
+            return
+
+        mlog("dismiss", "process_exited", sid=sid[:12], polls=poll_count)
+
+        # Close the terminal tab
+        self._dismissing_sessions[sid] = "closing"
+        self.call_from_thread(self.refresh_sessions)
+        time.sleep(1)
+        closed = _close_terminal_tab(session)
+        mlog("dismiss", "tab_closed", sid=sid[:12], success=closed)
+
+        self._dismissing_sessions.pop(sid, None)
+        title = session.title[:20]
+        self.call_from_thread(self.notify, f"Dismissed {title}", timeout=4)
+        self.call_from_thread(self.refresh_sessions)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if not (event.row_key and event.row_key.value):
@@ -1563,7 +2155,7 @@ class ClaudeMonitor(App):
         # Build detail content: archived summary, plan, or last assistant text
         detail_parts = [header]
 
-        if s.status == "archived":
+        if s.status in ("archived", "closed"):
             detail_parts.append(
                 f"[dim]Project:[/] {s.project}  "
                 f"[dim]Cost:[/] ${s.cost:.2f}  "
@@ -1576,7 +2168,7 @@ class ClaudeMonitor(App):
         if tasks:
             detail_parts.append(format_plan(tasks))
         elif s.last_assistant_text:
-            preview = s.last_assistant_text[:400].replace("[", "\\[").replace("]", "\\]")
+            preview = rich_escape(s.last_assistant_text[:400])
             detail_parts.append(f"[italic]{preview}[/italic]")
 
         self.query_one("#detail-panel", Static).update("\n".join(detail_parts))
@@ -1589,9 +2181,7 @@ class ClaudeMonitor(App):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "search-bar":
-            search_bar = self.query_one("#search-bar", Input)
-            search_bar.display = False
-            self.query_one("#session-table", DataTable).focus()
+            self._dismiss_search()
 
     def action_start_search(self) -> None:
         search_bar = self.query_one("#search-bar", Input)
@@ -1600,32 +2190,43 @@ class ClaudeMonitor(App):
 
     def action_clear_search(self) -> None:
         search_bar = self.query_one("#search-bar", Input)
-        if search_bar.display:
-            search_bar.value = ""
-            search_bar.display = False
-            self._filter = ""
-            self.refresh_sessions()
-            self.query_one("#session-table", DataTable).focus()
+        if search_bar.display or self._filter:
+            self._dismiss_search()
+
+    def _dismiss_search(self) -> None:
+        search_bar = self.query_one("#search-bar", Input)
+        search_bar.value = ""
+        search_bar.display = False
+        self._filter = ""
+        self.refresh_sessions()
+        self.query_one("#session-table", DataTable).focus()
 
     def action_refresh(self) -> None:
+        global _terminal_titles_ts, _liveness_logged, _pid_map_ts
+        _terminal_titles_ts = 0  # Force fresh window title scan
+        _pid_map_ts = 0  # Force fresh PID map
+        _liveness_logged.clear()  # Re-evaluate all sessions
+        _scan_cache.clear()  # Force re-read all transcripts
+        _subagent_cache.clear()
+        self._refresh_pending = False  # Allow immediate refresh
         self.refresh_sessions()
-        self.notify("Refreshed", timeout=1)
+        self.notify("Refreshed", timeout=3)
 
     def action_cycle_sort(self) -> None:
         self.sort_mode = self.sort_mode.next()
         self._selected_key = None
         self.refresh_sessions()
-        self.notify(f"Sort: {self.sort_mode.label}", timeout=1)
+        self.notify(f"Sort: {self.sort_mode.label}", timeout=3)
 
     def action_toggle_subagents(self) -> None:
         self.show_subagents = not self.show_subagents
         self.refresh_sessions()
-        self.notify(f"Subagents {'shown' if self.show_subagents else 'hidden'}", timeout=1)
+        self.notify(f"Subagents {'shown' if self.show_subagents else 'hidden'}", timeout=3)
 
     def action_toggle_archived(self) -> None:
         self.show_archived = not self.show_archived
         self.refresh_sessions()
-        self.notify(f"Archived sessions {'shown' if self.show_archived else 'hidden'}", timeout=1)
+        self.notify(f"All sessions {'shown' if self.show_archived else 'recent only'}", timeout=3)
 
     def action_pick_columns(self) -> None:
         picker = ColumnPicker(self._visible_cols, self._col_order)
@@ -1640,9 +2241,44 @@ class ClaudeMonitor(App):
                 save_prefs(prefs)
                 self._rebuild_table_columns()
                 self.refresh_sessions()
-                self.notify("Columns updated", timeout=1)
+                self.notify("Columns updated", timeout=3)
 
         self.push_screen(picker, on_dismiss)
+
+    def action_statusline_config(self) -> None:
+        sl_prefs = load_statusline_prefs()
+        screen = StatuslineConfig(sl_prefs)
+
+        def on_dismiss(result: dict[str, bool] | None) -> None:
+            if result is not None:
+                prefs = load_prefs()
+                prefs["statusline"] = result
+                save_prefs(prefs)
+                changed = {k: v for k, v in result.items() if v != sl_prefs.get(k)}
+                mlog("config", "statusline_saved", changed=changed)
+                self.notify("Statusline config saved", timeout=3)
+
+        self.push_screen(screen, on_dismiss)
+
+    def action_toggle_debug(self) -> None:
+        self.debug_logging = not self.debug_logging
+        monitor_log.enabled = self.debug_logging
+        state = "ON" if self.debug_logging else "OFF"
+        # Log the toggle itself (even when turning off, so the log shows it)
+        monitor_log.enabled = True
+        mlog("app", "debug_toggled", state=state)
+        monitor_log.enabled = self.debug_logging
+        self.notify(f"Debug logging {state}", timeout=3)
+
+    def _audit_stats(self) -> None:
+        """Periodic snapshot of session status breakdown."""
+        sessions = [s for s in self.sessions if not s.is_subagent]
+        by_status: dict[str, int] = {}
+        for s in sessions:
+            by_status[s.status] = by_status.get(s.status, 0) + 1
+        total_cost = sum(s.cost for s in sessions)
+        mlog("audit", "stats", total=len(sessions),
+             cost=f"${total_cost:.2f}", breakdown=by_status)
 
     def action_cursor_down(self) -> None:
         self.query_one("#session-table", DataTable).action_cursor_down()
@@ -1652,7 +2288,13 @@ class ClaudeMonitor(App):
 
 
 def main():
-    ClaudeMonitor().run()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--log":
+        from monitor_log import tail_log
+        cat_filter = sys.argv[2] if len(sys.argv) > 2 else None
+        tail_log(category=cat_filter)
+    else:
+        ClaudeMonitor().run()
 
 
 if __name__ == "__main__":

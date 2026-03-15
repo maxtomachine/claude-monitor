@@ -67,7 +67,8 @@ The statusline (`statusline/statusline.sh`) shares data with the monitor:
 - **Context %**: statusline writes ground-truth `remaining_percentage` to `/tmp/claude-ctx-{session_id}`, which the monitor reads instead of estimating from token counts.
 - **Session name**: statusline writes `session_name` to `/tmp/claude-name-{session_id}`, used by jump-to-terminal for match resolution.
 - **Jump to terminal**: matches on Ghostty window titles (instant, no AXTextArea cycling). Falls back to AXTextArea content for unrenamed sessions. Uses `AXRaise` + `AXMain` + `proc.frontmost` (not `tell app to activate`).
-- **Debug log**: jump operations log to `/tmp/claude-monitor-jump.log`.
+- **Structured log**: `~/.claude/monitor.log` — JSON-lines with categories (jump, status, signal, close, error). Auto-rotates at 5 MB. Tail with `uv run python claude_monitor.py --log` or `uv run python claude_monitor.py --log jump` to filter by category.
+- **Debrief auto-close**: `/debrief` writes `/tmp/claude-debrief-done-{sid}`, monitor polls on each refresh and closes the terminal tab.
 
 ## Careful edits — avoid accidental regressions
 

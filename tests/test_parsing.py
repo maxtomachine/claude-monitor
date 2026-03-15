@@ -2,6 +2,7 @@
 
 import json
 import time
+from unittest.mock import patch
 
 from claude_monitor import (
     parse_timestamp,
@@ -114,17 +115,29 @@ class TestScanFullFile:
 
 
 class TestDetermineStatus:
-    def test_recent_activity_is_working(self):
+    @patch("claude_monitor._is_session_alive", return_value=True)
+    def test_recent_activity_is_working(self, _mock):
         assert determine_status("test-id", time.time() - 5) == "working"
 
-    def test_moderate_elapsed_is_waiting(self):
+    @patch("claude_monitor._is_session_alive", return_value=True)
+    def test_moderate_elapsed_is_waiting(self, _mock):
         assert determine_status("test-id", time.time() - 60) == "waiting"
 
-    def test_old_activity_is_idle(self):
+    @patch("claude_monitor._is_session_alive", return_value=True)
+    def test_old_activity_is_idle(self, _mock):
         assert determine_status("test-id", time.time() - 600) == "idle"
 
-    def test_no_activity(self):
+    @patch("claude_monitor._is_session_alive", return_value=True)
+    def test_no_activity(self, _mock):
         assert determine_status("test-id", 0) == "idle"
+
+    @patch("claude_monitor._is_session_alive", return_value=False)
+    def test_dead_process_is_closed(self, _mock):
+        assert determine_status("test-id", time.time() - 5) == "closed"
+
+    @patch("claude_monitor._is_session_alive", return_value=False)
+    def test_idle_dead_process_is_closed(self, _mock):
+        assert determine_status("test-id", 0) == "closed"
 
 
 class TestSortSessions:

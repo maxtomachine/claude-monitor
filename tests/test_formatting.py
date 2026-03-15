@@ -103,23 +103,26 @@ class TestFormatDuration:
 
 class TestFormatContextBar:
     def test_full_context(self):
+        # 100% used = red (danger)
         result = format_context_bar(100)
         assert "100%" in result
-        assert "bright_green" in result
+        assert "red" in result
 
-    def test_low_context(self):
+    def test_low_usage(self):
+        # 10% used = green (plenty left)
         result = format_context_bar(10)
         assert "10%" in result
-        assert "red" in result
+        assert "bright_green" in result
 
     def test_medium_context(self):
         result = format_context_bar(50)
         assert "50%" in result
 
     def test_zero(self):
+        # 0% used = green (fresh session)
         result = format_context_bar(0)
         assert "0%" in result
-        assert "red" in result
+        assert "bright_green" in result
 
 
 class TestFormatCompactions:
