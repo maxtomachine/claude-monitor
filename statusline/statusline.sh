@@ -276,6 +276,7 @@ if [ -n "$transcript" ]; then
     [ -n "$remaining" ] && printf '%s' "$remaining" > "/tmp/claude-ctx-${_sid}"
     [ -n "$remote_url" ] && printf '%s' "$remote_url" > "/tmp/claude-url-${_sid}"
     [ -n "$session_name" ] && printf '%s' "$session_name" > "/tmp/claude-name-${_sid}"
+    [ -n "$cost_raw" ] && [ "$cost_raw" != "0" ] && printf '%s' "$cost_raw" > "/tmp/claude-cost-${_sid}"
     [ "$is_fast" = true ] && printf '%s' "$extra_cost" > "/tmp/claude-fast-${_sid}"
   fi
 fi

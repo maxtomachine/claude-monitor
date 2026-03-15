@@ -579,7 +579,15 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
         else:
             context_pct = min(100, int((last_input / 200000) * 100))
 
-    cost = estimate_cost(data["model_id"], data["tokens_in"], data["tokens_out"])
+    # Prefer ground-truth cost from statusline cache, fall back to estimation
+    cached_cost = _read_session_cache("cost", session_id)
+    if cached_cost:
+        try:
+            cost = float(cached_cost)
+        except ValueError:
+            cost = estimate_cost(data["model_id"], data["tokens_in"], data["tokens_out"])
+    else:
+        cost = estimate_cost(data["model_id"], data["tokens_in"], data["tokens_out"])
 
     remote_url = ""
     # Slug: prefer live cache from statusline, fall back to transcript
@@ -658,7 +666,7 @@ def _scan_terminal_titles() -> list[str]:
     jxa = """(() => {
         const se = Application("System Events");
         const t = [];
-        const apps = ["Ghostty", "ghostty", "Terminal"];
+        const apps = ["Ghostty", "Terminal"];
         for (const app of apps) {
             try {
                 const proc = se.processes.byName(app);
@@ -1174,6 +1182,17 @@ import monitor_log
 from monitor_log import log as mlog
 
 
+def _resolve_match_name(session: Session) -> str:
+    """Resolve the best match name for a session (for window title/content matching).
+
+    Three-level fallback: fresh /tmp file > cached status_name > transcript title.
+    """
+    return (
+        _read_session_cache("name", session.session_id)
+        or session.status_name or session.title or ""
+    )
+
+
 def _raise_window_by_content(session: Session, app_name: str) -> bool:
     """Raise the terminal window/tab containing a specific Claude session.
 
@@ -1191,14 +1210,7 @@ def _raise_window_by_content(session: Session, app_name: str) -> bool:
     Uses AXRaise + AXMain + proc.frontmost (not `tell app to activate`)
     to avoid re-focusing the monitor's own window.
     """
-    # Three-level fallback for match name:
-    # 1. Fresh file (handles renames since last refresh)
-    # 2. Cached status_name (from build_session)
-    # 3. Transcript-derived title (last resort)
-    match_name = (
-        _read_session_cache("name", session.session_id)
-        or session.status_name or session.title or ""
-    )
+    match_name = _resolve_match_name(session)
     if not match_name:
         mlog("jump", "no_match_name", sid=session.session_id[:12])
         return False
@@ -1229,10 +1241,11 @@ def _raise_window_by_content(session: Session, app_name: str) -> bool:
 
         // Pass 1: TITLE MATCH (instant, no visual impact)
         // Claude Code sets terminal title to "{{emoji}} session_name".
-        // Skip wins[0] — the monitor is frontmost when user triggers jump.
+        // Check ALL windows including wins[0] — title matching is safe
+        // because the monitor's own title won't contain other session names.
         // For tabs, each tab has its own title — no AXRaise needed.
         const titleCandidates = [];
-        for (let i = 1; i < wins.length; i++) {{
+        for (let i = 0; i < wins.length; i++) {{
             const title = wins[i].name();
             info.push(i + ":" + title);
             if (title.includes(matchName)) {{
@@ -1347,14 +1360,12 @@ def focus_terminal_session(session: Session) -> bool:
     """Find and activate the terminal window containing this session."""
     mlog("jump", "focus_start", sid=session.session_id[:12], title=session.title)
 
-    # Fast path: if session name is in a Ghostty window title, jump directly
-    # without needing to find the PID first
-    match_name = _read_session_cache("name", session.session_id) or session.status_name or ""
-
+    # Fast path: if session name is in a terminal window title, jump directly
+    # without needing to find the PID first (avoids lsof/ps overhead)
+    match_name = _resolve_match_name(session)
     if match_name:
         titles = _scan_terminal_titles()
         if any(match_name in t for t in titles):
-            # Try each terminal app — Ghostty first (most common), then Terminal
             for app in ("Ghostty", "Terminal"):
                 mlog("jump", "fast_path_try", sid=session.session_id[:12],
                      name=match_name, app=app)
@@ -1389,94 +1400,41 @@ def session_has_debrief(transcript_path: str) -> bool:
 def _send_to_terminal_session(session: Session, text: str) -> bool:
     """Find the session's terminal window, raise it, and type text + Enter.
 
-    Uses the same title+content matching strategy as _raise_window_by_content:
-    1. Title match (works for renamed sessions, including inactive tabs)
-    2. AXTextArea content match (works for unrenamed sessions titled "Claude Code")
+    Delegates window-finding to _raise_window_by_content (single source of
+    truth for the title+content matching strategy), then sends a keystroke
+    in a lightweight JXA call.
     """
+    # Try PID-based terminal lookup first, then fall back to trying
+    # known terminal apps (same fast-path strategy as focus_terminal_session)
+    raised = False
     terminal = find_terminal_for_session(session)
-    if not terminal:
+    if terminal:
+        raised = _raise_window_by_content(session, terminal)
+    if not raised:
+        for app in ("Ghostty", "Terminal"):
+            if _raise_window_by_content(session, app):
+                raised = True
+                break
+    if not raised:
         return False
 
-    match_name = (
-        _read_session_cache("name", session.session_id)
-        or session.status_name or session.title or ""
-    )
-    if not match_name:
-        return False
-
-    match_str = f"{match_name} \u2502"
-    proc_names = json.dumps(list({terminal.lower(), terminal}))
-    match_name_json = json.dumps(match_name)
-    match_str_json = json.dumps(match_str)
+    # Window is now focused — send the keystroke
     text_json = json.dumps(text)
-
     jxa = f"""(() => {{
         const se = Application("System Events");
-        const names = {proc_names};
-        let proc = null;
-        for (const n of names) {{
-            try {{ proc = se.processes.byName(n); proc.name(); break; }}
-            catch(e) {{ proc = null; }}
-        }}
-        if (!proc) return "notfound";
-        const wins = proc.windows();
-        const matchName = {match_name_json};
-        const matchStr = {match_str_json};
-
-        // Pass 1: title match (instant, works for renamed sessions)
-        const titleCandidates = [];
-        for (let i = 0; i < wins.length; i++) {{
-            if (wins[i].name().includes(matchName)) {{
-                titleCandidates.push(wins[i]);
-            }}
-        }}
-
-        let target = null;
-        if (titleCandidates.length === 1) {{
-            target = titleCandidates[0];
-        }} else if (titleCandidates.length > 1) {{
-            // Disambiguate with content
-            for (const w of titleCandidates) {{
-                try {{
-                    const full = w.groups[0].groups[0].textAreas[0].value();
-                    if (full.substring(full.length - 500).includes(matchStr)) {{
-                        target = w; break;
-                    }}
-                }} catch(e) {{}}
-            }}
-            if (!target) target = titleCandidates[0];
-        }}
-
-        // Pass 2: content match (for unrenamed sessions titled "Claude Code")
-        if (!target) {{
-            for (let i = 0; i < wins.length; i++) {{
-                try {{
-                    const full = wins[i].groups[0].groups[0].textAreas[0].value();
-                    if (full.substring(full.length - 500).includes(matchStr)) {{
-                        target = wins[i]; break;
-                    }}
-                }} catch(e) {{}}
-            }}
-        }}
-
-        if (!target) return "no_match";
-
-        target.actions["AXRaise"].perform();
-        try {{ target.attributes["AXMain"].value = true; }} catch(e) {{}}
-        proc.frontmost = true;
         delay(0.3);
         se.keystroke({text_json});
         delay(0.1);
         se.keyCode(36);
-        return "sent:" + target.name();
+        return "sent";
     }})()"""
 
     try:
         result = subprocess.run(
             ["osascript", "-l", "JavaScript", "-e", jxa],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=5,
         )
-        return "sent:" in result.stdout
+        return "sent" in result.stdout
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return False
 
@@ -2107,9 +2065,8 @@ class ClaudeMonitor(App):
         if sid in self._dismissing_sessions:
             mlog("dismiss", "already_in_progress", sid=sid[:12])
             return
-        if sid in self._dismiss_failed:
-            self.notify("Can't reach this session's terminal", timeout=4)
-            return
+        # Clear stale failure — let the user retry after fixes
+        self._dismiss_failed.discard(sid)
         has_debrief = session_has_debrief(session.transcript_path)
         phase = "closing" if has_debrief else "debriefing"
         mlog("dismiss", "start", sid=sid[:12], title=session.title,
