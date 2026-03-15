@@ -1521,9 +1521,9 @@ class SessionMenu(ModalScreen[str]):
         if s.status not in ("archived", "closed", "debriefing"):
             options.append(Option("📝  Debrief & close", id="dismiss"))
         if s.status not in ("archived", "closed"):
-            options.append(Option("🛑  Kill process", id="kill"))
+            options.append(Option("❌  Kill process", id="kill"))
         options.append(Option("─" * 26, id="sep", disabled=True))
-        options.append(Option("❌  Close", id="close"))
+        options.append(Option("◀   Back", id="close"))
 
         with Vertical(id="menu-container"):
             yield Label(f"[bold]{s.title}[/]", id="menu-title")
