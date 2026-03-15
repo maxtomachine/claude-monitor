@@ -691,21 +691,32 @@ def _scan_terminal_titles() -> list[str]:
 
 
 
+_recently_resumed: dict[str, float] = {}  # sid -> timestamp (set by resume_session)
+_RESUME_GRACE = 60  # seconds to treat a resumed session as alive without a PID
+
+
 def _is_session_alive(session_id: str, display_title: str = "") -> bool:
     """Check if the Claude process for this session is still running.
 
-    Single source of truth: PID files in ~/.claude/sessions/.
-    No PID file with a live process = not running.
+    Primary: PID files in ~/.claude/sessions/.
+    Grace period: sessions resumed from the monitor are treated as alive
+    for 60s while waiting for the PID file to appear.
     """
     _refresh_pid_map()
 
     if session_id in _pid_map:
         pid = _pid_map[session_id]
         if pid is not None:
+            _recently_resumed.pop(session_id, None)  # PID appeared, no longer need grace
             return True
         return False
 
-    # No PID file at all — process is not running
+    # No PID file — check if we just resumed this session
+    resumed_at = _recently_resumed.get(session_id)
+    if resumed_at and (time.time() - resumed_at) < _RESUME_GRACE:
+        return True
+
+    _recently_resumed.pop(session_id, None)
     return False
 
 
@@ -1484,7 +1495,10 @@ def resume_session(session: Session) -> bool:
         mlog("resume", "launched", sid=session.session_id[:12],
              rc=result.returncode,
              stderr=result.stderr.strip() if result.stderr.strip() else None)
-        return result.returncode == 0
+        if result.returncode == 0:
+            _recently_resumed[session.session_id] = time.time()
+            return True
+        return False
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         mlog("resume", "launch_error", sid=session.session_id[:12], error=str(e))
         return False
