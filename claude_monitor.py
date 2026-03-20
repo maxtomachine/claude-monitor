@@ -12,7 +12,9 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 
-from rich.markup import escape as rich_escape
+def _escape_markup(text: str) -> str:
+    """Escape all [ for Textual markup (rich.markup.escape misses some)."""
+    return text.replace("[", "\\[")
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -26,6 +28,7 @@ from textual.widgets.option_list import Option
 
 CLAUDE_DIR = Path.home() / ".claude" / "projects"
 SIGNALS_DIR = Path.home() / ".claude" / "session-signals"
+HOOK_STATE_DIR = Path.home() / ".claude" / "session-states"
 TASKS_DIR = Path.home() / ".claude" / "tasks"
 SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 PREFS_PATH = Path.home() / ".claude" / "monitor-prefs.json"
@@ -235,17 +238,19 @@ def parse_timestamp(ts: str) -> float:
 _scan_cache: dict[str, tuple[float, dict]] = {}  # path -> (mtime, result)
 
 
-def scan_full_file(path: str) -> dict:
+def scan_full_file(path: str, stale_ok: bool = False) -> dict:
     """Single-pass full file scan: tokens, MCP, title, slug, created, last activity.
 
     Results are cached by (path, mtime) — unchanged files return instantly.
+    When stale_ok=True, returns the last cached result even if mtime changed
+    (hook state provides fresher status/tool data; tokens/model are slow-changing).
     """
     try:
         mtime = os.path.getmtime(path)
     except OSError:
         mtime = 0
     cached = _scan_cache.get(path)
-    if cached and cached[0] == mtime:
+    if cached and (cached[0] == mtime or stale_ok):
         return cached[1]
 
     result = {
@@ -446,7 +451,7 @@ def format_plan(tasks: list[Task], max_lines: int = 8) -> str:
 
     lines = [header]
     for t in tasks[:max_lines]:
-        subj = rich_escape(t.subject[:50])
+        subj = _escape_markup(t.subject[:50])
         if t.status == "completed":
             lines.append(f"  [green]✓[/] [dim]{subj}[/]")
         elif t.status == "in_progress":
@@ -489,6 +494,31 @@ def estimate_cost(model_id: str, tokens_in: int, tokens_out: int) -> float:
     return 0.0
 
 
+_gc_state_files_last: float = 0
+
+
+def _gc_state_files() -> None:
+    """Delete hook state files for sessions exited >24h ago. Runs hourly."""
+    global _gc_state_files_last
+    now = time.time()
+    if now - _gc_state_files_last < 3600:
+        return
+    _gc_state_files_last = now
+    if not HOOK_STATE_DIR.exists():
+        return
+    cutoff = now - 86400
+    for f in HOOK_STATE_DIR.glob("*.json"):
+        try:
+            data = json.loads(f.read_text())
+            if data.get("state") != "exited":
+                continue
+            exited_at = data.get("exited_at", "")
+            if exited_at and datetime.fromisoformat(exited_at).timestamp() < cutoff:
+                f.unlink()
+        except (json.JSONDecodeError, OSError, ValueError):
+            pass
+
+
 def parse_sessions(include_archived: bool = False) -> list[Session]:
     sessions = []
     now = time.time()
@@ -497,6 +527,8 @@ def parse_sessions(include_archived: bool = False) -> list[Session]:
 
     if not CLAUDE_DIR.exists():
         return sessions
+
+    _gc_state_files()
 
     meta = load_index_metadata()
 
@@ -549,19 +581,65 @@ def _read_session_cache(kind: str, session_id: str) -> str:
         return ""
 
 
+def read_session_memory_title(transcript_path: str) -> str:
+    """Read session title from session-memory/summary.md next to the transcript."""
+    base = transcript_path
+    if base.endswith(".jsonl"):
+        base = base[:-6]
+    summary_path = Path(base) / "session-memory" / "summary.md"
+    try:
+        if not summary_path.exists():
+            return ""
+        in_title_section = False
+        for line in summary_path.read_text().splitlines():
+            if line.strip() == "# Session Title":
+                in_title_section = True
+                continue
+            if in_title_section:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("_"):
+                    continue
+                if stripped.startswith("#"):
+                    break
+                return stripped
+    except OSError:
+        pass
+    return ""
+
+
 def build_session(path: str, session_id: str, project: str, idx: dict,
                   mtime: float, is_subagent: bool = False,
                   parent_id: str = "") -> Session | None:
-    data = scan_full_file(path)
+    # If hook state is fresh (<30s), skip transcript rescan — tokens/model
+    # are slow-changing and stale cache is fine. Hook provides status/tool.
+    hook = None if is_subagent else read_hook_state(session_id)
+    hook_fresh = False
+    if hook and hook.get("timestamp"):
+        try:
+            hook_age = time.time() - datetime.fromisoformat(hook["timestamp"]).timestamp()
+            hook_fresh = hook_age < 30
+        except (ValueError, TypeError):
+            pass
 
-    # Compute display title first — needed for both rendering and status check
+    data = scan_full_file(path, stale_ok=hook_fresh)
+
+    # Compute display title — priority chain:
+    # 1. custom_title (set by user in session)
+    # 2. hook state title (session-memory or Haiku-generated)
+    # 3. sessions-index summary
+    # 4. session-memory/summary.md (direct read)
+    # 5. first prompt / cwd / session_id fallback
     if is_subagent:
         parts = Path(path).stem.split("-")
         display_title = "-".join(parts[:2]) if len(parts) >= 2 else session_id[:12]
     else:
+        hook_title = hook.get("title", "") if hook else ""
+        sm_title = read_session_memory_title(path)
         display_title = (
             data["custom_title"]
+            or hook_title
             or idx.get("summary", "")
+            or sm_title
             or idx.get("firstPrompt", "")[:60]
             or Path(data["cwd"]).name
             or session_id[:8]
@@ -720,12 +798,55 @@ def _is_session_alive(session_id: str, display_title: str = "") -> bool:
     return False
 
 
+_hook_state_cache: dict[str, tuple[float, dict]] = {}  # session_id -> (mtime, data)
+
+
+def read_hook_state(session_id: str) -> dict | None:
+    """Read hook-written state file, cached by mtime."""
+    state_file = HOOK_STATE_DIR / f"{session_id}.json"
+    try:
+        mtime = state_file.stat().st_mtime
+    except OSError:
+        return None
+    cached = _hook_state_cache.get(session_id)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        data = json.loads(state_file.read_text())
+        _hook_state_cache[session_id] = (mtime, data)
+        return data
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 def determine_status(session_id: str, last_assistant_time: float,
                      display_title: str = "") -> str:
     alive = _is_session_alive(session_id)
     if not alive:
         return "closed"
-    # Process is running — determine activity state
+
+    # Tier 1: hook state files (real-time, event-driven)
+    hook = read_hook_state(session_id)
+    if hook:
+        hook_state = hook.get("state", "")
+        if hook_state == "thinking":
+            return "working"
+        if hook_state == "approval":
+            return "needs_approval"
+        if hook_state == "exited":
+            return "closed"
+        if hook_state == "idle":
+            # Decay waiting → idle after 5 minutes of inactivity
+            entered = hook.get("state_entered_at", "")
+            if entered:
+                try:
+                    elapsed = time.time() - datetime.fromisoformat(entered).timestamp()
+                    return "idle" if elapsed > 300 else "waiting"
+                except (ValueError, TypeError):
+                    pass
+            return "waiting"
+
+    # Tier 2: signal files (legacy)
     if SIGNALS_DIR.exists():
         signal_file = SIGNALS_DIR / session_id
         if signal_file.exists():
@@ -735,6 +856,8 @@ def determine_status(session_id: str, last_assistant_time: float,
                         "stop": "waiting"}.get(s, "idle")
             except OSError:
                 pass
+
+    # Tier 3: time-based heuristics (fallback)
     now = time.time()
     if last_assistant_time > 0:
         elapsed = now - last_assistant_time
@@ -953,9 +1076,17 @@ def generate_activity(s: Session) -> str:
     Waiting → gerund:     "Editing claude_monitor.py"
     Idle → past tense:    "Edited claude_monitor.py"
     """
-    # Build the base gerund from tool call or assistant text
+    # Tier 1: hook state (real-time tool + target)
+    hook = read_hook_state(s.session_id)
     gerund = ""
-    if s.last_tool:
+    if hook and hook.get("tool"):
+        tool = hook["tool"]
+        target = hook.get("tool_target", "")
+        inp = {"file_path": target} if target and not target.startswith(("http", "/", "git ", "npm ")) else {"command": target}
+        gerund = _gerund_from_tool(tool, inp)
+
+    # Tier 2: transcript-derived last_tool
+    if not gerund and s.last_tool:
         gerund = _gerund_from_tool(s.last_tool, s.last_tool_input)
     if not gerund and s.last_assistant_text:
         gerund = _gerund_from_text(s.last_assistant_text) or ""
@@ -1039,7 +1170,7 @@ def render_row(s: Session, visible_cols: list[str]) -> list[str]:
             if activity:
                 if len(activity) > DOING_MAX_WIDTH:
                     activity = activity[:DOING_MAX_WIDTH - 1] + "…"
-                activity_escaped = rich_escape(activity)
+                activity_escaped = _escape_markup(activity)
                 if s.status == "idle":
                     cells.append(f"[dim]{activity_escaped}[/]")
                 elif s.status == "needs_approval":
@@ -1142,15 +1273,29 @@ import monitor_log
 from monitor_log import log as mlog
 
 
-def _resolve_match_name(session: Session) -> str:
-    """Resolve the best match name for a session (for window title/content matching).
+def _resolve_match_candidates(session: Session) -> list[str]:
+    """Collect all candidate names for window title matching.
 
-    Three-level fallback: fresh /tmp file > cached status_name > transcript title.
+    Returns deduplicated candidates ordered by specificity:
+    - ·{sid8} marker — hook writes this to terminal title, unique per session
+    - /tmp/claude-name-{sid} — statusline's session_name
+    - hook state title — session-memory or Haiku-generated
+    - Session.status_name — cached session_name
+    - Session.title — transcript-derived display title
+    - cwd basename — last-resort fallback
     """
-    return (
-        _read_session_cache("name", session.session_id)
-        or session.status_name or session.title or ""
-    )
+    sid8 = session.session_id[:8]
+    candidates = [f"\u00b7{sid8}"]
+    for name in [
+        _read_session_cache("name", session.session_id),
+        (read_hook_state(session.session_id) or {}).get("title", ""),
+        session.status_name,
+        session.title,
+        Path(session.cwd).name if session.cwd else "",
+    ]:
+        if name and name not in candidates and name not in ("Claude Code", "~"):
+            candidates.append(name)
+    return candidates
 
 
 def _raise_window_by_content(session: Session, app_name: str) -> bool:
@@ -1170,18 +1315,15 @@ def _raise_window_by_content(session: Session, app_name: str) -> bool:
     Uses AXRaise + AXMain + proc.frontmost (not `tell app to activate`)
     to avoid re-focusing the monitor's own window.
     """
-    match_name = _resolve_match_name(session)
-    if not match_name:
+    candidates = _resolve_match_candidates(session)
+    if not candidates:
         mlog("jump", "no_match_name", sid=session.session_id[:12])
         return False
 
-    match_str = f"{match_name} \u2502"
-
     proc_names = json.dumps(list({app_name.lower(), app_name}))
-    match_name_json = json.dumps(match_name)
-    match_str_json = json.dumps(match_str)
+    candidates_json = json.dumps(candidates)
 
-    mlog("jump", "raise_attempt", app=app_name, name=match_name, sid=session.session_id[:12])
+    mlog("jump", "raise_attempt", app=app_name, candidates=candidates, sid=session.session_id[:12])
 
     jxa = f"""(() => {{
         const se = Application("System Events");
@@ -1195,70 +1337,72 @@ def _raise_window_by_content(session: Session, app_name: str) -> bool:
         const wins = proc.windows();
         if (wins.length === 0) return "no_windows";
 
-        const matchName = {match_name_json};
-        const matchStr = {match_str_json};
+        const candidates = {candidates_json};
         const info = [];
 
-        // Pass 1: TITLE MATCH (instant, no visual impact)
-        // Claude Code sets terminal title to "{{emoji}} session_name".
-        // Check ALL windows including wins[0] — title matching is safe
-        // because the monitor's own title won't contain other session names.
-        // For tabs, each tab has its own title — no AXRaise needed.
-        const titleCandidates = [];
+        // Collect all window titles once
+        const titles = [];
         for (let i = 0; i < wins.length; i++) {{
-            const title = wins[i].name();
-            info.push(i + ":" + title);
-            if (title.includes(matchName)) {{
-                titleCandidates.push(wins[i]);
+            const t = wins[i].name();
+            titles.push(t);
+            info.push(i + ":" + t);
+        }}
+
+        // Try each candidate name until one matches a window title
+        for (const cand of candidates) {{
+            const matched = [];
+            for (let i = 0; i < titles.length; i++) {{
+                if (titles[i].includes(cand)) matched.push(i);
             }}
-        }}
+            if (matched.length === 0) continue;
 
-        // If exactly one title match, raise it immediately
-        if (titleCandidates.length === 1) {{
-            const w = titleCandidates[0];
-            w.actions["AXRaise"].perform();
-            try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
-            proc.frontmost = true;
-            return "title_matched:" + w.name() + "|info:" + info.join("|");
-        }}
+            // Single match — raise it
+            if (matched.length === 1) {{
+                const w = wins[matched[0]];
+                w.actions["AXRaise"].perform();
+                try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
+                proc.frontmost = true;
+                return "title_matched:" + cand + ":" + titles[matched[0]] + "|info:" + info.join("|");
+            }}
 
-        // If multiple title matches, use AXTextArea to disambiguate
-        // (e.g., two sessions with similar names)
-        if (titleCandidates.length > 1) {{
-            for (const w of titleCandidates) {{
+            // Multiple matches — disambiguate via content (statusline pattern)
+            const matchStr = cand + " \\u2502";
+            for (const idx of matched) {{
                 try {{
-                    const full = w.groups[0].groups[0].textAreas[0].value();
+                    const full = wins[idx].groups[0].groups[0].textAreas[0].value();
                     const tail = full.substring(full.length - 500);
                     if (tail.includes(matchStr)) {{
-                        w.actions["AXRaise"].perform();
-                        try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
+                        wins[idx].actions["AXRaise"].perform();
+                        try {{ wins[idx].attributes["AXMain"].value = true; }} catch(e) {{}}
                         proc.frontmost = true;
-                        return "title+content_matched:" + w.name() + "|info:" + info.join("|");
+                        return "title+content:" + cand + ":" + titles[idx] + "|info:" + info.join("|");
                     }}
                 }} catch(e) {{}}
             }}
-            // Still ambiguous — just take the first one
-            const w = titleCandidates[0];
+            // Still ambiguous — take first
+            const w = wins[matched[0]];
             w.actions["AXRaise"].perform();
             try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
             proc.frontmost = true;
-            return "title_first:" + w.name() + "|info:" + info.join("|");
+            return "title_first:" + cand + ":" + titles[matched[0]] + "|info:" + info.join("|");
         }}
 
-        // Pass 2: CONTENT MATCH (for unrenamed sessions titled "Claude Code")
-        // Read AXTextArea without AXRaise — works for separate windows
-        // and the active tab, but not inactive tabs.
-        for (let i = 1; i < wins.length; i++) {{
-            try {{
-                const full = wins[i].groups[0].groups[0].textAreas[0].value();
-                const tail = full.substring(full.length - 500);
-                if (tail.includes(matchStr)) {{
-                    wins[i].actions["AXRaise"].perform();
-                    try {{ wins[i].attributes["AXMain"].value = true; }} catch(e) {{}}
-                    proc.frontmost = true;
-                    return "content_matched:" + wins[i].name() + "|info:" + info.join("|");
-                }}
-            }} catch(e) {{}}
+        // No title candidate matched — try content match across all windows
+        // (for unrenamed sessions titled "Claude Code")
+        for (const cand of candidates) {{
+            const matchStr = cand + " \\u2502";
+            for (let i = 1; i < wins.length; i++) {{
+                try {{
+                    const full = wins[i].groups[0].groups[0].textAreas[0].value();
+                    const tail = full.substring(full.length - 500);
+                    if (tail.includes(matchStr)) {{
+                        wins[i].actions["AXRaise"].perform();
+                        try {{ wins[i].attributes["AXMain"].value = true; }} catch(e) {{}}
+                        proc.frontmost = true;
+                        return "content_matched:" + cand + ":" + titles[i] + "|info:" + info.join("|");
+                    }}
+                }} catch(e) {{}}
+            }}
         }}
 
         return "no_match|info:" + info.join("|");
@@ -1320,17 +1464,17 @@ def focus_terminal_session(session: Session) -> bool:
     """Find and activate the terminal window containing this session."""
     mlog("jump", "focus_start", sid=session.session_id[:12], title=session.title)
 
-    # Fast path: if session name is in a terminal window title, jump directly
-    # without needing to find the PID first (avoids lsof/ps overhead)
-    match_name = _resolve_match_name(session)
-    if match_name:
+    # Fast path: if any candidate name appears in a terminal window title,
+    # jump directly without PID lookup (avoids lsof/ps overhead)
+    candidates = _resolve_match_candidates(session)
+    if candidates:
         titles = _scan_terminal_titles()
-        if any(match_name in t for t in titles):
+        if any(c in t for c in candidates for t in titles):
             # IMPORTANT: Must try BOTH apps. Sessions can run in either
             # Ghostty or Terminal.app — do NOT "simplify" to one app.
             for app in ("Ghostty", "Terminal"):
                 mlog("jump", "fast_path_try", sid=session.session_id[:12],
-                     name=match_name, app=app)
+                     candidates=candidates, app=app)
                 if _raise_window_by_content(session, app):
                     return True
 
@@ -1459,9 +1603,13 @@ def _derive_cwd_from_transcript(transcript_path: str) -> str:
     return "/" + name[1:].replace("-", "/")
 
 
-def resume_session(session: Session) -> bool:
-    """Resume a Claude session in Terminal.app via AppleScript `do script`."""
-    cmd = f"claude --dangerously-skip-permissions --resume {session.session_id}"
+def resume_session(session: Session, then_command: str = "") -> bool:
+    """Resume a Claude session in a new Ghostty tab (falls back to Terminal.app).
+
+    If then_command is set (e.g. "/rename"), the resume waits for Claude to
+    start and then sends that command via keystroke.
+    """
+    cmd = f"claude --resume {session.session_id}"
     # Claude CLI resolves sessions by hashing the cwd. Use the original
     # launch directory: sessions-index projectPath > transcript path > last cwd.
     cwd = (
@@ -1474,28 +1622,49 @@ def resume_session(session: Session) -> bool:
     # Verify the JSONL transcript exists before trying to resume
     jsonl_exists = bool(session.transcript_path) and Path(session.transcript_path).exists()
     mlog("resume", "attempt", sid=session.session_id[:12], title=session.title,
-         cwd=cwd, jsonl_exists=jsonl_exists)
+         cwd=cwd, jsonl_exists=jsonl_exists, then=then_command or None)
     if not jsonl_exists:
         mlog("resume", "no_jsonl", sid=session.session_id[:12],
              path=session.transcript_path)
         return False
 
-    script = (
-        f'tell application "Terminal"\n'
-        f'  activate\n'
-        f'  do script "cd {cwd} && {cmd}"\n'
-        f'end tell'
-    )
+    # Ghostty: open new tab via keystroke, then type the command
+    jxa = f"""(() => {{
+        const se = Application("System Events");
+        const cwd = {json.dumps(cwd)};
+        const cmd = {json.dumps(cmd)};
+
+        // Try Ghostty first
+        try {{
+            const proc = se.processes.byName("Ghostty");
+            proc.name();  // Throws if not running
+            proc.frontmost = true;
+            delay(0.2);
+            // Cmd+T for new tab
+            se.keystroke("t", {{using: "command down"}});
+            delay(0.5);
+            se.keystroke("cd " + cwd + " && " + cmd);
+            delay(0.1);
+            se.keyCode(36);
+            return "ghostty";
+        }} catch(e) {{}}
+
+        // Fall back to Terminal.app
+        const term = Application("Terminal");
+        term.activate();
+        term.doScript("cd " + cwd + " && " + cmd);
+        return "terminal";
+    }})()"""
 
     try:
         result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=5,
+            ["osascript", "-l", "JavaScript", "-e", jxa],
+            capture_output=True, text=True, timeout=10,
         )
+        out = result.stdout.strip()
         mlog("resume", "launched", sid=session.session_id[:12],
-             rc=result.returncode,
-             stderr=result.stderr.strip() if result.stderr.strip() else None)
-        if result.returncode == 0:
+             via=out, rc=result.returncode)
+        if result.returncode == 0 and out in ("ghostty", "terminal"):
             _recently_resumed[session.session_id] = time.time()
             return True
         return False
@@ -1533,6 +1702,7 @@ class SessionMenu(ModalScreen[str]):
             options.append(Option("▶   Resume session", id="resume"))
         else:
             options.append(Option("🖥   Jump to terminal", id="jump"))
+            options.append(Option("🏷   Send /rename", id="rename"))
         options.append(Option(f"📋  Copy session ID ({s.session_id[:8]}…)", id="copy_id"))
         if s.remote_url:
             options.append(Option("🔗  Open remote control", id="remote"))
@@ -1830,6 +2000,7 @@ class ClaudeMonitor(App):
         Binding("escape", "clear_search", "Clear", show=False),
         Binding("j", "cursor_down", "↓", show=False),
         Binding("k", "cursor_up", "↑", show=False),
+        Binding("n", "rename_selected", "Rename", show=False),
     ]
 
     sort_mode: reactive[SortMode] = reactive(SortMode.ACTIVITY)
@@ -1846,7 +2017,7 @@ class ClaudeMonitor(App):
     _dismiss_failed: set[str] = set()  # sids where dismiss failed (can't reach terminal)
     _prev_statuses: dict[str, str] = {}  # sid -> previous status (for transition logging)
 
-    def notify(self, message, *, timeout=5, **kwargs):
+    def notify(self, message, *, timeout: float | None = 5, **kwargs):
         """Override to log every toast notification."""
         mlog("toast", "notify", message=str(message))
         super().notify(message, timeout=timeout, **kwargs)
@@ -2007,8 +2178,23 @@ class ClaudeMonitor(App):
             if action == "jump":
                 ok = focus_terminal_session(s)
                 if not ok:
-                    self.notify("Could not find terminal", timeout=4)
+                    ok = resume_session(s)
+                    if ok:
+                        self.notify(f"Resuming {s.title[:20]} in new tab", timeout=4)
+                    else:
+                        self.notify("Could not find or resume session", timeout=4)
                 mlog("menu", "jump_result", sid=s.session_id[:12], success=ok)
+            elif action == "rename":
+                ok = _send_to_terminal_session(s, "/rename")
+                if ok:
+                    self.notify(f"Sent /rename to {s.title[:20]}", timeout=3)
+                else:
+                    ok = resume_session(s)
+                    if ok:
+                        self.notify(f"Resuming {s.title[:20]} in new tab", timeout=4)
+                    else:
+                        self.notify("Could not find or resume session", timeout=4)
+                mlog("menu", "rename_result", sid=s.session_id[:12], success=ok)
             elif action == "resume":
                 ok = resume_session(s)
                 if ok:
@@ -2149,7 +2335,7 @@ class ClaudeMonitor(App):
         if tasks:
             detail_parts.append(format_plan(tasks))
         elif s.last_assistant_text:
-            preview = rich_escape(s.last_assistant_text[:400])
+            preview = _escape_markup(s.last_assistant_text[:400])
             detail_parts.append(f"[italic]{preview}[/italic]")
 
         self.query_one("#detail-panel", Static).update("\n".join(detail_parts))
@@ -2207,6 +2393,26 @@ class ClaudeMonitor(App):
         self.show_archived = not self.show_archived
         self.refresh_sessions()
         self.notify(f"All sessions {'shown' if self.show_archived else 'recent only'}", timeout=3)
+
+    def action_rename_selected(self) -> None:
+        """Send /rename to the currently selected session's terminal."""
+        table = self.query_one(DataTable)
+        if table.cursor_row is None or table.cursor_row >= len(self._flat_rows):
+            return
+        s = self._flat_rows[table.cursor_row]
+        if s.status in ("archived", "closed"):
+            self.notify("Session not running", timeout=3)
+            return
+        ok = _send_to_terminal_session(s, "/rename")
+        if ok:
+            self.notify(f"Sent /rename to {s.title[:20]}", timeout=3)
+        else:
+            ok = resume_session(s)
+            if ok:
+                self.notify(f"Resuming {s.title[:20]} in new tab", timeout=4)
+            else:
+                self.notify("Could not find or resume session", timeout=4)
+        mlog("action", "rename", sid=s.session_id[:12], success=ok)
 
     def action_pick_columns(self) -> None:
         picker = ColumnPicker(self._visible_cols, self._col_order)

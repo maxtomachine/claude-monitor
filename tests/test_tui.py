@@ -323,6 +323,7 @@ class TestArchived:
                 option_ids = [options.get_option_at_index(i).id
                               for i in range(options.option_count)]
                 assert "jump" in option_ids
+                assert "rename" in option_ids
                 assert "resume" not in option_ids
 
 

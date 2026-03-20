@@ -59,6 +59,7 @@ Single file: `claude_monitor.py`. Key sections:
 | `c` | Column picker |
 | `/` | Search/filter |
 | `j`/`k` | Vim navigation |
+| `n` | Send `/rename` to selected session |
 | `Enter` | Session context menu |
 
 ## Statusline integration

@@ -1,27 +1,44 @@
 # Jump to Terminal — Bug Investigation File
 
-## Status: SOLVED (2026-03-14)
+## Status: SOLVED (2026-03-19, v2)
 
-### The Fix: Title Matching
+### The Fix: Hook-set title with session_id marker
 
-The breakthrough was realizing Claude Code already sets terminal titles to `{emoji} session_name` (e.g., `✳ jump-to-claude-fix`). Instead of reading AXTextArea content (fragile, fails for inactive tabs, causes visual cycling), we match on `wins[i].name()` — the window title. This is:
+The hook script (`~/.claude/hooks/session_tracker.py`) writes the terminal
+title on every event via `/dev/ttysNNN` (the TTY device), formatting it as
+`{emoji} {name} ·{sid8}`. The `·{sid8}` suffix is a unique, always-present
+marker. The monitor's match logic tries this marker first, then falls back
+to name-based candidates.
 
-- **Instant** — no content reading, no delays
-- **Tab-safe** — each tab has its own title, readable without AXRaise
-- **No cycling** — single AXRaise on the matched window only
+This works because:
+- The hook fires on every PreToolUse, so the title stays set even if Claude
+  occasionally overwrites it
+- The 8-char session_id prefix is unique per session — no title ambiguity
+- Writing to `/dev/tty{N}` works from any subprocess with access to the
+  terminal's TTY device
+- TTY is discovered by walking the hook's process tree up to the `claude`
+  process, then reading its controlling terminal
 
-### Strategy (in priority order)
+### Multi-candidate match chain
 
-1. **Title match**: Scan all window titles for the session name. If exactly one matches, raise it instantly. If multiple match, disambiguate with AXTextArea content. Works for all renamed sessions including inactive tabs.
+If the `·{sid8}` marker is absent (e.g. idle sessions that haven't fired a
+hook since hooks were added), `_resolve_match_candidates()` tries:
+1. `·{sid8}` marker (unique, primary)
+2. `/tmp/claude-name-{sid}` — statusline's `session_name`
+3. Hook state title — session-memory or Haiku-generated
+4. `session.status_name` — cached from build_session
+5. `session.title` — transcript-derived
+6. cwd basename — last resort
 
-2. **Content fallback**: For unrenamed sessions (all titled "Claude Code"), read AXTextArea of each window (no AXRaise) and match `"name │"` in the statusline. Works for separate windows and the active tab.
+The JXA loop tries each candidate until one matches a window title.
 
-3. **No speculative cycling**: We do NOT AXRaise tabs speculatively. If both passes miss, we accept the miss rather than jarring the user with window cycling.
+### What failed before (v1, 2026-03-14)
 
-### Supporting changes
-
-- **Statusline writes session_name**: `statusline.sh` writes `session_name` to `/tmp/claude-name-{sid}` for the monitor to read as the match string (three-level fallback: fresh file > `session.status_name` > `session.title`).
-- **Skip wins[0]**: The monitor is always frontmost when the user triggers "jump", so wins[0] is always the monitor's own window.
+Title matching against `session_name` worked for user-renamed sessions but
+failed when Claude set an auto-generated title (e.g.
+"Build Claude Code session monitor dashboard"). No stored source had the
+same string as what Claude wrote to the terminal title — the statusline's
+`session_name` was empty, hook titles were descriptive but different.
 
 ---
 

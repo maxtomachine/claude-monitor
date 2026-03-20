@@ -21,6 +21,9 @@ htmlcov/
 *.swo
 *~
 
+# Secrets
+.api_key
+
 # OS
 .DS_Store
 Thumbs.db
