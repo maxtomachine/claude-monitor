@@ -1685,8 +1685,9 @@ class SessionMenu(ModalScreen[str]):
         if s.remote_url:
             options.append(Option("🔗  Open remote control", id="remote"))
         options.append(Option("📂  Open transcript", id="transcript"))
-        if s.status not in ("archived", "closed", "debriefing"):
-            options.append(Option("📝  Debrief & close", id="dismiss"))
+        # Debrief requires a /debrief skill installed on the user's machine
+        # if s.status not in ("archived", "closed", "debriefing"):
+        #     options.append(Option("📝  Debrief & close", id="dismiss"))
         if s.status not in ("archived", "closed"):
             options.append(Option("❌  Kill process", id="kill"))
         options.append(Option("─" * 26, id="sep", disabled=True))
