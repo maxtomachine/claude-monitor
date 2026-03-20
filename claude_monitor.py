@@ -1488,11 +1488,11 @@ def resume_session(session: Session, then_command: str = "") -> bool:
 
 # Kanban columns: status key → display header
 KANBAN_COLUMNS = [
-    ("working",        "● Working",  "green"),
-    ("needs_approval", "◉ Approval", "yellow"),
-    ("waiting",        "○ Waiting",  "dark_orange"),
-    ("idle",           "◌ Idle",     "grey70"),
     ("closed",         "⊘ Closed",   "grey50"),
+    ("idle",           "◌ Idle",     "grey70"),
+    ("waiting",        "○ Waiting",  "dark_orange"),
+    ("needs_approval", "◉ Approval", "yellow"),
+    ("working",        "● Working",  "green"),
 ]
 
 
@@ -1569,6 +1569,7 @@ class KanbanView(ModalScreen[str | None]):
             self._grid[col_idx[bucket]].append((s, body))
         self._col = next((i for i, c in enumerate(self._grid) if c), 0)
         self._row = 0
+        self._working_col = col_idx.get("working", -1)
 
     def _card_text(self, col_idx: int, body: str) -> str:
         status_key = KANBAN_COLUMNS[col_idx][0]
@@ -1579,15 +1580,17 @@ class KanbanView(ModalScreen[str | None]):
         return f"[bold]{icon} {body}"
 
     def on_mount(self) -> None:
-        if self._grid[0]:
+        wc = self._working_col
+        if wc >= 0 and self._grid[wc]:
             self.set_interval(0.132, self._tick_spinner)
 
     def _tick_spinner(self) -> None:
         self._spin_idx += 1
-        for row_idx, (_, body) in enumerate(self._grid[0]):
+        wc = self._working_col
+        for row_idx, (_, body) in enumerate(self._grid[wc]):
             try:
-                card = self.query_one(f"#kc-0-{row_idx}", Static)
-                card.update(self._card_text(0, body))
+                card = self.query_one(f"#kc-{wc}-{row_idx}", Static)
+                card.update(self._card_text(wc, body))
             except Exception:
                 pass
 
