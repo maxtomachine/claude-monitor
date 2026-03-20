@@ -6,7 +6,6 @@ if [ -f "$SL_LOG" ] && [ "$(wc -l < "$SL_LOG")" -gt 500 ]; then
 fi
 echo "$(date '+%H:%M:%S') CALLED pid=$$" >> "$SL_LOG"
 input=$(cat)
-echo "$input" > /tmp/claude-statusline-input.json
 
 # ──────────────────────────────────────────────────────────────────────
 # SECTION: JSON extraction
@@ -109,16 +108,15 @@ fi
 # SECTION: Effort/fast resolution
 # Priority: status JSON (live) > transcript (last /effort cmd) > settings.json
 # ──────────────────────────────────────────────────────────────────────
+settings_effort="" settings_fast=""
+eval "$(jq -r '@sh "settings_effort=\(.effortLevel // empty)", @sh "settings_fast=\(.fastMode // false)"' \
+  "$HOME/.claude/settings.json" 2>/dev/null)"
 [ -n "$json_effort" ] && effort_level="$json_effort"
-if [ -z "$effort_level" ]; then
-  effort_level=$(jq -r '.effortLevel // empty' "$HOME/.claude/settings.json" 2>/dev/null)
-fi
-if [ "$json_fast" = "true" ] || [ "$output_style" = "fast" ]; then
-  output_style="fast"
-elif [ -z "$json_fast" ]; then
-  settings_fast=$(jq -r '.fastMode // false' "$HOME/.claude/settings.json" 2>/dev/null)
-  [ "$settings_fast" = "true" ] && output_style="fast"
-fi
+[ -z "$effort_level" ] && effort_level="$settings_effort"
+# fastMode in settings.json is the live source — updated by /fast toggle.
+# output_style.name tracks rendering style, NOT fast-mode state.
+is_fast=false
+[ "$settings_fast" = "true" ] && is_fast=true
 
 # ──────────────────────────────────────────────────────────────────────
 # SECTION: Statusline preferences loader
@@ -254,23 +252,34 @@ if [ -n "$usage_json" ]; then
   fi
 fi
 
+# Extract session ID early (needed for per-session caching below)
+_sid=""
+if [ -n "$transcript" ]; then
+  _sid=$(basename "$transcript" .jsonl)
+  [[ "$_sid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || _sid=""
+fi
+
 # ──────────────────────────────────────────────────────────────────────
 # SECTION: Fast mode + extra billing
+# is_fast set earlier from settings.json (the live /fast toggle state)
 # ──────────────────────────────────────────────────────────────────────
 fast_indicator=""
 extra_cost=""
-is_fast=false
-if [ "$output_style" = "fast" ]; then
-  is_fast=true
+if [ "$is_fast" = true ]; then
   fast_indicator="${ORG}⚡ fast${RST}"
 fi
-if [ -n "$_extra_used" ] && [ "$_extra_used" != "null" ] && [ "$_extra_used" != "0" ]; then
-  # used_credits is cumulative cents; convert and cap display at 4 figures
-  extra_cost=$(awk -v c="$_extra_used" 'BEGIN {
-    d = c / 100.0
-    if (d >= 10000) printf "$%.0fk", d/1000
-    else if (d >= 100) printf "$%.0f", d
-    else printf "$%.2f", d
+if [ -n "$_extra_used" ] && [ "$_extra_used" != "null" ] && [ "$_extra_used" != "0" ] && [ -n "$_sid" ]; then
+  # used_credits is cumulative cents account-wide; snapshot at session start
+  # and show only this session's delta.
+  snap_file="/tmp/claude-extra-snap-${_sid}"
+  [ -f "$snap_file" ] || printf '%s' "$_extra_used" > "$snap_file"
+  _snap=$(cat "$snap_file" 2>/dev/null)
+  extra_cost=$(awk -v now="$_extra_used" -v snap="${_snap:-0}" 'BEGIN {
+    d = (now - snap) / 100.0
+    if (d < 0.01) exit
+    if (d >= 1000) printf "+$%.0fk", d/1000
+    else if (d >= 10) printf "+$%.0f", d
+    else printf "+$%.2f", d
   }')
 fi
 
@@ -293,16 +302,12 @@ fi
 # SECTION: Monitor data sharing (per-session cache files)
 # Writes ground-truth data to /tmp/ for claude-monitor TUI.
 # ──────────────────────────────────────────────────────────────────────
-if [ -n "$transcript" ]; then
-  _sid=$(basename "$transcript" .jsonl)
-  [[ "$_sid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || _sid=""
-  if [ -n "$_sid" ]; then
-    [ -n "$remaining" ] && printf '%s' "$remaining" > "/tmp/claude-ctx-${_sid}"
-    [ -n "$remote_url" ] && printf '%s' "$remote_url" > "/tmp/claude-url-${_sid}"
-    [ -n "$session_name" ] && printf '%s' "$session_name" > "/tmp/claude-name-${_sid}"
-    [ -n "$cost_raw" ] && [ "$cost_raw" != "0" ] && printf '%s' "$cost_raw" > "/tmp/claude-cost-${_sid}"
-    [ "$is_fast" = true ] && printf '%s' "$extra_cost" > "/tmp/claude-fast-${_sid}"
-  fi
+if [ -n "$_sid" ]; then
+  [ -n "$remaining" ] && printf '%s' "$remaining" > "/tmp/claude-ctx-${_sid}"
+  [ -n "$remote_url" ] && printf '%s' "$remote_url" > "/tmp/claude-url-${_sid}"
+  [ -n "$session_name" ] && printf '%s' "$session_name" > "/tmp/claude-name-${_sid}"
+  [ -n "$cost_raw" ] && [ "$cost_raw" != "0" ] && printf '%s' "$cost_raw" > "/tmp/claude-cost-${_sid}"
+  [ "$is_fast" = true ] && printf '%s' "$extra_cost" > "/tmp/claude-fast-${_sid}"
 fi
 
 echo "$(date '+%H:%M:%S') OK ctx=${remaining:-?} quota=${quota_used:-?} tokens=${tokens}" >> "$SL_LOG"

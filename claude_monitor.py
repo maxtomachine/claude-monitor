@@ -34,6 +34,7 @@ TASKS_DIR = Path.home() / ".claude" / "tasks"
 SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 PREFS_PATH = Path.home() / ".claude" / "monitor-prefs.json"
 DOING_MAX_WIDTH = 40
+RESTART_EXIT_CODE = 99
 
 MODEL_PRICING = {
     "claude-opus-4-6": (15.0, 75.0),
@@ -514,7 +515,7 @@ def _gc_state_files() -> None:
             if data.get("state") != "exited":
                 continue
             exited_at = data.get("exited_at", "")
-            if exited_at and datetime.fromisoformat(exited_at).timestamp() < cutoff:
+            if exited_at and parse_timestamp(exited_at) < cutoff:
                 f.unlink()
         except (json.JSONDecodeError, OSError, ValueError):
             pass
@@ -617,7 +618,7 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
     hook_fresh = False
     if hook and hook.get("timestamp"):
         try:
-            hook_age = time.time() - datetime.fromisoformat(hook["timestamp"]).timestamp()
+            hook_age = time.time() - parse_timestamp(hook["timestamp"])
             hook_fresh = hook_age < 30
         except (ValueError, TypeError):
             pass
@@ -635,12 +636,11 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
         display_title = "-".join(parts[:2]) if len(parts) >= 2 else session_id[:12]
     else:
         hook_title = hook.get("title", "") if hook else ""
-        sm_title = read_session_memory_title(path)
         display_title = (
             data["custom_title"]
             or hook_title
             or idx.get("summary", "")
-            or sm_title
+            or read_session_memory_title(path)
             or idx.get("firstPrompt", "")[:60]
             or Path(data["cwd"]).name
             or session_id[:8]
@@ -805,7 +805,7 @@ def determine_status(session_id: str, last_assistant_time: float,
             entered = hook.get("state_entered_at", "")
             if entered:
                 try:
-                    elapsed = time.time() - datetime.fromisoformat(entered).timestamp()
+                    elapsed = time.time() - parse_timestamp(entered)
                     return "idle" if elapsed > 300 else "waiting"
                 except (ValueError, TypeError):
                     pass
@@ -1264,47 +1264,49 @@ def _resolve_match_candidates(session: Session) -> list[str]:
     return candidates
 
 
-def _raise_window_by_content(session: Session, app_name: str | None = None) -> bool:
+def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
     """Raise the terminal window/tab for a session — single JXA call.
 
-    Checks both Ghostty and Terminal.app in one pass. Matches window titles
-    against all candidates (·{sid8} marker first). Multiple matches
-    disambiguate via AXTextArea content.
-
-    Uses AXRaise + AXMain + proc.frontmost (not `tell app to activate`)
-    to avoid re-focusing the monitor's own window.
+    Checks both Ghostty and Terminal.app. Matches window titles against all
+    candidates (·{sid8} marker first). Uses byName() lookup — z-order safe.
+    If then_text is set, types it + Enter after raising.
     """
     candidates = _resolve_match_candidates(session)
     if not candidates:
         mlog("jump", "no_match_name", sid=session.session_id[:12])
         return False
 
-    apps = [app_name] if app_name else ["Ghostty", "Terminal"]
-    apps_json = json.dumps(apps)
     candidates_json = json.dumps(candidates)
+    text_json = json.dumps(then_text)
 
-    mlog("jump", "raise_attempt", apps=apps, candidates=candidates, sid=session.session_id[:12])
+    mlog("jump", "raise_attempt", candidates=candidates, then=then_text or None,
+         sid=session.session_id[:12])
 
     jxa = f"""(() => {{
         const se = Application("System Events");
-        const appNames = {apps_json};
         const candidates = {candidates_json};
+        const thenText = {text_json};
 
-        for (const appName of appNames) {{
+        for (const appName of ["Ghostty", "Terminal"]) {{
             let proc, titles;
             try {{
                 proc = se.processes.byName(appName);
-                titles = proc.windows.name();  // bulk: one AX call for all titles
+                titles = proc.windows.name();
             }} catch(e) {{ continue; }}
             if (titles.length === 0) continue;
 
             for (const cand of candidates) {{
                 const match = titles.find(t => t.includes(cand));
                 if (match) {{
-                    const w = proc.windows.byName(match);  // name-based, z-order safe
+                    const w = proc.windows.byName(match);
                     w.actions["AXRaise"].perform();
                     try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
                     proc.frontmost = true;
+                    if (thenText) {{
+                        delay(0.15);
+                        se.keystroke(thenText);
+                        se.keyCode(36);
+                    }}
                     return "matched:" + cand + ":" + match;
                 }}
             }}
@@ -1319,13 +1321,9 @@ def _raise_window_by_content(session: Session, app_name: str | None = None) -> b
         )
         out = result.stdout.strip()
         mlog("jump", "jxa_result", result=out, sid=session.session_id[:12])
-
-        if "matched:" in out or out.startswith("title_first:"):
-            return True
-        mlog("jump", "jxa_miss", stderr=result.stderr.strip(), sid=session.session_id[:12])
+        return out.startswith("matched:")
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         mlog("jump", "jxa_error", error=str(e), sid=session.session_id[:12])
-
     return False
 
 
@@ -1354,61 +1352,13 @@ def session_has_debrief(transcript_path: str) -> bool:
 
 
 def _send_to_terminal_session(session: Session, text: str) -> bool:
-    """Find the session's terminal window, raise it, and type text + Enter.
-
-    Single JXA call: scans both Ghostty and Terminal.app, matches by title
-    candidates, raises the window, and sends the keystroke.
-    """
-    candidates = _resolve_match_candidates(session)
-    if not candidates:
-        return False
-
-    candidates_json = json.dumps(candidates)
-    text_json = json.dumps(text)
-
-    jxa = f"""(() => {{
-        const se = Application("System Events");
-        const candidates = {candidates_json};
-        const text = {text_json};
-
-        for (const appName of ["Ghostty", "Terminal"]) {{
-            let proc, titles;
-            try {{
-                proc = se.processes.byName(appName);
-                titles = proc.windows.name();
-            }} catch(e) {{ continue; }}
-
-            for (const cand of candidates) {{
-                const match = titles.find(t => t.includes(cand));
-                if (match) {{
-                    const w = proc.windows.byName(match);
-                    w.actions["AXRaise"].perform();
-                    try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
-                    proc.frontmost = true;
-                    delay(0.15);
-                    se.keystroke(text);
-                    se.keyCode(36);
-                    return "sent:" + appName + ":" + cand;
-                }}
-            }}
-        }}
-        return "no_match";
-    }})()"""
-
-    try:
-        result = subprocess.run(
-            ["osascript", "-l", "JavaScript", "-e", jxa],
-            capture_output=True, text=True, timeout=5,
-        )
-        mlog("send", "result", sid=session.session_id[:12], out=result.stdout.strip())
-        return result.stdout.strip().startswith("sent:")
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
+    """Raise the session's terminal and type text + Enter."""
+    return _raise_window_by_content(session, then_text=text)
 
 
 def _close_terminal_tab(session: Session) -> bool:
     """Close the terminal tab for a session by sending 'exit' + Enter."""
-    return _send_to_terminal_session(session, "exit")
+    return _raise_window_by_content(session, then_text="exit")
 
 
 DEBRIEF_DONE_PREFIX = Path("/tmp")
@@ -1603,46 +1553,41 @@ class KanbanView(ModalScreen[str | None]):
     def __init__(self, sessions: list[Session]) -> None:
         super().__init__()
         self._spin_idx = 0
-        # grid[col] = [Session, ...] — indexed by column position
-        self._grid: list[list[Session]] = []
-        for key, _, _ in KANBAN_COLUMNS:
-            col = []
-            for s in sessions:
-                if s.is_subagent:
-                    continue
-                bucket = s.status if s.status in (k for k, _, _ in KANBAN_COLUMNS) else "closed"
-                if s.status in ("archived", "debriefing"):
-                    bucket = "closed"
-                if bucket == key:
-                    col.append(s)
-            self._grid.append(col)
-        # Start selection at first non-empty column
+        valid = {k for k, _, _ in KANBAN_COLUMNS}
+        # grid[col] = [(session, body_text), ...] — body precomputed, icon swapped on tick
+        self._grid: list[list[tuple[Session, str]]] = [[] for _ in KANBAN_COLUMNS]
+        col_idx = {k: i for i, (k, _, _) in enumerate(KANBAN_COLUMNS)}
+        for s in sessions:
+            if s.is_subagent:
+                continue
+            bucket = s.status if s.status in valid else "closed"
+            title = _escape_markup(s.title.replace("-", "-\n"))
+            activity = generate_activity(s)
+            body = f"{title}[/]"
+            if activity:
+                body += f"\n[dim]{_escape_markup(activity[:36])}[/]"
+            self._grid[col_idx[bucket]].append((s, body))
         self._col = next((i for i, c in enumerate(self._grid) if c), 0)
         self._row = 0
 
-    def _card_text(self, col_idx: int, s: Session) -> str:
+    def _card_text(self, col_idx: int, body: str) -> str:
         status_key = KANBAN_COLUMNS[col_idx][0]
         if status_key == "working":
             icon = SPINNER_FRAMES[self._spin_idx % len(SPINNER_FRAMES)]
         else:
             icon = STATUS_ICON.get(status_key, "·")
-        title = _escape_markup(s.title.replace("-", "-\n"))
-        activity = generate_activity(s)
-        text = f"[bold]{icon} {title}[/]"
-        if activity:
-            text += f"\n[dim]{_escape_markup(activity[:36])}[/]"
-        return text
+        return f"[bold]{icon} {body}"
 
     def on_mount(self) -> None:
-        if self._grid[0]:  # only animate if there are working sessions
+        if self._grid[0]:
             self.set_interval(0.132, self._tick_spinner)
 
     def _tick_spinner(self) -> None:
         self._spin_idx += 1
-        for row_idx, s in enumerate(self._grid[0]):
+        for row_idx, (_, body) in enumerate(self._grid[0]):
             try:
                 card = self.query_one(f"#kc-0-{row_idx}", Static)
-                card.update(self._card_text(0, s))
+                card.update(self._card_text(0, body))
             except Exception:
                 pass
 
@@ -1660,10 +1605,10 @@ class KanbanView(ModalScreen[str | None]):
                         with Vertical(classes="kanban-cards"):
                             if not self._grid[col_idx]:
                                 yield Static("[dim]—[/]", classes="kanban-empty")
-                            for row_idx, s in enumerate(self._grid[col_idx]):
+                            for row_idx, (_, body) in enumerate(self._grid[col_idx]):
                                 sel = col_idx == self._col and row_idx == self._row
                                 classes = "kanban-card -selected" if sel else "kanban-card"
-                                yield Static(self._card_text(col_idx, s),
+                                yield Static(self._card_text(col_idx, body),
                                              classes=classes,
                                              id=f"kc-{col_idx}-{row_idx}")
 
@@ -1697,7 +1642,7 @@ class KanbanView(ModalScreen[str | None]):
     def action_select(self) -> None:
         col = self._grid[self._col] if 0 <= self._col < len(self._grid) else []
         if 0 <= self._row < len(col):
-            s = col[self._row]
+            s, _ = col[self._row]
             handler = self.app._make_menu_handler(s)  # type: ignore[attr-defined]
             self.app.push_screen(SessionMenu(s), handler)
 
@@ -2230,16 +2175,7 @@ class ClaudeMonitor(App):
                         self.notify("Could not find or resume session", timeout=4)
                 mlog("menu", "jump_result", sid=s.session_id[:12], success=ok)
             elif action == "rename":
-                ok = _send_to_terminal_session(s, "/rename")
-                if ok:
-                    self.notify(f"Sent /rename to {s.title[:20]}", timeout=3)
-                else:
-                    ok = resume_session(s)
-                    if ok:
-                        self.notify(f"Resuming {s.title[:20]} in new tab", timeout=4)
-                    else:
-                        self.notify("Could not find or resume session", timeout=4)
-                mlog("menu", "rename_result", sid=s.session_id[:12], success=ok)
+                self._do_rename(s, "menu")
             elif action == "resume":
                 ok = resume_session(s)
                 if ok:
@@ -2446,15 +2382,7 @@ class ClaudeMonitor(App):
         self.refresh_sessions()
         self.notify(f"All sessions {'shown' if self.show_archived else 'recent only'}", timeout=3)
 
-    def action_rename_selected(self) -> None:
-        """Send /rename to the currently selected session's terminal."""
-        table = self.query_one(DataTable)
-        if table.cursor_row is None or table.cursor_row >= len(self._flat_rows):
-            return
-        s = self._flat_rows[table.cursor_row]
-        if s.status in ("archived", "closed"):
-            self.notify("Session not running", timeout=3)
-            return
+    def _do_rename(self, s: Session, log_cat: str) -> None:
         ok = _send_to_terminal_session(s, "/rename")
         if ok:
             self.notify(f"Sent /rename to {s.title[:20]}", timeout=3)
@@ -2464,13 +2392,24 @@ class ClaudeMonitor(App):
                 self.notify(f"Resuming {s.title[:20]} in new tab", timeout=4)
             else:
                 self.notify("Could not find or resume session", timeout=4)
-        mlog("action", "rename", sid=s.session_id[:12], success=ok)
+        mlog(log_cat, "rename", sid=s.session_id[:12], success=ok)
+
+    def action_rename_selected(self) -> None:
+        """Send /rename to the currently selected session's terminal."""
+        table = self.query_one(DataTable)
+        if table.cursor_row is None or table.cursor_row >= len(self._flat_rows):
+            return
+        s = self._flat_rows[table.cursor_row]
+        if s.status in ("archived", "closed"):
+            self.notify("Session not running", timeout=3)
+            return
+        self._do_rename(s, "action")
 
     def action_kanban(self) -> None:
         self.push_screen(KanbanView(self.sessions))
 
     def action_restart(self) -> None:
-        self.exit(return_code=99)
+        self.exit(return_code=RESTART_EXIT_CODE)
 
     def action_toggle_theme(self) -> None:
         self.theme = "textual-light" if "dark" in self.theme else "textual-dark"
@@ -2546,7 +2485,7 @@ def main():
     else:
         app = ClaudeMonitor()
         app.run()
-        if app.return_code == 99:
+        if app.return_code == RESTART_EXIT_CODE:
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
 

@@ -41,6 +41,8 @@ def _tmux(*args: str, timeout: float = 5) -> str:
     result = subprocess.run(
         ["tmux", *args], capture_output=True, text=True, timeout=timeout,
     )
+    if result.returncode != 0 and args and args[0] not in ("kill-session",):
+        pytest.fail(f"tmux {args[0]} failed (rc={result.returncode}): {result.stderr.strip()}")
     return result.stdout
 
 
@@ -138,15 +140,16 @@ class TestKeybindings:
         _send("t")
         time.sleep(0.5)
         after = _capture(raw=True)
-        # Theme change should alter ANSI color codes
-        assert before != after
-        _send("t")
-        time.sleep(0.5)
+        try:
+            assert before != after
+        finally:
+            # Always restore original theme even if assertion fails
+            _send("t")
+            time.sleep(0.5)
 
     def test_sort_cycles(self, tmux_monitor):
         _send("s")
-        content = _wait_for("Sort:")
-        assert "Sort:" in content
+        _wait_for("Sort:")
 
 
 class TestSpinner:
@@ -176,7 +179,10 @@ class TestKanbanNavigation:
         # Selection highlight border should have moved
         # (hard to assert precisely in ANSI; just check something changed)
         _send("Escape")
-        assert snap1 != snap2 or True  # weak — flaky tests are weak by design
+        # Best-effort: assert that pane content changed after navigation.
+        # May collide if selection was already at rightmost non-empty column.
+        if snap1 == snap2:
+            pytest.skip("selection didn't visibly move (edge position)")
 
     def test_enter_opens_session_menu(self, tmux_monitor):
         _send("k")

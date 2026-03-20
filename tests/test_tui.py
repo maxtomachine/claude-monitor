@@ -414,7 +414,8 @@ class TestKanban:
                 # Right jumps to next non-empty column (idle)
                 await pilot.press("right")
                 await pilot.pause()
-                assert screen._grid[screen._col][0].status == "idle"
+                session, _ = screen._grid[screen._col][0]
+                assert session.status == "idle"
                 # Row clamped to column length
                 assert screen._row == 0
 
