@@ -2029,6 +2029,7 @@ class ClaudeMonitor(App):
         Binding("escape", "clear_search", "Clear", show=False),
         Binding("k", "kanban", "Kanban"),
         Binding("t", "toggle_theme", "Theme", show=False),
+        Binding("R", "restart", "Restart", show=False),
         Binding("j", "cursor_down", "↓", show=False),
         Binding("n", "rename_selected", "Rename", show=False),
     ]
@@ -2468,6 +2469,9 @@ class ClaudeMonitor(App):
     def action_kanban(self) -> None:
         self.push_screen(KanbanView(self.sessions))
 
+    def action_restart(self) -> None:
+        self.exit(return_code=99)
+
     def action_toggle_theme(self) -> None:
         self.theme = "textual-light" if "dark" in self.theme else "textual-dark"
         prefs = load_prefs()
@@ -2535,13 +2539,15 @@ class ClaudeMonitor(App):
 
 
 def main():
-    import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--log":
         from monitor_log import tail_log
         cat_filter = sys.argv[2] if len(sys.argv) > 2 else None
         tail_log(category=cat_filter)
     else:
-        ClaudeMonitor().run()
+        app = ClaudeMonitor()
+        app.run()
+        if app.return_code == 99:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 if __name__ == "__main__":

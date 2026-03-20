@@ -22,6 +22,7 @@ uv run pytest tests/ -v
 - `tests/test_parsing.py` — transcript parsing, status detection, sorting
 - `tests/test_rendering.py` — row rendering, column config, truncation
 - `tests/test_tui.py` — full TUI integration tests using Textual's headless pilot
+- `tests/test_tmux_e2e.py` — tmux-based e2e tests (spawn real TUI in tmux pane, send keystrokes, assert on terminal output). Flaky by nature — skipped in CI and when tmux not installed. Supplements Pilot tests; failures don't block merge. Run: `uv run pytest tests/test_tmux_e2e.py -v`
 
 ### Writing TUI tests
 
@@ -60,6 +61,7 @@ Single file: `claude_monitor.py`. Key sections:
 | `/` | Search/filter |
 | `k` | Kanban board view |
 | `t` | Toggle dark/light theme |
+| `R` | Restart monitor (picks up code changes) |
 | `j` | Cursor down |
 | `n` | Send `/rename` to selected session |
 | `Enter` | Session context menu |

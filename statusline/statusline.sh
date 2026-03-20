@@ -6,12 +6,13 @@ if [ -f "$SL_LOG" ] && [ "$(wc -l < "$SL_LOG")" -gt 500 ]; then
 fi
 echo "$(date '+%H:%M:%S') CALLED pid=$$" >> "$SL_LOG"
 input=$(cat)
+echo "$input" > /tmp/claude-statusline-input.json
 
 # ──────────────────────────────────────────────────────────────────────
 # SECTION: JSON extraction
 # Parses the status JSON from Claude Code into shell variables.
 # ──────────────────────────────────────────────────────────────────────
-cwd="" session_name="" remaining="" total_input=0 total_output=0 cost_raw=0 model="" transcript="" output_style=""
+cwd="" session_name="" remaining="" total_input=0 total_output=0 cost_raw=0 model="" transcript="" output_style="" json_effort="" json_fast=""
 jq_out=$(echo "$input" | jq -r '
   @sh "cwd=\(.cwd // empty)",
   @sh "session_name=\(.session_name // empty)",
@@ -21,7 +22,9 @@ jq_out=$(echo "$input" | jq -r '
   @sh "cost_raw=\(.cost.total_cost_usd // 0)",
   @sh "model=\(if .model | type == "object" then .model.display_name // .model.id else .model // empty end)",
   @sh "transcript=\(.transcript_path // empty)",
-  @sh "output_style=\(.output_style.name // empty)"
+  @sh "output_style=\(.output_style.name // empty)",
+  @sh "json_effort=\(.effort_level // .effortLevel // empty)",
+  @sh "json_fast=\(.fast_mode // .fastMode // empty)"
 ' 2>/dev/null) && eval "$jq_out"
 cwd=${cwd##*/}
 # Strip "(1M context)" etc. from model — we already show the context bar
@@ -100,6 +103,21 @@ if [ -n "$transcript" ] && [ -f "$transcript" ]; then
     { read -r remote_url; read -r compact_count; read -r effort_level; } < "$tcache"
   fi
   compact_count=${compact_count:-0}
+fi
+
+# ──────────────────────────────────────────────────────────────────────
+# SECTION: Effort/fast resolution
+# Priority: status JSON (live) > transcript (last /effort cmd) > settings.json
+# ──────────────────────────────────────────────────────────────────────
+[ -n "$json_effort" ] && effort_level="$json_effort"
+if [ -z "$effort_level" ]; then
+  effort_level=$(jq -r '.effortLevel // empty' "$HOME/.claude/settings.json" 2>/dev/null)
+fi
+if [ "$json_fast" = "true" ] || [ "$output_style" = "fast" ]; then
+  output_style="fast"
+elif [ -z "$json_fast" ]; then
+  settings_fast=$(jq -r '.fastMode // false' "$HOME/.claude/settings.json" 2>/dev/null)
+  [ "$settings_fast" = "true" ] && output_style="fast"
 fi
 
 # ──────────────────────────────────────────────────────────────────────
@@ -247,7 +265,13 @@ if [ "$output_style" = "fast" ]; then
   fast_indicator="${ORG}⚡ fast${RST}"
 fi
 if [ -n "$_extra_used" ] && [ "$_extra_used" != "null" ] && [ "$_extra_used" != "0" ]; then
-  extra_cost=$(printf '$%.2f' "$_extra_used")
+  # used_credits is cumulative cents; convert and cap display at 4 figures
+  extra_cost=$(awk -v c="$_extra_used" 'BEGIN {
+    d = c / 100.0
+    if (d >= 10000) printf "$%.0fk", d/1000
+    else if (d >= 100) printf "$%.0f", d
+    else printf "$%.2f", d
+  }')
 fi
 
 # ──────────────────────────────────────────────────────────────────────
