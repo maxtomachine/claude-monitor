@@ -14,6 +14,7 @@ from claude_monitor import (
     ClaudeMonitor,
     SessionMenu,
     ColumnPicker,
+    KanbanView,
     StatsBar,
     Session,
     ALL_COLUMNS,
@@ -323,6 +324,7 @@ class TestArchived:
                 option_ids = [options.get_option_at_index(i).id
                               for i in range(options.option_count)]
                 assert "jump" in option_ids
+                assert "rename" in option_ids
                 assert "resume" not in option_ids
 
 
@@ -352,3 +354,83 @@ class TestSubagents:
                 await pilot.pause()
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count == 1
+
+
+class TestKanban:
+    async def test_kanban_opens_and_closes(self, sample_sessions):
+        with _mock_sessions(sample_sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("k")
+                await pilot.pause()
+                assert isinstance(pilot.app.screen, KanbanView)
+                await pilot.press("escape")
+                await pilot.pause()
+                assert not isinstance(pilot.app.screen, KanbanView)
+
+    async def test_kanban_shows_columns(self):
+        sessions = [
+            make_session(session_id="w1", title="Worker", status="working"),
+            make_session(session_id="i1", title="Idler", status="idle"),
+        ]
+        with _mock_sessions(sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("k")
+                await pilot.pause()
+                screen = pilot.app.screen
+                cards = screen.query(".kanban-card")
+                assert len(cards) == 2
+
+    async def test_kanban_excludes_subagents(self):
+        sub = make_session(session_id="sub-1", is_subagent=True, parent_id="p1")
+        parent = make_session(session_id="p1", title="Parent", subagents=[sub])
+        with _mock_sessions([parent]):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("k")
+                await pilot.pause()
+                cards = pilot.app.screen.query(".kanban-card")
+                assert len(cards) == 1
+
+    async def test_kanban_arrow_navigation(self):
+        sessions = [
+            make_session(session_id="w1", title="W1", status="working"),
+            make_session(session_id="w2", title="W2", status="working"),
+            make_session(session_id="i1", title="I1", status="idle"),
+        ]
+        with _mock_sessions(sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("k")
+                await pilot.pause()
+                screen = pilot.app.screen
+                # Starts at first non-empty column (working), row 0
+                assert screen._col == 0 and screen._row == 0
+                # Down moves within column
+                await pilot.press("down")
+                await pilot.pause()
+                assert screen._row == 1
+                # Right jumps to next non-empty column (idle)
+                await pilot.press("right")
+                await pilot.pause()
+                assert screen._grid[screen._col][0].status == "idle"
+                # Row clamped to column length
+                assert screen._row == 0
+
+    async def test_kanban_enter_opens_session_menu(self):
+        s = make_session(session_id="w1", title="Worker", status="working")
+        with _mock_sessions([s]):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("k")
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause()
+                # SessionMenu opens on top; KanbanView still underneath
+                assert isinstance(pilot.app.screen, SessionMenu)
+                assert any(isinstance(sc, KanbanView) for sc in pilot.app.screen_stack)
+                # Escape → back to kanban
+                await pilot.press("escape")
+                await pilot.pause()
+                assert isinstance(pilot.app.screen, KanbanView)

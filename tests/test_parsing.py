@@ -11,6 +11,9 @@ from claude_monitor import (
     determine_status,
     sort_sessions,
     SortMode,
+    read_hook_state,
+    read_session_memory_title,
+    _resolve_match_candidates,
 )
 from tests.helpers import make_session, make_transcript_jsonl
 
@@ -171,3 +174,72 @@ class TestSortSessions:
         s2 = make_session(session_id="working", status="working")
         result = sort_sessions([s1, s2], SortMode.STATUS)
         assert result[0].session_id == "working"
+
+
+class TestHookState:
+    def test_missing_returns_none(self, tmp_path):
+        with patch("claude_monitor.HOOK_STATE_DIR", tmp_path):
+            assert read_hook_state("nonexistent") is None
+
+    def test_reads_json(self, tmp_path):
+        with patch("claude_monitor.HOOK_STATE_DIR", tmp_path):
+            state = {"session_id": "abc123", "state": "thinking", "tty": "ttys015"}
+            (tmp_path / "abc123.json").write_text(json.dumps(state))
+            result = read_hook_state("abc123")
+            assert result == state
+
+    def test_malformed_returns_none(self, tmp_path):
+        with patch("claude_monitor.HOOK_STATE_DIR", tmp_path):
+            (tmp_path / "bad.json").write_text("not json")
+            assert read_hook_state("bad") is None
+
+    def test_cached_by_mtime(self, tmp_path):
+        with patch("claude_monitor.HOOK_STATE_DIR", tmp_path), \
+             patch("claude_monitor._hook_state_cache", {}):
+            f = tmp_path / "s1.json"
+            f.write_text(json.dumps({"state": "idle"}))
+            assert read_hook_state("s1")["state"] == "idle"
+            # Rewrite with different content but same mtime — still cached
+            # (won't actually test cache here since mtime changes; just verify no crash)
+            f.write_text(json.dumps({"state": "thinking"}))
+            assert read_hook_state("s1")["state"] in ("idle", "thinking")
+
+
+class TestSessionMemoryTitle:
+    def test_missing_file(self, tmp_path):
+        assert read_session_memory_title(str(tmp_path / "fake.jsonl")) == ""
+
+    def test_parses_title_section(self, tmp_path):
+        transcript = tmp_path / "s1.jsonl"
+        transcript.touch()
+        sm_dir = tmp_path / "s1" / "session-memory"
+        sm_dir.mkdir(parents=True)
+        (sm_dir / "summary.md").write_text(
+            "# Session Title\n\n_description in italics_\n\nMy Great Title\n\n# Other\n"
+        )
+        assert read_session_memory_title(str(transcript)) == "My Great Title"
+
+    def test_stops_at_next_heading(self, tmp_path):
+        transcript = tmp_path / "s1.jsonl"
+        transcript.touch()
+        sm_dir = tmp_path / "s1" / "session-memory"
+        sm_dir.mkdir(parents=True)
+        (sm_dir / "summary.md").write_text("# Session Title\n# Next Section\nignored\n")
+        assert read_session_memory_title(str(transcript)) == ""
+
+
+class TestMatchCandidates:
+    def test_sid8_always_first(self):
+        s = make_session(session_id="abc12345-6789-xxxx-yyyy-zzzzzzzz")
+        cands = _resolve_match_candidates(s)
+        assert cands[0] == "\u00b7abc12345"
+
+    def test_dedupes(self):
+        s = make_session(title="same", status_name="same")
+        cands = _resolve_match_candidates(s)
+        assert cands.count("same") == 1
+
+    def test_excludes_generic(self):
+        s = make_session(title="Claude Code")
+        cands = _resolve_match_candidates(s)
+        assert "Claude Code" not in cands

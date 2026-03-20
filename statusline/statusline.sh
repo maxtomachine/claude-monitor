@@ -304,7 +304,7 @@ echo "$(date '+%H:%M:%S') OK ctx=${remaining:-?} quota=${quota_used:-?} tokens=$
     printf '\n'
   fi
 
-  # ── Line 2: use bar + fast + cost ──
+  # ── Line 2: quota bar (consumer) OR hook state (employee) + cost ──
   if [ "$sl_show_quota_bar" = true ] && [ -n "$quota_bar" ]; then
     line2="use ${quota_bar}"
     if [ "$is_fast" = true ] && [ "$sl_show_fast_mode" = true ]; then
@@ -313,6 +313,19 @@ echo "$(date '+%H:%M:%S') OK ctx=${remaining:-?} quota=${quota_used:-?} tokens=$
     elif [ -n "$effort_indicator" ]; then
       line2="${line2}         "
     fi
+    line2="${line2}   ${DIM}${cost_field}${RST}"
+    printf '%b\n' "$line2"
+  elif [ -n "$_sid" ]; then
+    # No quota bar (employee auth) — show hook state instead
+    hook_state_file="$HOME/.claude/session-states/${_sid}.json"
+    hook_tool=""
+    if [ -f "$hook_state_file" ]; then
+      hook_tool=$(jq -r '.tool // empty' "$hook_state_file" 2>/dev/null)
+    fi
+    sid8="${_sid:0:8}"
+    line2="${DIM}·${sid8}${RST}"
+    [ -n "$hook_tool" ] && line2="${line2}  ${DIM}${hook_tool}${RST}"
+    [ "$is_fast" = true ] && line2="${line2}  ${fast_indicator}"
     line2="${line2}   ${DIM}${cost_field}${RST}"
     printf '%b\n' "$line2"
   else
