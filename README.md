@@ -1,228 +1,213 @@
 # Claude Monitor
 
-A btop-style terminal dashboard for monitoring Claude Code sessions in real-time, plus a custom two-line HUD statusline that lives inside every Claude Code session.
+See what all your Claude Code sessions are doing at a glance.
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
+![macOS](https://img.shields.io/badge/macOS-supported-brightgreen)
 
-## What it does
+## The problem
 
-Claude Monitor watches your `~/.claude/projects/` session logs and displays a live-updating table of all active sessions. Built for power users running multiple Claude Code instances in parallel.
+You've got 6 Claude Code sessions open across 3 terminal windows. One is thinking, two are waiting for approval, one finished 20 minutes ago, and you can't remember which tab has which. You're alt-tabbing between windows to check on each one.
 
-```
-✻ WORKING   Build session monitor TUI    Opus 4.6   ██████████ 95%   245k   $3.42   0s   Editing claude_monitor.py
-. WAITING   Delete empty Gmail drafts    Opus 4.6   ████░░░░░░ 38%   1.2M   $6.76   9m   Searched Gmail
-◌ IDLE      Refactor auth middleware     Sonnet 4.6 ██░░░░░░░░ 15%   890k   $12.50  2h   Edited main.rs
-```
+## The solution
 
-### Features
-
-- **Live session table** — auto-refreshes every 3 seconds
-- **Kanban board** — `k` toggles a status-column board view with arrow navigation and animated spinners
-- **Spinner animation** — working sessions show a ping-pong `·*✢✳✶✻` cycle; static icons for other statuses
-- **Hook-based state tracking** — instant status updates via Claude Code hooks (no transcript polling needed)
-- **Activity tracking** — "Doing" column shows what each session is up to (gerund when working, past tense when idle)
-- **Context bar** — colored progress bar (green → yellow → red as context depletes)
-- **Compaction tracking** — colored markers show how many times context was compacted
-- **Cost estimation** — per-session cost based on model pricing and token counts
-- **Subagent tree view** — expand sessions to see their subagents indented below
-- **Jump to terminal** — instantly raise the Ghostty/Terminal window for any session
-- **Send /rename** — patch unnamed sessions directly from the monitor
-- **Resume fallback** — if a session's terminal can't be found, opens a new tab and resumes
-- **Dark/light theme** — `t` toggles between dark and light, persisted to preferences
-- **Sort modes** — cycle through: last active, status, context %, tokens, cost
-- **Search/filter** — `/` to filter sessions by name, project, status, or model
-- **Column picker** — toggle columns on/off, reorder with Shift+arrows, preferences saved to disk
-- **Restart** — `R` restarts the monitor in-place (picks up code changes without losing terminal)
-
-### Keyboard shortcuts
-
-| Key | Action |
-|-----|--------|
-| `j` / arrows | Navigate sessions |
-| `Enter` | Open action menu for selected session |
-| `k` | Kanban board view |
-| `s` | Cycle sort mode |
-| `a` | Toggle subagent tree view |
-| `z` | Show all sessions (including archived) |
-| `c` | Open column picker |
-| `t` | Toggle dark/light theme |
-| `n` | Send /rename to selected session |
-| `R` | Restart monitor |
-| `/` | Search / filter |
-| `Esc` | Clear search |
-| `r` | Manual refresh |
-| `d` | Toggle debug logging |
-| `q` | Quit |
-
----
-
-## The Statusline
-
-A two-line HUD that lives inside every Claude Code session, showing context usage, effort/speed modes, and session costs at a glance.
+A terminal dashboard that shows every session's status, what it's working on, how much context it's burned, and what it costs — updated in real time. Plus a two-line HUD statusline inside each Claude session.
 
 ```
-ctx ██░░░░░░▒▒  22%  🧠 max   113k tok
-·636519dc  ⚡ fast  Bash       24   $
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│ Status   Session                    Model      Context     Tokens   Cost   Doing    │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│ ✻ WORKING Build monitor dashboard   Opus 4.6   ██████████  245k    $3.42  Editing…  │
+│ ? APPROVE Delete empty Gmail drafts  Opus 4.6   ████░░░░░░  1.2M    $6.76  Bash…    │
+│ ◌ IDLE    Refactor auth middleware   Sonnet 4.6 ██░░░░░░░░  890k   $12.50  Edited…  │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### What each part shows
+Working sessions animate with a `·*✢✳✶✻` spinner. Press `k` for a kanban board:
 
-**Line 1 — Context window:**
-- 10-block colored bar (green → yellow → red → blink red at 90%+)
-- Effort level indicator (🧠) — only when `/effort` is set to non-auto
-- Total token count
-
-**Line 2 — Usage / hook state:**
-- Session ID marker (·{sid8}) — used by jump-to-terminal matching
-- Fast mode indicator (⚡) — reads live from settings.json
-- Current tool name (from hook state)
-- Session cost
-
-### Color tiers (context bar)
-
-| Usage | Color |
-|-------|-------|
-| < 50% | Green |
-| 50-74% | Yellow |
-| 75-79% | Red |
-| 80-89% | Bold red |
-| 90%+ | Blinking red |
-
----
+```
+┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+│ ⊘ Closed │  │ ◌ Idle   │  │ ○ Waiting │  │ ◉ Approve│  │ ● Working│
+│   (2)    │  │   (1)    │  │   (0)    │  │   (1)    │  │   (2)    │
+├──────────┤  ├──────────┤  │          │  ├──────────┤  ├──────────┤
+│ auth-    │  │ refactor-│  │    —     │  │ gmail-   │  │ ✻ monitor│
+│ work     │  │ module   │  │          │  │ cleanup  │  │ Editing… │
+│          │  │ Edited…  │  │          │  │          │  ├──────────┤
+│ old-     │  │          │  │          │  │          │  │ ✶ deploy │
+│ session  │  │          │  │          │  │          │  │ Running… │
+└──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘
+```
 
 ## Install
 
-One command sets up everything — monitor TUI, statusline, hooks, and launcher:
+Requires macOS, Python 3.12+, and at least one of: Ghostty, iTerm2, or Terminal.app.
 
 ```bash
-git clone https://github.com/maxtomachine/claude-monitor.git ~/Projects/claude-monitor
-cd ~/Projects/claude-monitor
+git clone https://github.com/maxtomachine/claude-monitor.git
+cd claude-monitor
 ./install.sh
 ```
 
-This will:
-- Install `uv` and `jq` if missing
-- Set up the Python environment (`uv sync`)
-- Symlink the statusline into `~/.claude/statusline.sh`
-- Install the session tracker hook at `~/.claude/hooks/session_tracker.py`
-- Add `statusLine` and `hooks` config to `~/.claude/settings.json`
-- Copy monitor column preferences to `~/.claude/monitor-prefs.json`
-- Create a `claude-monitor` launcher at `~/.local/bin/claude-monitor`
+The installer sets up everything:
+- Python environment via [uv](https://docs.astral.sh/uv/)
+- Statusline HUD symlinked into Claude Code
+- Session tracker hooks for real-time status
+- `claude-monitor` command on your PATH
 
-Then restart Claude Code for the statusline and hooks, and run `claude-monitor` from anywhere for the TUI.
+**Restart Claude Code** after install to pick up the statusline and hooks. Then run:
+
+```bash
+claude-monitor
+```
 
 ### Updating
 
-Since the installer symlinks everything back to the repo, pulling is all you need:
-
 ```bash
-cd ~/Projects/claude-monitor
-git pull
+cd claude-monitor && git pull
 ```
 
-No reinstall required.
+The statusline is symlinked, so pulling updates it everywhere instantly.
 
----
+## What you get
+
+### 1. The Dashboard (TUI)
+
+A Textual-based terminal app showing all active Claude sessions in a sortable, searchable table.
+
+| Key | What it does |
+|-----|--------------|
+| `Enter` | Action menu — jump to terminal, rename, copy ID, open remote, kill |
+| `k` | Kanban board — sessions grouped by status column, arrow-key navigation |
+| `s` | Cycle sort — activity, status, context %, tokens, cost |
+| `/` | Search — filter by session name, project, model, or status |
+| `c` | Column picker — show/hide columns, reorder with Shift+arrows |
+| `a` | Toggle subagent rows — see spawned agents nested under parents |
+| `z` | Show archived — include closed/old sessions with option to resume |
+| `t` | Dark/light theme toggle |
+| `n` | Send `/rename` to the selected session (patches unnamed sessions) |
+| `R` | Restart the monitor in-place (picks up code changes) |
+| `r` | Force refresh |
+| `q` | Quit |
+
+**Session actions** (Enter on any session):
+- **Jump to terminal** — raises the right Ghostty/iTerm2/Terminal window, even across tabs (~200ms)
+- **Resume** — reattach to a closed session in a new terminal tab
+- **Send /rename** — tell Claude to auto-generate a session name
+- **Copy session ID** — for `--resume` or debugging
+- **Open remote control** — `claude.ai/code/session_*` link
+- **Open transcript** — reveal the JSONL in Finder
+- **Debrief & close** — run `/debrief` then close the tab
+- **Kill process** — SIGTERM the Claude process
+
+If jump-to-terminal can't find the window (renamed tab, moved to a different space), it falls back to opening a new tab and resuming the session there.
+
+### 2. The Statusline (HUD)
+
+A two-line display inside every Claude Code session:
+
+```
+ctx ██████░░▒▒  58%  🧠 max    341k tok
+·636519dc  ⚡ fast  Bash        42   $
+```
+
+**Line 1:** Context bar (color-coded: green → yellow → red → blinking at 90%+), effort level, token count.
+
+**Line 2:** Session ID marker (enables jump-to-terminal), fast mode indicator, current tool, session cost.
+
+The statusline reads effort and fast-mode state from `~/.claude/settings.json`, so indicators show correctly from the moment a session starts — no need to run `/effort` or `/fast` first.
+
+### 3. The Hooks
+
+Seven Claude Code hooks fire on session events and write state to `~/.claude/session-states/`:
+
+| Hook | What it tracks |
+|------|---------------|
+| SessionStart | New session → idle state |
+| UserPromptSubmit | User sent a prompt → thinking |
+| PreToolUse / PostToolUse | Tool running → tool name + target file/command |
+| PermissionRequest | Waiting for approval |
+| Stop | Claude finished responding → idle |
+| SessionEnd | Session closed → exited (terminal state) |
+
+The hooks also:
+- **Set terminal titles** with a unique `·{sid8}` marker via `/dev/tty` writes — this is how jump-to-terminal finds the right window
+- **Generate session titles** via `session-memory/summary.md` or a background Haiku API call (needs an API key at `~/.claude-monitor/.api_key`)
+- **Guard state transitions** — exited is terminal (no flip-back), subagent events don't overwrite parent state
 
 ## How it works
 
-### Status detection (3-tier)
+### Status detection (3-tier fallback)
 
-1. **Hook state** (instant) — hooks write JSON to `~/.claude/session-states/` on every event
-2. **Signal files** (legacy) — `~/.claude/session-signals/` for simple working/stop/permission signals
-3. **Timing heuristics** (fallback) — < 30s since last output = working, < 5min = waiting, else idle
+1. **Hook state files** — instant, event-driven, always accurate when hooks are installed
+2. **PID checking** — process alive/dead via `~/.claude/sessions/*.json`
+3. **Timing heuristics** — < 30s = working, < 5min = waiting, else idle (for sessions started before hooks)
 
-### Session title resolution
+### Performance
 
-1. User-set title (`/rename` → `custom-title` in transcript)
-2. Hook-generated title (from `session-memory/summary.md` or Haiku API fallback)
-3. Sessions-index summary
-4. First user prompt
-5. Working directory name
+- **Warm refresh: ~11ms** — hook state provides status/tool, stale transcript cache reused for slow-changing data (tokens, model, cost)
+- **Cold refresh: ~180ms** — full JSONL transcript scan, cached by mtime
+- **Jump-to-terminal: ~200ms** — single JXA call with bulk title scan + `byName()` lookup
 
-### Jump-to-terminal
+### Terminal support
 
-The hook script writes the terminal title via `/dev/tty{N}` with a unique `·{sid8}` marker. The monitor matches this marker against Ghostty/Terminal window titles using a single JXA call with `byName()` lookup (z-order safe, ~200ms).
-
-### Data sources
-
-| Data | Source |
-|------|--------|
-| Session list | `~/.claude/projects/**/*.jsonl` (by mtime) |
-| Status | Hook state files → signal files → timing heuristics |
-| Context % | Ground-truth from statusline cache or token estimation |
-| Tokens / cost | Accumulated from `usage` blocks in assistant messages |
-| Activity | Hook state `tool` + `tool_target`, or transcript last tool call |
-| Effort level | Transcript (`/effort` command) → `settings.json` fallback |
-| Fast mode | `settings.json:fastMode` (live toggle state) |
-
----
+| Terminal | Jump | Resume | Tested |
+|----------|------|--------|--------|
+| Ghostty | Yes | Yes (Cmd+T) | Primary |
+| iTerm2 | Yes | Yes (Cmd+T) | Supported |
+| Terminal.app | Yes | Yes (do script) | Fallback |
 
 ## Configuration
 
-Preferences are saved to `~/.claude/monitor-prefs.json`:
+Preferences persist at `~/.claude/monitor-prefs.json`:
 
 ```json
 {
-  "columns": ["status", "session", "project", "model", "context", "compact", "tokens", "cost", "active", "doing"],
+  "columns": ["status", "session", "project", "model", "context", "tokens", "cost", "active", "doing"],
   "theme": "textual-dark"
 }
 ```
 
-### Column picker (`c`)
+### Available columns
 
-Toggle columns on/off and reorder them with Shift+arrows. Preferences persist across sessions.
-
-| Column | Description | Default |
-|--------|-------------|---------|
-| Status | Working / Waiting / Idle with animated spinner | on |
-| Session | Name or AI summary | on |
-| Project | Project directory | on |
+| Column | What it shows | Default |
+|--------|---------------|---------|
+| Status | Animated status with spinner | on |
+| Session | Name or AI-generated summary | on |
+| Project | Working directory | on |
 | Model | Opus 4.6, Sonnet 4.6, etc. | on |
-| Context | Colored bar + percentage | on |
-| Compacts | Markers for compaction count | on |
-| Tokens | Total token count | on |
-| Cost | Estimated $ spent | on |
+| Context | Color bar + percentage | on |
+| Compacts | Context compaction count | on |
+| Tokens | Total input + output tokens | on |
+| Cost | Estimated USD spent | on |
 | MCP | MCP tool call count | off |
-| Msgs | Message count | off |
+| Msgs | Human + assistant message count | off |
 | Duration | Session lifetime | off |
 | Active | Time since last activity | on |
-| Doing | Current activity / last action | on |
-
----
+| Doing | Current activity description | on |
 
 ## Testing
-
-172 tests covering pure functions, rendering, transcript parsing, full TUI interactions, and end-to-end tmux tests.
 
 ```bash
 uv sync --group dev
 uv run pytest tests/ -v
 ```
 
-| File | What it covers |
-|------|----------------|
-| `test_formatting.py` | format_model, format_tokens, format_cost, context bar, compactions |
-| `test_gerunds.py` | Activity generation — gerund mapping, MCP tools, text extraction, past tense |
-| `test_parsing.py` | Transcript parsing, timestamp handling, status detection, sorting, hook state, session-memory titles |
-| `test_rendering.py` | Row rendering, column config, truncation, subagent display |
-| `test_tui.py` | Full app: keybindings, session menu, column picker, search, subagents, kanban |
-| `test_tmux_e2e.py` | Real TUI in tmux: startup, keybinding routing, theme toggle, kanban navigation (flaky, skipped in CI) |
+172 tests across 6 files: formatting, gerund generation, transcript parsing, row rendering, full TUI integration (Textual pilot), and tmux-based end-to-end tests.
 
----
+## Requirements
+
+- **macOS** (uses JXA/System Events for terminal management)
+- **Python 3.12+**
+- **uv** (installed automatically by `install.sh`)
+- **jq** (installed automatically on macOS via Homebrew)
+- **Claude Code** (what you're monitoring)
 
 ## Contributing
 
 ```bash
-git clone https://github.com/maxtomachine/claude-monitor.git
-cd claude-monitor
 git checkout -b my-feature
-
-# Make changes, run tests
-uv run pytest tests/ -v
-
-# Push and open a PR
+uv run pytest tests/ -v   # run before committing
 git push -u origin my-feature
 gh pr create
 ```
