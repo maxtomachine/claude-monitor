@@ -6,6 +6,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -701,9 +702,6 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
     )
 
 
-_terminal_titles: list[str] = []  # Cached window titles from last scan
-_terminal_titles_ts: float = 0  # When we last scanned
-
 # PID map: built once per refresh cycle to avoid re-scanning ~/.claude/sessions/
 # per-session. Maps sessionId -> alive PID (int) or None (dead/not found).
 _pid_map: dict[str, int | None] = {}
@@ -734,39 +732,6 @@ def _refresh_pid_map() -> None:
             except (json.JSONDecodeError, OSError, KeyError, ValueError):
                 continue
     _pid_map_ts = now
-
-
-def _scan_terminal_titles() -> list[str]:
-    """Get window titles from all terminal apps. Cached for 3 seconds."""
-    global _terminal_titles, _terminal_titles_ts
-    now = time.time()
-    if now - _terminal_titles_ts < 3:
-        return _terminal_titles
-
-    jxa = """(() => {
-        const se = Application("System Events");
-        const t = [];
-        const apps = ["Ghostty", "Terminal"];
-        for (const app of apps) {
-            try {
-                const proc = se.processes.byName(app);
-                const wins = proc.windows();
-                for (let i = 0; i < wins.length; i++) t.push(wins[i].name());
-            } catch(e) {}
-        }
-        return t.join("\\n");
-    })()"""
-    try:
-        result = subprocess.run(
-            ["osascript", "-l", "JavaScript", "-e", jxa],
-            capture_output=True, text=True, timeout=3,
-        )
-        _terminal_titles = result.stdout.strip().splitlines() if result.stdout.strip() else []
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        _terminal_titles = []
-    _terminal_titles_ts = now
-    return _terminal_titles
-
 
 
 _recently_resumed: dict[str, float] = {}  # sid -> timestamp (set by resume_session)
@@ -1131,12 +1096,19 @@ def sort_sessions(sessions: list[Session], mode: SortMode) -> list[Session]:
 # ── Column rendering ──────────────────────────────────────────────────────────
 
 
-def render_row(s: Session, visible_cols: list[str]) -> list[str]:
+def render_status_cell(status: str, spin_idx: int = 0) -> str:
+    icon, color = STATUS_DISPLAY.get(status, ("?", "white"))
+    if status == "working":
+        frame = SPINNER_FRAMES[spin_idx % len(SPINNER_FRAMES)]
+        icon = f"{frame} WORKING"
+    return f"[{color}]{icon}[/]"
+
+
+def render_row(s: Session, visible_cols: list[str], spin_idx: int = 0) -> list[str]:
     cells = []
     for col in visible_cols:
         if col == "status":
-            icon, color = STATUS_DISPLAY.get(s.status, ("?", "white"))
-            cells.append(f"[{color}]{icon}[/]")
+            cells.append(render_status_cell(s.status, spin_idx))
         elif col == "session":
             if s.is_subagent:
                 cells.append(f"[dim]└─ {s.title}[/]")
@@ -1188,12 +1160,6 @@ def render_row(s: Session, visible_cols: list[str]) -> list[str]:
 
 
 # ── Terminal focus ────────────────────────────────────────────────────────────
-
-_TERMINAL_APPS: dict[str, str] = {
-    "ghostty": "Ghostty", "iterm2": "iTerm2", "iterm": "iTerm2",
-    "terminal": "Terminal", "kitty": "kitty", "alacritty": "Alacritty",
-    "wezterm": "WezTerm", "warp": "Warp",
-}
 
 
 def _find_claude_pid(session: Session) -> int | None:
@@ -1298,19 +1264,12 @@ def _resolve_match_candidates(session: Session) -> list[str]:
     return candidates
 
 
-def _raise_window_by_content(session: Session, app_name: str) -> bool:
-    """Raise the terminal window/tab containing a specific Claude session.
+def _raise_window_by_content(session: Session, app_name: str | None = None) -> bool:
+    """Raise the terminal window/tab for a session — single JXA call.
 
-    Strategy (designed for instant cmd-tab feel):
-      1. Title match — Claude Code sets terminal titles to "{emoji} name".
-         Match on window title directly. Instant, no AXRaise cycling,
-         works even for inactive tabs. Handles renamed sessions perfectly.
-      2. AXTextArea fallback — for unrenamed sessions (all titled "Claude
-         Code"), read terminal content and match "name │" in statusline.
-         Only works for the active tab in each physical window.
-      3. No cycling pass — we do NOT AXRaise tabs speculatively. If title
-         match and AXTextArea both miss, we accept the miss rather than
-         jarring the user with window cycling.
+    Checks both Ghostty and Terminal.app in one pass. Matches window titles
+    against all candidates (·{sid8} marker first). Multiple matches
+    disambiguate via AXTextArea content.
 
     Uses AXRaise + AXMain + proc.frontmost (not `tell app to activate`)
     to avoid re-focusing the monitor's own window.
@@ -1320,92 +1279,37 @@ def _raise_window_by_content(session: Session, app_name: str) -> bool:
         mlog("jump", "no_match_name", sid=session.session_id[:12])
         return False
 
-    proc_names = json.dumps(list({app_name.lower(), app_name}))
+    apps = [app_name] if app_name else ["Ghostty", "Terminal"]
+    apps_json = json.dumps(apps)
     candidates_json = json.dumps(candidates)
 
-    mlog("jump", "raise_attempt", app=app_name, candidates=candidates, sid=session.session_id[:12])
+    mlog("jump", "raise_attempt", apps=apps, candidates=candidates, sid=session.session_id[:12])
 
     jxa = f"""(() => {{
         const se = Application("System Events");
-        const names = {proc_names};
-        let proc = null;
-        for (const n of names) {{
-            try {{ proc = se.processes.byName(n); proc.name(); break; }}
-            catch(e) {{ proc = null; }}
-        }}
-        if (!proc) return "notfound";
-        const wins = proc.windows();
-        if (wins.length === 0) return "no_windows";
-
+        const appNames = {apps_json};
         const candidates = {candidates_json};
-        const info = [];
 
-        // Collect all window titles once
-        const titles = [];
-        for (let i = 0; i < wins.length; i++) {{
-            const t = wins[i].name();
-            titles.push(t);
-            info.push(i + ":" + t);
-        }}
+        for (const appName of appNames) {{
+            let proc, titles;
+            try {{
+                proc = se.processes.byName(appName);
+                titles = proc.windows.name();  // bulk: one AX call for all titles
+            }} catch(e) {{ continue; }}
+            if (titles.length === 0) continue;
 
-        // Try each candidate name until one matches a window title
-        for (const cand of candidates) {{
-            const matched = [];
-            for (let i = 0; i < titles.length; i++) {{
-                if (titles[i].includes(cand)) matched.push(i);
-            }}
-            if (matched.length === 0) continue;
-
-            // Single match — raise it
-            if (matched.length === 1) {{
-                const w = wins[matched[0]];
-                w.actions["AXRaise"].perform();
-                try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
-                proc.frontmost = true;
-                return "title_matched:" + cand + ":" + titles[matched[0]] + "|info:" + info.join("|");
-            }}
-
-            // Multiple matches — disambiguate via content (statusline pattern)
-            const matchStr = cand + " \\u2502";
-            for (const idx of matched) {{
-                try {{
-                    const full = wins[idx].groups[0].groups[0].textAreas[0].value();
-                    const tail = full.substring(full.length - 500);
-                    if (tail.includes(matchStr)) {{
-                        wins[idx].actions["AXRaise"].perform();
-                        try {{ wins[idx].attributes["AXMain"].value = true; }} catch(e) {{}}
-                        proc.frontmost = true;
-                        return "title+content:" + cand + ":" + titles[idx] + "|info:" + info.join("|");
-                    }}
-                }} catch(e) {{}}
-            }}
-            // Still ambiguous — take first
-            const w = wins[matched[0]];
-            w.actions["AXRaise"].perform();
-            try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
-            proc.frontmost = true;
-            return "title_first:" + cand + ":" + titles[matched[0]] + "|info:" + info.join("|");
-        }}
-
-        // No title candidate matched — try content match across all windows
-        // (for unrenamed sessions titled "Claude Code")
-        for (const cand of candidates) {{
-            const matchStr = cand + " \\u2502";
-            for (let i = 1; i < wins.length; i++) {{
-                try {{
-                    const full = wins[i].groups[0].groups[0].textAreas[0].value();
-                    const tail = full.substring(full.length - 500);
-                    if (tail.includes(matchStr)) {{
-                        wins[i].actions["AXRaise"].perform();
-                        try {{ wins[i].attributes["AXMain"].value = true; }} catch(e) {{}}
-                        proc.frontmost = true;
-                        return "content_matched:" + cand + ":" + titles[i] + "|info:" + info.join("|");
-                    }}
-                }} catch(e) {{}}
+            for (const cand of candidates) {{
+                const match = titles.find(t => t.includes(cand));
+                if (match) {{
+                    const w = proc.windows.byName(match);  // name-based, z-order safe
+                    w.actions["AXRaise"].perform();
+                    try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
+                    proc.frontmost = true;
+                    return "matched:" + cand + ":" + match;
+                }}
             }}
         }}
-
-        return "no_match|info:" + info.join("|");
+        return "no_match";
     }})()"""
 
     try:
@@ -1425,68 +1329,14 @@ def _raise_window_by_content(session: Session, app_name: str) -> bool:
     return False
 
 
-def find_terminal_for_session(session: Session) -> str | None:
-    """Find which terminal app owns the Claude process for this session."""
-    pid = _find_claude_pid(session)
-    if pid is None:
-        return None
-    # Walk up the process tree to find the terminal app
-    try:
-        result = subprocess.run(
-            ["ps", "-eo", "pid,ppid,comm"],
-            capture_output=True, text=True, timeout=3,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return None
-
-    pid_table: dict[int, tuple[int, str]] = {}
-    for line in result.stdout.strip().splitlines()[1:]:
-        parts = line.split(None, 2)
-        if len(parts) >= 3:
-            try:
-                pid_table[int(parts[0])] = (int(parts[1]), parts[2])
-            except ValueError:
-                continue
-
-    current = pid
-    for _ in range(15):
-        if current not in pid_table:
-            break
-        ppid, comm = pid_table[current]
-        for substr, app_name in _TERMINAL_APPS.items():
-            if substr in comm.lower():
-                return app_name
-        current = ppid
-    return None
-
-
 def focus_terminal_session(session: Session) -> bool:
-    """Find and activate the terminal window containing this session."""
+    """Find and activate the terminal window containing this session.
+
+    Single JXA call checks both Ghostty and Terminal.app, matches against
+    all candidates (·{sid8} marker first), and raises the window.
+    """
     mlog("jump", "focus_start", sid=session.session_id[:12], title=session.title)
-
-    # Fast path: if any candidate name appears in a terminal window title,
-    # jump directly without PID lookup (avoids lsof/ps overhead)
-    candidates = _resolve_match_candidates(session)
-    if candidates:
-        titles = _scan_terminal_titles()
-        if any(c in t for c in candidates for t in titles):
-            # IMPORTANT: Must try BOTH apps. Sessions can run in either
-            # Ghostty or Terminal.app — do NOT "simplify" to one app.
-            for app in ("Ghostty", "Terminal"):
-                mlog("jump", "fast_path_try", sid=session.session_id[:12],
-                     candidates=candidates, app=app)
-                if _raise_window_by_content(session, app):
-                    return True
-
-    # Standard path: find PID → terminal app → raise window
-    terminal = find_terminal_for_session(session)
-    mlog("jump", "terminal_lookup", sid=session.session_id[:12], terminal=terminal or "none")
-
-    if terminal:
-        return _raise_window_by_content(session, terminal)
-
-    mlog("jump", "no_terminal", sid=session.session_id[:12])
-    return False
+    return _raise_window_by_content(session)
 
 
 def session_has_debrief(transcript_path: str) -> bool:
@@ -1506,33 +1356,43 @@ def session_has_debrief(transcript_path: str) -> bool:
 def _send_to_terminal_session(session: Session, text: str) -> bool:
     """Find the session's terminal window, raise it, and type text + Enter.
 
-    Delegates window-finding to _raise_window_by_content (single source of
-    truth for the title+content matching strategy), then sends a keystroke
-    in a lightweight JXA call.
+    Single JXA call: scans both Ghostty and Terminal.app, matches by title
+    candidates, raises the window, and sends the keystroke.
     """
-    # Try PID-based terminal lookup first, then fall back to trying
-    # known terminal apps (same fast-path strategy as focus_terminal_session)
-    raised = False
-    terminal = find_terminal_for_session(session)
-    if terminal:
-        raised = _raise_window_by_content(session, terminal)
-    if not raised:
-        for app in ("Ghostty", "Terminal"):
-            if _raise_window_by_content(session, app):
-                raised = True
-                break
-    if not raised:
+    candidates = _resolve_match_candidates(session)
+    if not candidates:
         return False
 
-    # Window is now focused — send the keystroke
+    candidates_json = json.dumps(candidates)
     text_json = json.dumps(text)
+
     jxa = f"""(() => {{
         const se = Application("System Events");
-        delay(0.3);
-        se.keystroke({text_json});
-        delay(0.1);
-        se.keyCode(36);
-        return "sent";
+        const candidates = {candidates_json};
+        const text = {text_json};
+
+        for (const appName of ["Ghostty", "Terminal"]) {{
+            let proc, titles;
+            try {{
+                proc = se.processes.byName(appName);
+                titles = proc.windows.name();
+            }} catch(e) {{ continue; }}
+
+            for (const cand of candidates) {{
+                const match = titles.find(t => t.includes(cand));
+                if (match) {{
+                    const w = proc.windows.byName(match);
+                    w.actions["AXRaise"].perform();
+                    try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
+                    proc.frontmost = true;
+                    delay(0.15);
+                    se.keystroke(text);
+                    se.keyCode(36);
+                    return "sent:" + appName + ":" + cand;
+                }}
+            }}
+        }}
+        return "no_match";
     }})()"""
 
     try:
@@ -1540,7 +1400,8 @@ def _send_to_terminal_session(session: Session, text: str) -> bool:
             ["osascript", "-l", "JavaScript", "-e", jxa],
             capture_output=True, text=True, timeout=5,
         )
-        return "sent" in result.stdout
+        mlog("send", "result", sid=session.session_id[:12], out=result.stdout.strip())
+        return result.stdout.strip().startswith("sent:")
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return False
 
@@ -1674,6 +1535,174 @@ def resume_session(session: Session, then_command: str = "") -> bool:
 
 
 # ── Screens ───────────────────────────────────────────────────────────────────
+
+# Kanban columns: status key → display header
+KANBAN_COLUMNS = [
+    ("working",        "● Working",  "green"),
+    ("needs_approval", "◉ Approval", "yellow"),
+    ("waiting",        "○ Waiting",  "dark_orange"),
+    ("idle",           "◌ Idle",     "grey70"),
+    ("closed",         "⊘ Closed",   "grey50"),
+]
+
+
+_SPIN_BASE = "·*✢✳✶✻"
+SPINNER_FRAMES = _SPIN_BASE + _SPIN_BASE[-2:0:-1]  # ping-pong: up then back down
+STATUS_ICON = {
+    "working": None,  # animated — uses SPINNER_FRAMES
+    "needs_approval": "?",
+    "waiting": ".",
+    "idle": "◌",
+    "closed": "x",
+}
+
+
+class KanbanView(ModalScreen[str | None]):
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("k", "close", "Close", show=False),
+        Binding("q", "close", "Close", show=False),
+        Binding("up", "move('up')", "↑", show=False),
+        Binding("down", "move('down')", "↓", show=False),
+        Binding("left", "move('left')", "←", show=False),
+        Binding("right", "move('right')", "→", show=False),
+        Binding("enter", "select", "Select"),
+    ]
+    CSS = """
+    KanbanView { background: $background; align: center middle; }
+    #kanban-outer {
+        width: 100%; height: 100%; padding: 1 2;
+    }
+    #kanban-title { text-align: center; text-style: bold; padding-bottom: 1; }
+    #kanban-board {
+        width: 100%; height: 1fr;
+    }
+    .kanban-col {
+        width: 1fr; height: 100%; padding: 0 1;
+        border-right: solid $panel;
+    }
+    .kanban-col:last-child { border-right: none; }
+    .kanban-col-header {
+        text-align: center; text-style: bold; padding-bottom: 1;
+        height: 2;
+    }
+    .kanban-cards {
+        height: 1fr; overflow-y: auto;
+    }
+    .kanban-card {
+        height: auto; padding: 0 1; margin-bottom: 1;
+        background: $panel; border: solid $primary-darken-2;
+    }
+    .kanban-card.-selected {
+        border: thick $accent;
+        background: $boost;
+    }
+    .kanban-empty { color: $text-disabled; text-align: center; padding-top: 2; }
+    """
+
+    def __init__(self, sessions: list[Session]) -> None:
+        super().__init__()
+        self._spin_idx = 0
+        # grid[col] = [Session, ...] — indexed by column position
+        self._grid: list[list[Session]] = []
+        for key, _, _ in KANBAN_COLUMNS:
+            col = []
+            for s in sessions:
+                if s.is_subagent:
+                    continue
+                bucket = s.status if s.status in (k for k, _, _ in KANBAN_COLUMNS) else "closed"
+                if s.status in ("archived", "debriefing"):
+                    bucket = "closed"
+                if bucket == key:
+                    col.append(s)
+            self._grid.append(col)
+        # Start selection at first non-empty column
+        self._col = next((i for i, c in enumerate(self._grid) if c), 0)
+        self._row = 0
+
+    def _card_text(self, col_idx: int, s: Session) -> str:
+        status_key = KANBAN_COLUMNS[col_idx][0]
+        if status_key == "working":
+            icon = SPINNER_FRAMES[self._spin_idx % len(SPINNER_FRAMES)]
+        else:
+            icon = STATUS_ICON.get(status_key, "·")
+        title = _escape_markup(s.title.replace("-", "-\n"))
+        activity = generate_activity(s)
+        text = f"[bold]{icon} {title}[/]"
+        if activity:
+            text += f"\n[dim]{_escape_markup(activity[:36])}[/]"
+        return text
+
+    def on_mount(self) -> None:
+        if self._grid[0]:  # only animate if there are working sessions
+            self.set_interval(0.132, self._tick_spinner)
+
+    def _tick_spinner(self) -> None:
+        self._spin_idx += 1
+        for row_idx, s in enumerate(self._grid[0]):
+            try:
+                card = self.query_one(f"#kc-0-{row_idx}", Static)
+                card.update(self._card_text(0, s))
+            except Exception:
+                pass
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="kanban-outer"):
+            yield Label("[bold]Kanban Board[/]  [dim]←→↑↓ nav · enter select · esc close[/]", id="kanban-title")
+            with Horizontal(id="kanban-board"):
+                for col_idx, (key, header, color) in enumerate(KANBAN_COLUMNS):
+                    with Vertical(classes="kanban-col"):
+                        count = len(self._grid[col_idx])
+                        yield Label(
+                            f"[{color}]{header}[/] [dim]({count})[/]",
+                            classes="kanban-col-header",
+                        )
+                        with Vertical(classes="kanban-cards"):
+                            if not self._grid[col_idx]:
+                                yield Static("[dim]—[/]", classes="kanban-empty")
+                            for row_idx, s in enumerate(self._grid[col_idx]):
+                                sel = col_idx == self._col and row_idx == self._row
+                                classes = "kanban-card -selected" if sel else "kanban-card"
+                                yield Static(self._card_text(col_idx, s),
+                                             classes=classes,
+                                             id=f"kc-{col_idx}-{row_idx}")
+
+    def _refresh_selection(self) -> None:
+        for w in self.query(".kanban-card"):
+            w.remove_class("-selected")
+        try:
+            card = self.query_one(f"#kc-{self._col}-{self._row}")
+            card.add_class("-selected")
+            card.scroll_visible(animate=False)
+        except Exception:
+            pass
+
+    def action_move(self, direction: str) -> None:
+        if direction in ("left", "right"):
+            step = -1 if direction == "left" else 1
+            new_col = self._col
+            for _ in range(len(self._grid)):
+                new_col = (new_col + step) % len(self._grid)
+                if self._grid[new_col]:
+                    break
+            self._col = new_col
+            self._row = min(self._row, len(self._grid[self._col]) - 1)
+        else:
+            col_len = len(self._grid[self._col])
+            if col_len:
+                step = -1 if direction == "up" else 1
+                self._row = (self._row + step) % col_len
+        self._refresh_selection()
+
+    def action_select(self) -> None:
+        col = self._grid[self._col] if 0 <= self._col < len(self._grid) else []
+        if 0 <= self._row < len(col):
+            s = col[self._row]
+            handler = self.app._make_menu_handler(s)  # type: ignore[attr-defined]
+            self.app.push_screen(SessionMenu(s), handler)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
 
 
 class SessionMenu(ModalScreen[str]):
@@ -1998,8 +2027,9 @@ class ClaudeMonitor(App):
         Binding("d", "toggle_debug", "Debug"),
         Binding("slash", "start_search", "Search"),
         Binding("escape", "clear_search", "Clear", show=False),
+        Binding("k", "kanban", "Kanban"),
+        Binding("t", "toggle_theme", "Theme", show=False),
         Binding("j", "cursor_down", "↓", show=False),
-        Binding("k", "cursor_up", "↑", show=False),
         Binding("n", "rename_selected", "Rename", show=False),
     ]
 
@@ -2016,6 +2046,7 @@ class ClaudeMonitor(App):
     _dismissing_sessions: dict[str, str] = {}  # sid -> "debriefing" | "closing"
     _dismiss_failed: set[str] = set()  # sids where dismiss failed (can't reach terminal)
     _prev_statuses: dict[str, str] = {}  # sid -> previous status (for transition logging)
+    _spin_idx: int = 0
 
     def notify(self, message, *, timeout: float | None = 5, **kwargs):
         """Override to log every toast notification."""
@@ -2038,14 +2069,33 @@ class ClaudeMonitor(App):
     def on_mount(self) -> None:
         self._visible_cols = get_visible_columns()
         self._col_order = get_column_order()
+        saved_theme = load_prefs().get("theme")
+        if saved_theme:
+            self.theme = saved_theme
         self._rebuild_table_columns()
-        # Set terminal window title (overrides Ghostty's cwd-based title)
-        print("\033]2;Claude Monitor\007", end="", flush=True)
+        # Set terminal window title (skip in tests / non-tty)
+        if sys.stdout.isatty() and "PYTEST_CURRENT_TEST" not in os.environ:
+            print("\033]2;Claude Monitor\007", end="", flush=True)
         self.refresh_sessions()
         self.set_interval(3, self.refresh_sessions)
+        self.set_interval(0.132, self._tick_spinner)
         self.set_interval(600, self._audit_stats)  # Every 10 minutes
         self.query_one("#session-table", DataTable).focus()
         mlog("app", "started")
+
+    def _tick_spinner(self) -> None:
+        """Advance spinner frame and update only working-status cells."""
+        if "status" not in self._visible_cols:
+            return
+        self._spin_idx += 1
+        table = self.query_one("#session-table", DataTable)
+        cell = render_status_cell("working", self._spin_idx)
+        for s in self._flat_rows:
+            if s.status == "working":
+                try:
+                    table.update_cell(s.session_id, "status", cell)
+                except Exception:
+                    pass
 
     def _rebuild_table_columns(self) -> None:
         table = self.query_one("#session-table", DataTable)
@@ -2164,14 +2214,8 @@ class ClaudeMonitor(App):
         table.scroll_to(saved_scroll_x, saved_scroll_y, animate=False)
         self.query_one(StatsBar).update_stats(self.sessions, self.sort_mode)
 
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Enter key pressed on a row — open context menu."""
-        if not (event.row_key and event.row_key.value):
-            return
-        s = next((s for s in self._flat_rows if s.session_id == event.row_key.value), None)
-        if not s:
-            return
-
+    def _make_menu_handler(self, s: Session):
+        """Build the SessionMenu dismiss callback for a session."""
         def handle_action(action: str | None) -> None:
             mlog("menu", "action", action=action, sid=s.session_id[:12],
                  title=s.title, status=s.status)
@@ -2199,7 +2243,6 @@ class ClaudeMonitor(App):
                 ok = resume_session(s)
                 if ok:
                     self.notify(f"Resuming {s.title[:20]}…", timeout=4)
-                    # Force PID map refresh so next cycle picks up the new process
                     global _pid_map_ts
                     _pid_map_ts = 0
                 else:
@@ -2226,7 +2269,16 @@ class ClaudeMonitor(App):
                         self.notify(f"Kill failed: {e}", timeout=4)
                 else:
                     self.notify("No process found", timeout=4)
-        self.push_screen(SessionMenu(s), handle_action)
+        return handle_action
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Enter key pressed on a row — open context menu."""
+        if not (event.row_key and event.row_key.value):
+            return
+        s = next((s for s in self._flat_rows if s.session_id == event.row_key.value), None)
+        if not s:
+            return
+        self.push_screen(SessionMenu(s), self._make_menu_handler(s))
 
     def _start_dismiss(self, session: Session) -> None:
         sid = session.session_id
@@ -2369,8 +2421,7 @@ class ClaudeMonitor(App):
         self.query_one("#session-table", DataTable).focus()
 
     def action_refresh(self) -> None:
-        global _terminal_titles_ts, _pid_map_ts
-        _terminal_titles_ts = 0  # Force fresh window title scan
+        global _pid_map_ts
         _pid_map_ts = 0  # Force fresh PID map
         _scan_cache.clear()  # Force re-read all transcripts
         _subagent_cache.clear()
@@ -2413,6 +2464,16 @@ class ClaudeMonitor(App):
             else:
                 self.notify("Could not find or resume session", timeout=4)
         mlog("action", "rename", sid=s.session_id[:12], success=ok)
+
+    def action_kanban(self) -> None:
+        self.push_screen(KanbanView(self.sessions))
+
+    def action_toggle_theme(self) -> None:
+        self.theme = "textual-light" if "dark" in self.theme else "textual-dark"
+        prefs = load_prefs()
+        prefs["theme"] = self.theme
+        save_prefs(prefs)
+        self.notify(f"Theme: {self.theme.replace('textual-', '')}", timeout=2)
 
     def action_pick_columns(self) -> None:
         picker = ColumnPicker(self._visible_cols, self._col_order)

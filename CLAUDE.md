@@ -58,7 +58,9 @@ Single file: `claude_monitor.py`. Key sections:
 | `z` | Toggle archived/resumable sessions |
 | `c` | Column picker |
 | `/` | Search/filter |
-| `j`/`k` | Vim navigation |
+| `k` | Kanban board view |
+| `t` | Toggle dark/light theme |
+| `j` | Cursor down |
 | `n` | Send `/rename` to selected session |
 | `Enter` | Session context menu |
 
