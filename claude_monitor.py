@@ -1287,7 +1287,7 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
         const candidates = {candidates_json};
         const thenText = {text_json};
 
-        for (const appName of ["Ghostty", "Terminal"]) {{
+        for (const appName of ["Ghostty", "iTerm2", "Terminal"]) {{
             let proc, titles;
             try {{
                 proc = se.processes.byName(appName);
@@ -1445,26 +1445,27 @@ def resume_session(session: Session, then_command: str = "") -> bool:
         const cwd = {json.dumps(cwd)};
         const cmd = {json.dumps(cmd)};
 
-        // Try Ghostty first
-        try {{
-            const proc = se.processes.byName("Ghostty");
-            proc.name();  // Throws if not running
-            proc.frontmost = true;
-            delay(0.2);
-            // Cmd+T for new tab
-            se.keystroke("t", {{using: "command down"}});
-            delay(0.5);
-            se.keystroke("cd " + cwd + " && " + cmd);
-            delay(0.1);
-            se.keyCode(36);
-            return "ghostty";
-        }} catch(e) {{}}
+        // Try Ghostty, then iTerm2 (both use Cmd+T for new tab)
+        for (const appName of ["Ghostty", "iTerm2"]) {{
+            try {{
+                const proc = se.processes.byName(appName);
+                proc.name();
+                proc.frontmost = true;
+                delay(0.2);
+                se.keystroke("t", {{using: "command down"}});
+                delay(0.5);
+                se.keystroke("cd " + cwd + " && " + cmd);
+                delay(0.1);
+                se.keyCode(36);
+                return appName;
+            }} catch(e) {{}}
+        }}
 
         // Fall back to Terminal.app
         const term = Application("Terminal");
         term.activate();
         term.doScript("cd " + cwd + " && " + cmd);
-        return "terminal";
+        return "Terminal";
     }})()"""
 
     try:
@@ -1475,7 +1476,7 @@ def resume_session(session: Session, then_command: str = "") -> bool:
         out = result.stdout.strip()
         mlog("resume", "launched", sid=session.session_id[:12],
              via=out, rc=result.returncode)
-        if result.returncode == 0 and out in ("ghostty", "terminal"):
+        if result.returncode == 0 and out in ("Ghostty", "iTerm2", "Terminal"):
             _recently_resumed[session.session_id] = time.time()
             return True
         return False

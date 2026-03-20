@@ -53,6 +53,30 @@ else
   echo "Created $SETTINGS with statusLine config"
 fi
 
+# ── Session tracker hook ───────────────────────────────────────────────────────
+
+HOOKS_DIR="$CLAUDE_DIR/hooks"
+mkdir -p "$HOOKS_DIR"
+cp "$REPO_DIR/hooks/session_tracker.py" "$HOOKS_DIR/session_tracker.py"
+echo "Installed hook → $HOOKS_DIR/session_tracker.py"
+
+# Add hooks config if not already present
+if [ -f "$SETTINGS" ] && ! grep -q '"SessionStart"' "$SETTINGS"; then
+  tmp=$(mktemp)
+  jq '. + {"hooks": {
+    "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/session_tracker.py session_start"}]}],
+    "UserPromptSubmit": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/session_tracker.py user_prompt_submit"}]}],
+    "PreToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/session_tracker.py pre_tool_use"}]}],
+    "PostToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/session_tracker.py post_tool_use"}]}],
+    "PermissionRequest": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/session_tracker.py permission_request"}]}],
+    "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/session_tracker.py stop"}]}],
+    "SessionEnd": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/session_tracker.py session_end"}]}]
+  }}' "$SETTINGS" > "$tmp" && mv "$tmp" "$SETTINGS"
+  echo "Added hooks config to $SETTINGS"
+else
+  echo "Hooks already configured in $SETTINGS"
+fi
+
 # ── Monitor preferences ────────────────────────────────────────────────────────
 
 if [ ! -f "$CLAUDE_DIR/monitor-prefs.json" ]; then

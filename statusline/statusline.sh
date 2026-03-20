@@ -290,11 +290,11 @@ fi
 effort_indicator=""
 if [ -n "$effort_level" ] && [ "$effort_level" != "auto" ]; then
   case "$effort_level" in
-    max)    effort_indicator="🧠 \033[38;5;175m max${RST}" ;;
+    max)    effort_indicator="🧠 \033[38;5;175mmax ${RST}" ;;
     high)   effort_indicator="🧠 ${GRN}high${RST}" ;;
-    medium) effort_indicator="🧠 ${YEL} med${RST}" ;;
-    low)    effort_indicator="🧠 ${DIM} low${RST}" ;;
-    *)      effort_indicator="🧠 ${DIM} ${effort_level}${RST}" ;;
+    medium) effort_indicator="🧠 ${YEL}med ${RST}" ;;
+    low)    effort_indicator="🧠 ${DIM}low ${RST}" ;;
+    *)      effort_indicator="🧠 ${DIM}${effort_level}${RST}" ;;
   esac
 fi
 
