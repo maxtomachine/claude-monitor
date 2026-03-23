@@ -338,7 +338,7 @@ echo "$(date '+%H:%M:%S') OK ctx=${remaining:-?} quota=${quota_used:-?} tokens=$
     line2="use ${quota_bar}"
     if [ "$is_fast" = true ] && [ "$sl_show_fast_mode" = true ]; then
       line2="${line2}  ${fast_indicator}"
-      [ -n "$extra_cost" ] && line2="${line2} ${YEL}+${extra_cost}${RST}"
+      [ -n "$extra_cost" ] && line2="${line2} ${YEL}${extra_cost}${RST}"
     elif [ -n "$effort_indicator" ]; then
       line2="${line2}         "
     fi
