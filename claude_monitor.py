@@ -1288,7 +1288,7 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
         const thenText = {text_json};
 
         for (const appName of ["Ghostty", "iTerm2", "Terminal"]) {{
-            // Use app's own scripting bridge — sees ALL windows across spaces
+            // App's own scripting bridge sees ALL windows across spaces
             // (System Events is scoped to current space)
             let app, allTitles;
             try {{
@@ -1305,30 +1305,34 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
             }}
             if (!targetName) continue;
 
-            // activate() switches to the app's space (requires workspaces-auto-swoosh)
             app.activate();
-            delay(0.2);
+            delay(0.1);
 
-            // Now SE can see windows on this space — raise the target
+            const proc = se.processes.byName(appName);
+
+            // Fast path: AXRaise if window is on the current space
             try {{
-                const proc = se.processes.byName(appName);
                 const w = proc.windows.byName(targetName);
                 w.actions["AXRaise"].perform();
                 try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
-            }} catch(e) {{
-                // Window might be on a DIFFERENT space than where activate() landed.
-                // Cycle with Cmd+` which (with auto-swoosh) crosses spaces.
-                const proc = se.processes.byName(appName);
-                for (let i = 0; i < allTitles.length; i++) {{
-                    se.keystroke("`", {{using: "command down"}});
-                    delay(0.2);
-                    try {{
-                        if (proc.windows[0].name().includes(matchedCand)) break;
-                    }} catch(e2) {{}}
+                if (thenText) {{ delay(0.15); se.keystroke(thenText); se.keyCode(36); }}
+                return "matched:" + matchedCand + ":" + targetName;
+            }} catch(e) {{}}
+
+            // Cross-space: click the Window menu item — macOS switches spaces natively
+            try {{
+                const menu = proc.menuBars[0].menuBarItems.byName("Window").menus[0];
+                const items = menu.menuItems.name();
+                const item = items.find(n => n && n.includes(matchedCand));
+                if (item) {{
+                    menu.menuItems.byName(item).click();
+                    if (thenText) {{ delay(0.3); se.keystroke(thenText); se.keyCode(36); }}
+                    return "matched:" + matchedCand + ":menu:" + item;
                 }}
+            }} catch(e) {{
+                return "menu_error:" + e.message;
             }}
-            if (thenText) {{ delay(0.15); se.keystroke(thenText); se.keyCode(36); }}
-            return "matched:" + matchedCand + ":" + targetName;
+            return "found_not_raised:" + matchedCand;
         }}
         return "no_match";
     }})()"""
