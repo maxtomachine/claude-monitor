@@ -1288,33 +1288,56 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
         const thenText = {text_json};
 
         for (const appName of ["Ghostty", "iTerm2", "Terminal"]) {{
+            // Use the app's own scripting bridge to see ALL windows
+            // (System Events can't see windows on other macOS spaces)
+            let app, allTitles;
+            try {{
+                app = Application(appName);
+                allTitles = app.windows.name();
+            }} catch(e) {{ continue; }}
+            if (allTitles.length === 0) continue;
+
+            // Check if any candidate matches a window title
+            let targetName = null;
+            let matchedCand = null;
+            for (const cand of candidates) {{
+                const match = allTitles.find(t => t.includes(cand));
+                if (match) {{ targetName = match; matchedCand = cand; break; }}
+            }}
+            if (!targetName) continue;
+
+            // Activate app (may switch space if only one window)
+            app.activate();
+            delay(0.2);
+
+            // Try System Events raise first (works if window is on current space)
             let proc;
             try {{
                 proc = se.processes.byName(appName);
-                proc.name();
-            }} catch(e) {{ continue; }}
-
-            // activate() first — switches macOS space so all windows become visible
-            Application(appName).activate();
-            delay(0.15);
-
-            const titles = proc.windows.name();
-            if (titles.length === 0) continue;
-
-            for (const cand of candidates) {{
-                const match = titles.find(t => t.includes(cand));
-                if (match) {{
-                    const w = proc.windows.byName(match);
+                const seTitles = proc.windows.name();
+                if (seTitles.some(t => t.includes(matchedCand))) {{
+                    const w = proc.windows.byName(targetName);
                     w.actions["AXRaise"].perform();
                     try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
-                    if (thenText) {{
-                        delay(0.15);
-                        se.keystroke(thenText);
-                        se.keyCode(36);
-                    }}
-                    return "matched:" + cand + ":" + match;
+                    if (thenText) {{ delay(0.15); se.keystroke(thenText); se.keyCode(36); }}
+                    return "matched:" + matchedCand + ":" + targetName;
                 }}
+            }} catch(e) {{}}
+
+            // Window is on another space — cycle with Cmd+` until we find it
+            const maxCycles = allTitles.length + 1;
+            for (let i = 0; i < maxCycles; i++) {{
+                se.keystroke("`", {{using: "command down"}});
+                delay(0.15);
+                try {{
+                    const frontTitle = proc.windows[0].name();
+                    if (frontTitle.includes(matchedCand)) {{
+                        if (thenText) {{ delay(0.1); se.keystroke(thenText); se.keyCode(36); }}
+                        return "cycled:" + matchedCand + ":" + frontTitle;
+                    }}
+                }} catch(e) {{}}
             }}
+            return "found_not_raised:" + matchedCand;
         }}
         return "no_match";
     }})()"""
@@ -1326,7 +1349,7 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
         )
         out = result.stdout.strip()
         mlog("jump", "jxa_result", result=out, sid=session.session_id[:12])
-        return out.startswith("matched:")
+        return out.startswith("matched:") or out.startswith("cycled:")
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         mlog("jump", "jxa_error", error=str(e), sid=session.session_id[:12])
     return False
