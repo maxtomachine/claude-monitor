@@ -1298,10 +1298,12 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
             for (const cand of candidates) {{
                 const match = titles.find(t => t.includes(cand));
                 if (match) {{
+                    // activate() triggers macOS space/desktop switch
+                    Application(appName).activate();
+                    delay(0.1);
                     const w = proc.windows.byName(match);
                     w.actions["AXRaise"].perform();
                     try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
-                    proc.frontmost = true;
                     if (thenText) {{
                         delay(0.15);
                         se.keystroke(thenText);
