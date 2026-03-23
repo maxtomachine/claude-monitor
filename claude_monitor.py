@@ -1288,19 +1288,22 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
         const thenText = {text_json};
 
         for (const appName of ["Ghostty", "iTerm2", "Terminal"]) {{
-            let proc, titles;
+            let proc;
             try {{
                 proc = se.processes.byName(appName);
-                titles = proc.windows.name();
+                proc.name();
             }} catch(e) {{ continue; }}
+
+            // activate() first — switches macOS space so all windows become visible
+            Application(appName).activate();
+            delay(0.15);
+
+            const titles = proc.windows.name();
             if (titles.length === 0) continue;
 
             for (const cand of candidates) {{
                 const match = titles.find(t => t.includes(cand));
                 if (match) {{
-                    // activate() triggers macOS space/desktop switch
-                    Application(appName).activate();
-                    delay(0.1);
                     const w = proc.windows.byName(match);
                     w.actions["AXRaise"].perform();
                     try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
