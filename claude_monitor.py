@@ -1288,8 +1288,8 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
         const thenText = {text_json};
 
         for (const appName of ["Ghostty", "iTerm2", "Terminal"]) {{
-            // Use the app's own scripting bridge to see ALL windows
-            // (System Events can't see windows on other macOS spaces)
+            // Use app's own scripting bridge — sees ALL windows across spaces
+            // (System Events is scoped to current space)
             let app, allTitles;
             try {{
                 app = Application(appName);
@@ -1297,7 +1297,6 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
             }} catch(e) {{ continue; }}
             if (allTitles.length === 0) continue;
 
-            // Check if any candidate matches a window title
             let targetName = null;
             let matchedCand = null;
             for (const cand of candidates) {{
@@ -1306,38 +1305,30 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
             }}
             if (!targetName) continue;
 
-            // Activate app (may switch space if only one window)
+            // activate() switches to the app's space (requires workspaces-auto-swoosh)
             app.activate();
             delay(0.2);
 
-            // Try System Events raise first (works if window is on current space)
-            let proc;
+            // Now SE can see windows on this space — raise the target
             try {{
-                proc = se.processes.byName(appName);
-                const seTitles = proc.windows.name();
-                if (seTitles.some(t => t.includes(matchedCand))) {{
-                    const w = proc.windows.byName(targetName);
-                    w.actions["AXRaise"].perform();
-                    try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
-                    if (thenText) {{ delay(0.15); se.keystroke(thenText); se.keyCode(36); }}
-                    return "matched:" + matchedCand + ":" + targetName;
+                const proc = se.processes.byName(appName);
+                const w = proc.windows.byName(targetName);
+                w.actions["AXRaise"].perform();
+                try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
+            }} catch(e) {{
+                // Window might be on a DIFFERENT space than where activate() landed.
+                // Cycle with Cmd+` which (with auto-swoosh) crosses spaces.
+                const proc = se.processes.byName(appName);
+                for (let i = 0; i < allTitles.length; i++) {{
+                    se.keystroke("`", {{using: "command down"}});
+                    delay(0.2);
+                    try {{
+                        if (proc.windows[0].name().includes(matchedCand)) break;
+                    }} catch(e2) {{}}
                 }}
-            }} catch(e) {{}}
-
-            // Window is on another space — cycle with Cmd+` until we find it
-            const maxCycles = allTitles.length + 1;
-            for (let i = 0; i < maxCycles; i++) {{
-                se.keystroke("`", {{using: "command down"}});
-                delay(0.15);
-                try {{
-                    const frontTitle = proc.windows[0].name();
-                    if (frontTitle.includes(matchedCand)) {{
-                        if (thenText) {{ delay(0.1); se.keystroke(thenText); se.keyCode(36); }}
-                        return "cycled:" + matchedCand + ":" + frontTitle;
-                    }}
-                }} catch(e) {{}}
             }}
-            return "found_not_raised:" + matchedCand;
+            if (thenText) {{ delay(0.15); se.keystroke(thenText); se.keyCode(36); }}
+            return "matched:" + matchedCand + ":" + targetName;
         }}
         return "no_match";
     }})()"""
@@ -1349,7 +1340,7 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
         )
         out = result.stdout.strip()
         mlog("jump", "jxa_result", result=out, sid=session.session_id[:12])
-        return out.startswith("matched:") or out.startswith("cycled:")
+        return out.startswith("matched:")
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         mlog("jump", "jxa_error", error=str(e), sid=session.session_id[:12])
     return False
