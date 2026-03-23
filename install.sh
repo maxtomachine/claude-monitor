@@ -32,6 +32,15 @@ echo "Setting up Python environment..."
 cd "$REPO_DIR"
 uv sync
 
+# ── macOS space-switching ──────────────────────────────────────────────────────
+
+# Jump-to-terminal needs this to switch desktops when activating an app
+if ! defaults read com.apple.dock workspaces-auto-swoosh &>/dev/null; then
+  defaults write com.apple.dock workspaces-auto-swoosh -bool YES
+  killall Dock 2>/dev/null
+  echo "Enabled space-switching on app activate"
+fi
+
 # ── Statusline ─────────────────────────────────────────────────────────────────
 
 mkdir -p "$CLAUDE_DIR"
