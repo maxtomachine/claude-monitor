@@ -346,8 +346,11 @@ def write_state(
 
     local_file.write_text(json.dumps(data, indent=2) + "\n")
 
-    # Set terminal title with unique session marker for jump-to-terminal
-    set_terminal_title(tty, state, session_id, display_name)
+    # Only touch TTY on state/title changes — writing escape sequences
+    # on every tool call corrupts the input buffer when background tasks
+    # fire hooks while the user is typing.
+    if state != existing_state or title != existing_title:
+        set_terminal_title(tty, state, session_id, display_name)
 
 
 def mark_exited(session_id: str) -> None:
