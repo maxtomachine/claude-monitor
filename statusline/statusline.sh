@@ -270,9 +270,14 @@ if [ "$is_fast" = true ]; then
 fi
 if [ -n "$_extra_used" ] && [ "$_extra_used" != "null" ] && [ "$_extra_used" != "0" ] && [ -n "$_sid" ]; then
   # used_credits is cumulative cents account-wide; snapshot at session start
-  # and show only this session's delta.
-  snap_file="/tmp/claude-extra-snap-${_sid}"
-  [ -f "$snap_file" ] || printf '%s' "$_extra_used" > "$snap_file"
+  # and show only this session's delta. Stored alongside hook state so it
+  # survives /tmp clears on reboot.
+  snap_dir="$HOME/.claude/session-states"
+  snap_file="${snap_dir}/${_sid}.extra-snap"
+  if [ ! -f "$snap_file" ]; then
+    mkdir -p "$snap_dir"
+    printf '%s' "$_extra_used" > "$snap_file"
+  fi
   _snap=$(cat "$snap_file" 2>/dev/null)
   extra_cost=$(awk -v now="$_extra_used" -v snap="${_snap:-0}" 'BEGIN {
     d = (now - snap) / 100.0
@@ -328,9 +333,9 @@ echo "$(date '+%H:%M:%S') OK ctx=${remaining:-?} quota=${quota_used:-?} tokens=$
       line1="${line1}          "
     fi
     line1="${line1}   ${DIM}${tok_field}${RST}"
-    printf '%b\n' "$line1"
+    printf '%b\033[K\n' "$line1"
   else
-    printf '\n'
+    printf '\033[K\n'
   fi
 
   # ── Line 2: quota bar (consumer) OR hook state (employee) + cost ──
@@ -343,7 +348,7 @@ echo "$(date '+%H:%M:%S') OK ctx=${remaining:-?} quota=${quota_used:-?} tokens=$
       line2="${line2}         "
     fi
     line2="${line2}   ${DIM}${cost_field}${RST}"
-    printf '%b\n' "$line2"
+    printf '%b\033[K\n' "$line2"
   elif [ -n "$_sid" ]; then
     # No quota bar (employee auth) — show hook state instead
     hook_state_file="$HOME/.claude/session-states/${_sid}.json"
@@ -356,8 +361,8 @@ echo "$(date '+%H:%M:%S') OK ctx=${remaining:-?} quota=${quota_used:-?} tokens=$
     [ -n "$hook_tool" ] && line2="${line2}  ${DIM}${hook_tool}${RST}"
     [ "$is_fast" = true ] && line2="${line2}  ${fast_indicator}"
     line2="${line2}   ${DIM}${cost_field}${RST}"
-    printf '%b\n' "$line2"
+    printf '%b\033[K\n' "$line2"
   else
-    printf '\n'
+    printf '\033[K\n'
   fi
-) 2>/dev/null || printf 'statusline error\n'
+) 2>/dev/null || printf 'statusline error\033[K\n'
