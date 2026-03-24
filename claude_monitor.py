@@ -1545,33 +1545,32 @@ class KanbanView(ModalScreen[str | None]):
     CSS = """
     KanbanView { background: $background; align: center middle; }
     #kanban-outer {
-        width: 100%; height: 100%; padding: 1 2;
+        width: 100%; height: 100%; padding: 0 1;
     }
-    #kanban-title { text-align: center; text-style: bold; padding-bottom: 1; }
+    #kanban-title { text-align: center; text-style: bold; height: 1; }
     #kanban-board {
         width: 100%; height: 1fr;
     }
     .kanban-col {
-        width: 1fr; height: 100%; padding: 0 1;
+        width: 1fr; height: 100%; padding: 0;
         border-right: solid $panel;
     }
     .kanban-col:last-child { border-right: none; }
     .kanban-col-header {
-        text-align: center; text-style: bold; padding-bottom: 1;
-        height: 2;
+        text-align: center; text-style: bold; height: 1;
     }
     .kanban-cards {
         height: 1fr; overflow-y: auto;
     }
     .kanban-card {
-        height: auto; padding: 0 1; margin-bottom: 1;
+        height: auto; padding: 0; margin: 0;
         background: $panel; border: solid $primary-darken-2;
     }
     .kanban-card.-selected {
         border: thick $accent;
         background: $boost;
     }
-    .kanban-empty { color: $text-disabled; text-align: center; padding-top: 2; }
+    .kanban-empty { color: $text-disabled; text-align: center; }
     """
 
     def __init__(self, sessions: list[Session]) -> None:
