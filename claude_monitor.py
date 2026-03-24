@@ -1100,7 +1100,7 @@ def render_status_cell(status: str, spin_idx: int = 0) -> str:
     icon, color = STATUS_DISPLAY.get(status, ("?", "white"))
     if status == "working":
         frame = SPINNER_FRAMES[spin_idx % len(SPINNER_FRAMES)]
-        icon = f"{frame} WORKING"
+        return f"[#D97757]{frame}[/] [{color}]WORKING[/]"
     return f"[{color}]{icon}[/]"
 
 
@@ -1599,8 +1599,8 @@ class KanbanView(ModalScreen[str | None]):
         status_key = KANBAN_COLUMNS[col_idx][0]
         if status_key == "working":
             icon = SPINNER_FRAMES[self._spin_idx % len(SPINNER_FRAMES)]
-        else:
-            icon = STATUS_ICON.get(status_key, "·")
+            return f"[bold][#D97757]{icon}[/#D97757] {body}"
+        icon = STATUS_ICON.get(status_key, "·")
         return f"[bold]{icon} {body}"
 
     def on_mount(self) -> None:
