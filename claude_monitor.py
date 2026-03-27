@@ -1584,6 +1584,7 @@ class KanbanView(ModalScreen[str | None]):
         Binding("t", "passthrough('toggle_theme')", "Theme", show=False),
         Binding("R", "passthrough('restart')", "Restart", show=False),
         Binding("n", "rename_selected", "Rename", show=False),
+        Binding("g", "toggle_groups", "Group", show=False),
     ]
     CSS = """
     KanbanView { background: $background; align: center middle; }
@@ -1616,40 +1617,62 @@ class KanbanView(ModalScreen[str | None]):
     .kanban-empty { color: $text-disabled; text-align: center; }
     """
 
-    def __init__(self, sessions: list[Session]) -> None:
+    def __init__(self, sessions: list[Session], by_group: bool = False) -> None:
         super().__init__()
         self._spin_idx = 0
         self._col = 0
         self._row = 0
         self._grid: list[list[tuple[Session, str]]] = []
         self._working_col = -1
+        self._by_group = by_group
+        self._columns: list[tuple[str, str, str]] = []
         self._populate_grid(sessions)
+
+    def _make_body(self, s: Session) -> str:
+        title = _escape_markup(s.title.replace("-", "-\n"))
+        activity = generate_activity(s)
+        body = f"{title}[/]"
+        if activity:
+            body += f"\n[dim]{_escape_markup(activity[:36])}[/]"
+        return body
 
     def _populate_grid(self, sessions: list[Session]) -> None:
         """Build grid[col] = [(session, body_text), ...] — body precomputed."""
-        valid = {k for k, _, _ in KANBAN_COLUMNS}
-        self._grid = [[] for _ in KANBAN_COLUMNS]
-        col_idx = {k: i for i, (k, _, _) in enumerate(KANBAN_COLUMNS)}
-        for s in sessions:
-            if s.is_subagent:
-                continue
-            bucket = s.status if s.status in valid else "closed"
-            title = _escape_markup(s.title.replace("-", "-\n"))
-            activity = generate_activity(s)
-            body = f"{title}[/]"
-            if activity:
-                body += f"\n[dim]{_escape_markup(activity[:36])}[/]"
-            self._grid[col_idx[bucket]].append((s, body))
+        active = [s for s in sessions if not s.is_subagent]
+
+        if self._by_group:
+            groups: dict[str, list[Session]] = {}
+            for s in active:
+                groups.setdefault(_group_key(s.title), []).append(s)
+            singles = [k for k in list(groups) if len(groups[k]) < 2]
+            if singles:
+                ung = groups.setdefault("ungrouped", [])
+                for k in singles:
+                    if k != "ungrouped":
+                        ung.extend(groups.pop(k))
+            keys = sorted(groups, key=lambda k: (k == "ungrouped", k.lower()))
+            self._columns = [(k, k, "cyan") for k in keys]
+            self._grid = [[(s, self._make_body(s)) for s in groups[k]] for k in keys]
+            self._working_col = -1
+        else:
+            self._columns = list(KANBAN_COLUMNS)
+            valid = {k for k, _, _ in KANBAN_COLUMNS}
+            col_idx = {k: i for i, (k, _, _) in enumerate(KANBAN_COLUMNS)}
+            self._grid = [[] for _ in KANBAN_COLUMNS]
+            for s in active:
+                bucket = s.status if s.status in valid else "closed"
+                self._grid[col_idx[bucket]].append((s, self._make_body(s)))
+            self._working_col = col_idx.get("working", -1)
+
         self._col = next((i for i, c in enumerate(self._grid) if c), 0)
         self._row = 0
-        self._working_col = col_idx.get("working", -1)
 
     def _card_text(self, col_idx: int, body: str) -> str:
-        status_key = KANBAN_COLUMNS[col_idx][0]
-        if status_key == "working":
+        key = self._columns[col_idx][0]
+        if not self._by_group and key == "working":
             icon = SPINNER_FRAMES[self._spin_idx % len(SPINNER_FRAMES)]
             return f"[bold][#D97757]{icon}[/#D97757] {body}"
-        icon = STATUS_ICON.get(status_key, "·")
+        icon = STATUS_ICON.get(key, "·")
         return f"[bold]{icon} {body}"
 
     def on_mount(self) -> None:
@@ -1668,10 +1691,11 @@ class KanbanView(ModalScreen[str | None]):
                 pass
 
     def compose(self) -> ComposeResult:
+        mode = "Groups" if self._by_group else "Status"
         with Vertical(id="kanban-outer"):
-            yield Label("[bold]Kanban Board[/]  [dim]←→↑↓ nav · enter select · esc close[/]", id="kanban-title")
+            yield Label(f"[bold]Kanban · {mode}[/]  [dim]←→↑↓ nav · enter select · esc close[/]", id="kanban-title")
             with Horizontal(id="kanban-board"):
-                for col_idx, (key, header, color) in enumerate(KANBAN_COLUMNS):
+                for col_idx, (key, header, color) in enumerate(self._columns):
                     with Vertical(classes="kanban-col"):
                         count = len(self._grid[col_idx])
                         yield Label(
@@ -1687,6 +1711,7 @@ class KanbanView(ModalScreen[str | None]):
                                 yield Static(self._card_text(col_idx, body),
                                              classes=classes,
                                              id=f"kc-{col_idx}-{row_idx}")
+        yield Footer()
 
     def _refresh_selection(self) -> None:
         for w in self.query(".kanban-card"):
@@ -1736,6 +1761,12 @@ class KanbanView(ModalScreen[str | None]):
         if 0 <= self._row < len(col):
             s, _ = col[self._row]
             self.app._do_rename(s, "kanban")  # type: ignore[attr-defined]
+
+    def action_toggle_groups(self) -> None:
+        self._by_group = not self._by_group
+        # Sync with main app so closing kanban keeps the setting
+        self.app.show_groups = self._by_group  # type: ignore[attr-defined]
+        self._rebuild_grid()
 
     def _rebuild_grid(self) -> None:
         """Re-populate cards from fresh app session data after a passthrough."""
@@ -2602,7 +2633,7 @@ class ClaudeMonitor(App):
         self._do_rename(s, "action")
 
     def action_kanban(self) -> None:
-        self.push_screen(KanbanView(self.sessions))
+        self.push_screen(KanbanView(self.sessions, by_group=self.show_groups))
 
     def action_restart(self) -> None:
         self.exit(return_code=RESTART_EXIT_CODE)
