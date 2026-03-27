@@ -2149,7 +2149,10 @@ class ClaudeMonitor(App):
         if "status" not in self._visible_cols:
             return
         self._spin_idx += 1
-        table = self.query_one("#session-table", DataTable)
+        try:
+            table = self.query_one("#session-table", DataTable)
+        except Exception:
+            return
         cell = render_status_cell("working", self._spin_idx)
         for s in self._flat_rows:
             if s.status == "working":
