@@ -1561,6 +1561,13 @@ class KanbanView(ModalScreen[str | None]):
         Binding("left", "move('left')", "←", show=False),
         Binding("right", "move('right')", "→", show=False),
         Binding("enter", "select", "Select"),
+        # Mirrored from main view
+        Binding("r", "passthrough('refresh')", "Refresh"),
+        Binding("z", "passthrough('toggle_archived')", "All", show=False),
+        Binding("d", "passthrough('toggle_debug')", "Debug", show=False),
+        Binding("t", "passthrough('toggle_theme')", "Theme", show=False),
+        Binding("R", "passthrough('restart')", "Restart", show=False),
+        Binding("n", "rename_selected", "Rename", show=False),
     ]
     CSS = """
     KanbanView { background: $background; align: center middle; }
@@ -1596,9 +1603,16 @@ class KanbanView(ModalScreen[str | None]):
     def __init__(self, sessions: list[Session]) -> None:
         super().__init__()
         self._spin_idx = 0
+        self._col = 0
+        self._row = 0
+        self._grid: list[list[tuple[Session, str]]] = []
+        self._working_col = -1
+        self._populate_grid(sessions)
+
+    def _populate_grid(self, sessions: list[Session]) -> None:
+        """Build grid[col] = [(session, body_text), ...] — body precomputed."""
         valid = {k for k, _, _ in KANBAN_COLUMNS}
-        # grid[col] = [(session, body_text), ...] — body precomputed, icon swapped on tick
-        self._grid: list[list[tuple[Session, str]]] = [[] for _ in KANBAN_COLUMNS]
+        self._grid = [[] for _ in KANBAN_COLUMNS]
         col_idx = {k: i for i, (k, _, _) in enumerate(KANBAN_COLUMNS)}
         for s in sessions:
             if s.is_subagent:
@@ -1694,6 +1708,23 @@ class KanbanView(ModalScreen[str | None]):
 
     def action_close(self) -> None:
         self.dismiss(None)
+
+    def action_passthrough(self, name: str) -> None:
+        """Delegate to the main app's action, then refresh this view."""
+        getattr(self.app, f"action_{name}")()
+        if name in ("refresh", "toggle_archived"):
+            self._rebuild_grid()
+
+    def action_rename_selected(self) -> None:
+        col = self._grid[self._col] if 0 <= self._col < len(self._grid) else []
+        if 0 <= self._row < len(col):
+            s, _ = col[self._row]
+            self.app._do_rename(s, "kanban")  # type: ignore[attr-defined]
+
+    def _rebuild_grid(self) -> None:
+        """Re-populate cards from fresh app session data after a passthrough."""
+        self._populate_grid(getattr(self.app, "sessions", []))
+        self.refresh(recompose=True)
 
 
 class SessionMenu(ModalScreen[str]):
