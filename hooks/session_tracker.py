@@ -10,6 +10,7 @@ States: thinking, idle, approval, exited
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from datetime import datetime
@@ -359,10 +360,15 @@ def write_state(
         sid8 = session_id[:8]
         name = display_name[:31] + "\u2026" if len(display_name) > 32 else display_name
         title_esc = f"\x1b]2;{emoji} {name} \u00b7{sid8}\x07"
-        subprocess.Popen(
-            ["bash", "-c", f"sleep 0.5 && printf %b {title_esc!r} > /dev/{tty}"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        try:
+            subprocess.Popen(
+                ["bash", "-c",
+                 f"sleep 0.5 && printf %b {shlex.quote(title_esc)} "
+                 f"> {shlex.quote('/dev/' + tty)}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            pass
 
 
 def mark_exited(session_id: str) -> None:

@@ -4,6 +4,7 @@
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -1305,7 +1306,7 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
             let targetName = null;
             let matchedCand = null;
             for (const cand of candidates) {{
-                const match = allTitles.find(t => t.includes(cand));
+                const match = allTitles.find(t => t && t.includes(cand));
                 if (match) {{ targetName = match; matchedCand = cand; break; }}
             }}
             if (!targetName) continue;
@@ -1439,7 +1440,12 @@ def _derive_cwd_from_transcript(transcript_path: str) -> str:
     name = Path(transcript_path).parent.name
     if not name.startswith("-"):
         return ""
-    return "/" + name[1:].replace("-", "/")
+    decoded = "/" + name[1:].replace("-", "/")
+    # Hyphen→slash is lossy (claude-monitor → claude/monitor). Only trust the
+    # decoded path if it actually exists; otherwise fall through to next source.
+    if not Path(decoded).is_dir():
+        return ""
+    return decoded
 
 
 def resume_session(session: Session, then_command: str = "") -> bool:
@@ -1468,9 +1474,10 @@ def resume_session(session: Session, then_command: str = "") -> bool:
         return False
 
     # Ghostty: open new tab via keystroke, then type the command
+    quoted_cwd = shlex.quote(cwd)
     jxa = f"""(() => {{
         const se = Application("System Events");
-        const cwd = {json.dumps(cwd)};
+        const cwd = {json.dumps(quoted_cwd)};
         const cmd = {json.dumps(cmd)};
 
         // Try Ghostty, then iTerm2 (both use Cmd+T for new tab)
@@ -2167,15 +2174,17 @@ class ClaudeMonitor(App):
                      title=s.title, prev=prev, new=s.status)
             self._prev_statuses[s.session_id] = s.status
 
-        self._flat_rows = flat
-
         table = self.query_one("#session-table", DataTable)
         # Snapshot cursor and scroll right before clear (user may have navigated
-        # since refresh_sessions() dispatched the worker)
-        if table.cursor_row is not None and table.cursor_row < len(flat):
-            selected_key = self._flat_rows[table.cursor_row].session_id if table.cursor_row < len(self._flat_rows) else self._selected_key
+        # since refresh_sessions() dispatched the worker). Must read the OLD
+        # _flat_rows here — cursor_row indexes the table as it was rendered.
+        old_rows = self._flat_rows
+        if table.cursor_row is not None and table.cursor_row < len(old_rows):
+            selected_key = old_rows[table.cursor_row].session_id
         else:
             selected_key = self._selected_key
+
+        self._flat_rows = flat
         saved_scroll_x = table.scroll_x
         saved_scroll_y = table.scroll_y
 

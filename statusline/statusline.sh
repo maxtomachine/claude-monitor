@@ -148,6 +148,7 @@ RST="\033[0m"
 # ──────────────────────────────────────────────────────────────────────
 ctx_bar=""
 if [ -n "$remaining" ]; then
+  remaining=$(printf '%.0f' "$remaining")
   ctx_used=$(( 100 - remaining ))
   width=10; danger=2
   safe=$((width - danger))
