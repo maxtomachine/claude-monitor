@@ -2350,6 +2350,8 @@ class ClaudeMonitor(App):
                     table.add_row(*header, key=f"__group__{gk}")
                     row_map.append(None)
                     last_group = gk
+                # Indent first cell so member rows nest under the ▸ header
+                cells = ["  " + cells[0], *cells[1:]]
             table.add_row(*cells, key=s.session_id)
             row_map.append(s)
         self._row_map = row_map
