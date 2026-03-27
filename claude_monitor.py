@@ -2219,11 +2219,25 @@ class ClaudeMonitor(App):
             if action == "jump":
                 ok = focus_terminal_session(s)
                 if not ok:
-                    ok = resume_session(s)
-                    if ok:
-                        self.notify(f"Resuming {s.title[:20]} in new tab", timeout=4)
+                    # If the session's process is alive, its window exists
+                    # SOMEWHERE — resuming would spawn a duplicate. Log the
+                    # divergence and tell the user instead.
+                    if _is_session_alive(s.session_id):
+                        mlog("DIVERGE", "alive_but_unfound",
+                             sid=s.session_id[:12], title=s.title,
+                             candidates=_resolve_match_candidates(s))
+                        self.notify(
+                            "Session running but window not found — "
+                            "title marker may be stale. Try /rename in that "
+                            "session, or check other spaces manually.",
+                            timeout=8, severity="warning",
+                        )
                     else:
-                        self.notify("Could not find or resume session", timeout=4)
+                        ok = resume_session(s)
+                        if ok:
+                            self.notify(f"Resuming {s.title[:20]} in new tab", timeout=4)
+                        else:
+                            self.notify("Could not find or resume session", timeout=4)
                 mlog("menu", "jump_result", sid=s.session_id[:12], success=ok)
             elif action == "rename":
                 self._do_rename(s, "menu")

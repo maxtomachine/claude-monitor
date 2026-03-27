@@ -5,6 +5,7 @@ Writes JSON-lines to ~/.claude/monitor.log with automatic rotation.
 Can be tailed with `uv run python monitor_log.py` for a live formatted view.
 """
 
+import fcntl
 import json
 import os
 import sys
@@ -13,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 LOG_PATH = Path.home() / ".claude" / "monitor.log"
+_LOCK_PATH = LOG_PATH.with_suffix(".log.lock")
 MAX_LOG_SIZE = 5 * 1024 * 1024  # 5 MB — rotate when exceeded
 KEEP_ROTATIONS = 2
 
@@ -20,28 +22,51 @@ enabled = True  # Toggle via 'd' hotkey in monitor
 
 
 def _rotate_if_needed() -> None:
-    """Rotate log file if it exceeds MAX_LOG_SIZE."""
+    """Rotate log file if it exceeds MAX_LOG_SIZE.
+
+    Holds an exclusive flock on a sibling lockfile across the
+    check-then-rename sequence so concurrent monitor instances can't
+    both rotate and clobber a generation of history.
+    """
     try:
         if not LOG_PATH.exists() or LOG_PATH.stat().st_size < MAX_LOG_SIZE:
             return
     except OSError:
         return
 
-    # Shift old rotations
-    for i in range(KEEP_ROTATIONS - 1, 0, -1):
-        src = LOG_PATH.with_suffix(f".log.{i}")
-        dst = LOG_PATH.with_suffix(f".log.{i + 1}")
-        if src.exists():
-            try:
-                src.rename(dst)
-            except OSError:
-                pass
-
-    # Current → .1
     try:
-        LOG_PATH.rename(LOG_PATH.with_suffix(".log.1"))
+        lock_fd = os.open(_LOCK_PATH, os.O_CREAT | os.O_WRONLY, 0o644)
     except OSError:
-        pass
+        return
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        # Re-check under lock — another process may have just rotated.
+        try:
+            if not LOG_PATH.exists() or LOG_PATH.stat().st_size < MAX_LOG_SIZE:
+                return
+        except OSError:
+            return
+
+        # Shift old rotations
+        for i in range(KEEP_ROTATIONS - 1, 0, -1):
+            src = LOG_PATH.with_suffix(f".log.{i}")
+            dst = LOG_PATH.with_suffix(f".log.{i + 1}")
+            if src.exists():
+                try:
+                    src.rename(dst)
+                except OSError:
+                    pass
+
+        # Current → .1
+        try:
+            LOG_PATH.rename(LOG_PATH.with_suffix(".log.1"))
+        except OSError:
+            pass
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
 
 
 def log(category: str, event: str, **data) -> None:
@@ -136,9 +161,18 @@ def tail_log(path: Path = LOG_PATH, follow: bool = True, category: str | None = 
 
     console.print("[dim]─── following ───[/]")
 
-    # Tail follow
-    with path.open() as f:
+    # Tail follow — reopen on inode change (rotation) so we don't hang
+    # on the old file after _rotate_if_needed() renames it away.
+    def _inode(p: Path) -> int | None:
+        try:
+            return p.stat().st_ino
+        except OSError:
+            return None
+
+    f = path.open()
+    try:
         f.seek(0, 2)  # EOF
+        cur_ino = _inode(path)
         while True:
             line = f.readline()
             if line:
@@ -147,6 +181,13 @@ def tail_log(path: Path = LOG_PATH, follow: bool = True, category: str | None = 
                     console.print(text)
             else:
                 time.sleep(0.3)
+                new_ino = _inode(path)
+                if new_ino is not None and new_ino != cur_ino:
+                    f.close()
+                    f = path.open()
+                    cur_ino = new_ino
+    finally:
+        f.close()
 
 
 if __name__ == "__main__":
