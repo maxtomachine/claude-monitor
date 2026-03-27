@@ -54,12 +54,17 @@ The installer sets up everything:
 - Statusline HUD symlinked into Claude Code
 - Session tracker hooks for real-time status
 - `claude-monitor` command on your PATH
+- `Ctrl+Shift+Space` global hotkey to jump back to the monitor (via skhd)
 
-**Restart Claude Code** after install to pick up the statusline and hooks. Then run:
+**Then three steps to go:**
 
-```bash
-claude-monitor
-```
+1. **Restart Claude Code** — picks up the statusline and hooks
+2. **Run `claude-monitor`** — opens the dashboard
+3. **Grant Accessibility when prompted** — first `Ctrl+Shift+Space` press
+   will ask; click "Open System Settings" → enable skhd. One-time.
+
+That's it. The monitor will remind you about the hotkey for your first
+20 launches.
 
 ### Updating
 

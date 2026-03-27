@@ -2082,6 +2082,18 @@ class ClaudeMonitor(App):
         self.query_one("#session-table", DataTable).focus()
         mlog("app", "started")
 
+        # Teach the jumpback hotkey for the first 20 launches
+        prefs = load_prefs()
+        launches = prefs.get("launch_count", 0) + 1
+        prefs["launch_count"] = launches
+        save_prefs(prefs)
+        if launches <= 20:
+            self.notify(
+                "Press [b]Ctrl+Shift+Space[/] from any app to return here "
+                f"[dim]({21 - launches} more reminders)[/]",
+                title="jumpback", timeout=6,
+            )
+
     def _tick_spinner(self) -> None:
         """Advance spinner frame and update only working-status cells."""
         if "status" not in self._visible_cols:
