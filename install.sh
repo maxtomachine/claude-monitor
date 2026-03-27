@@ -106,6 +106,32 @@ EOF
 chmod +x "$LAUNCHER"
 echo "Created launcher → $LAUNCHER"
 
+# ── jumpback (Ctrl+Shift+Space raises monitor window) ──────────────────────────
+
+ln -sf "$REPO_DIR/jumpback" "$HOME/.local/bin/jumpback"
+echo "Linked jumpback → ~/.local/bin/jumpback"
+
+if command -v brew &>/dev/null; then
+  if ! command -v skhd &>/dev/null; then
+    echo "Installing skhd (global hotkey daemon)..."
+    brew install koekeishiya/formulae/skhd 2>/dev/null || true
+  fi
+  if command -v skhd &>/dev/null; then
+    mkdir -p "$HOME/.config/skhd"
+    SKHDRC="$HOME/.config/skhd/skhdrc"
+    if ! grep -q "jumpback" "$SKHDRC" 2>/dev/null; then
+      echo "ctrl + shift - space : $HOME/.local/bin/jumpback" >> "$SKHDRC"
+    fi
+    skhd --start-service 2>/dev/null || true
+    echo "Bound Ctrl+Shift+Space → jumpback (via skhd)"
+  fi
+else
+  echo "NOTE: skhd requires brew. For jumpback keybind, install manually:"
+  echo "  brew install koekeishiya/formulae/skhd"
+  echo "  echo 'ctrl + shift - space : ~/.local/bin/jumpback' >> ~/.config/skhd/skhdrc"
+  echo "  skhd --start-service"
+fi
+
 # Check PATH
 if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
   echo ""
