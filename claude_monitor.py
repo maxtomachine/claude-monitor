@@ -2066,9 +2066,15 @@ class ClaudeMonitor(App):
         if saved_theme:
             self.theme = saved_theme
         self._rebuild_table_columns()
-        # Set terminal window title with ·MONITOR marker for jumpback
-        if sys.stdout.isatty() and "PYTEST_CURRENT_TEST" not in os.environ:
-            print("\033]2;◇ Claude Monitor ·MONITOR\007", end="", flush=True)
+        # Set terminal window title with ·MONITOR marker for jumpback.
+        # Textual captures stdout, so write to /dev/tty directly.
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            try:
+                with open("/dev/tty", "w") as tty:
+                    tty.write("\033]2;◇ Claude Monitor ·MONITOR\007")
+                    tty.flush()
+            except OSError:
+                pass
         self.refresh_sessions()
         self.set_interval(3, self.refresh_sessions)
         self.set_interval(0.132, self._tick_spinner)
