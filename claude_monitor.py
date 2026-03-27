@@ -530,7 +530,8 @@ def _perf(label: str, t0: float) -> float:
     return time.perf_counter()
 
 
-def parse_sessions(include_archived: bool = False) -> list[Session]:
+def parse_sessions(include_archived: bool = False,
+                   include_subagents: bool = False) -> list[Session]:
     t0 = time.perf_counter()
     sessions = []
     now = time.time()
@@ -599,7 +600,7 @@ def parse_sessions(include_archived: bool = False) -> list[Session]:
             tc = time.perf_counter()
             session.compact_count = count_compactions(str(jsonl_path))
             t_compact += time.perf_counter() - tc
-            if not is_archived:
+            if include_subagents and not is_archived:
                 ts = time.perf_counter()
                 for sub_path in find_subagent_paths(str(jsonl_path)):
                     sub = build_session(
@@ -2320,7 +2321,10 @@ class ClaudeMonitor(App):
     def _refresh_compute(self) -> None:
         """Background thread: parse, sort, filter — no UI access."""
         try:
-            sessions = parse_sessions(include_archived=self.show_archived)
+            sessions = parse_sessions(
+                include_archived=self.show_archived,
+                include_subagents=self.show_subagents,
+            )
 
             # Hide closed sessions unless "All" is toggled
             if not self.show_archived:
