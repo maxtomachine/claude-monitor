@@ -1350,7 +1350,17 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
         )
         out = result.stdout.strip()
         mlog("jump", "jxa_result", result=out, sid=session.session_id[:12])
-        return out.startswith("matched:")
+        if out.startswith("matched:"):
+            # Post-jump verification: if the raised window's title contains
+            # a ·{sid8} marker for a DIFFERENT session, we jumped wrong.
+            target_sid8 = session.session_id[:8]
+            m = re.search(r"\u00b7([0-9a-f]{8})", out)
+            if m and m.group(1) != target_sid8:
+                mlog("DIVERGE", "wrong_window",
+                     target=target_sid8, raised=m.group(1),
+                     matched_on=out.split(":", 2)[1], full=out)
+            return True
+        return False
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         mlog("jump", "jxa_error", error=str(e), sid=session.session_id[:12])
     return False
