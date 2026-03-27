@@ -1252,12 +1252,17 @@ def _resolve_match_candidates(session: Session) -> list[str]:
     """
     sid8 = session.session_id[:8]
     candidates = [f"\u00b7{sid8}"]
+    cwd_name = Path(session.cwd).name if session.cwd else ""
+    # cwd basename is unsafe when it's the home dir (= username) — it
+    # substring-matches any window title containing the username.
+    if cwd_name and cwd_name == Path.home().name:
+        cwd_name = ""
     for name in [
         _read_session_cache("name", session.session_id),
         (read_hook_state(session.session_id) or {}).get("title", ""),
         session.status_name,
         session.title,
-        Path(session.cwd).name if session.cwd else "",
+        cwd_name,
     ]:
         if name and name not in candidates and name not in ("Claude Code", "~"):
             candidates.append(name)

@@ -352,6 +352,18 @@ def write_state(
     if state != existing_state or title != existing_title:
         set_terminal_title(tty, state, session_id, display_name)
 
+    # On Stop, Claude overwrites our title with its auto-generated summary
+    # right after this hook returns. Spawn a delayed re-write to reclaim it.
+    if event == "stop" and tty and tty != "??":
+        emoji = STATE_EMOJI.get(state, "\u2733")
+        sid8 = session_id[:8]
+        name = display_name[:31] + "\u2026" if len(display_name) > 32 else display_name
+        title_esc = f"\x1b]2;{emoji} {name} \u00b7{sid8}\x07"
+        subprocess.Popen(
+            ["bash", "-c", f"sleep 0.5 && printf %b {title_esc!r} > /dev/{tty}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
 
 def mark_exited(session_id: str) -> None:
     """Mark session as exited — terminal state."""
