@@ -157,6 +157,19 @@ The hooks also:
 | iTerm2 | Yes | Yes (Cmd+T) | Supported |
 | Terminal.app | Yes | Yes (do script) | Fallback |
 
+### Jumpback (Ctrl+Shift+Space)
+
+Press `Ctrl+Shift+Space` from anywhere to raise the monitor window. Uses
+[skhd](https://github.com/koekeishiya/skhd) — `install.sh` sets this up
+automatically if you have Homebrew.
+
+**First-time setup:** macOS will prompt for Accessibility permission when
+you first press the keybind. Grant it at System Settings → Privacy &
+Security → Accessibility → enable `skhd`. One-time per machine.
+
+The script is at `~/.local/bin/jumpback` if you want to bind it
+differently (Shortcuts.app, Karabiner, etc.).
+
 ## Configuration
 
 Preferences persist at `~/.claude/monitor-prefs.json`:

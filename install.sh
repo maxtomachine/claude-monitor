@@ -124,6 +124,8 @@ if command -v brew &>/dev/null; then
     fi
     skhd --start-service 2>/dev/null || true
     echo "Bound Ctrl+Shift+Space → jumpback (via skhd)"
+    echo "  ⚠ First press will prompt for Accessibility permission."
+    echo "    Grant at: System Settings → Privacy & Security → Accessibility → skhd"
   fi
 else
   echo "NOTE: skhd requires brew. For jumpback keybind, install manually:"
