@@ -1107,6 +1107,22 @@ def render_status_cell(status: str, spin_idx: int = 0) -> str:
     return f"[{color}]{icon}[/]"
 
 
+_GROUP_SPLIT = re.compile(r"[\s\-/_.:]+")
+
+
+def _group_key(name: str) -> str:
+    """Extract group key from a session name.
+
+    - name with '@': part after @ is the explicit group (bugs@disclosey → disclosey)
+    - otherwise: first word before space/-/_/./: is the implicit group
+      (strategy-ideation → strategy)
+    """
+    if "@" in name:
+        return name.rsplit("@", 1)[1].strip() or "ungrouped"
+    parts = _GROUP_SPLIT.split(name.strip(), 1)
+    return parts[0] if parts and parts[0] else "ungrouped"
+
+
 def render_row(s: Session, visible_cols: list[str], spin_idx: int = 0) -> list[str]:
     cells = []
     for col in visible_cols:
@@ -2055,14 +2071,17 @@ class ClaudeMonitor(App):
         Binding("R", "restart", "Restart", show=False),
         Binding("j", "cursor_down", "↓", show=False),
         Binding("n", "rename_selected", "Rename", show=False),
+        Binding("g", "toggle_groups", "Group"),
     ]
 
     sort_mode: reactive[SortMode] = reactive(SortMode.ACTIVITY)
     show_subagents: reactive[bool] = reactive(False)
     show_archived: reactive[bool] = reactive(False)
+    show_groups: reactive[bool] = reactive(False)
     debug_logging: reactive[bool] = reactive(True)  # ON by default
     sessions: list[Session] = []
     _flat_rows: list[Session] = []
+    _row_map: list["Session | None"] = []
     _selected_key: str | None = None
     _visible_cols: list[str] = []
     _col_order: list[str] = []
@@ -2167,8 +2186,11 @@ class ClaudeMonitor(App):
         self._refresh_pending = True
         # Snapshot UI state before background work
         table = self.query_one("#session-table", DataTable)
-        if table.cursor_row is not None and table.cursor_row < len(self._flat_rows):
-            self._selected_key = self._flat_rows[table.cursor_row].session_id
+        cr = table.cursor_row
+        if cr is not None and cr < len(self._row_map):
+            sel = self._row_map[cr]
+            if sel:
+                self._selected_key = sel.session_id
         self.run_worker(
             lambda: self._refresh_compute(),
             thread=True,
@@ -2199,6 +2221,17 @@ class ClaudeMonitor(App):
             for s in flat:
                 if s.session_id in self._dismissing_sessions:
                     s.status = self._dismissing_sessions[s.session_id]
+
+            # When grouping, stable-sort by group key (preserves within-group
+            # sort from the earlier sort_mode pass). Singletons sink to the end.
+            if self.show_groups:
+                groups: dict[str, list[Session]] = {}
+                for s in flat:
+                    groups.setdefault(_group_key(s.title), []).append(s)
+                ordered_keys = sorted(
+                    groups, key=lambda k: (len(groups[k]) < 2, k.lower())
+                )
+                flat = [s for k in ordered_keys for s in groups[k]]
 
             # Pre-render rows in background thread (Rich markup generation)
             visible_cols = self._visible_cols
@@ -2239,24 +2272,41 @@ class ClaudeMonitor(App):
         table = self.query_one("#session-table", DataTable)
         # Snapshot cursor and scroll right before clear (user may have navigated
         # since refresh_sessions() dispatched the worker). Must read the OLD
-        # _flat_rows here — cursor_row indexes the table as it was rendered.
-        old_rows = self._flat_rows
-        if table.cursor_row is not None and table.cursor_row < len(old_rows):
-            selected_key = old_rows[table.cursor_row].session_id
-        else:
-            selected_key = self._selected_key
+        # _row_map here — cursor_row indexes the table as it was rendered.
+        old_map = self._row_map
+        cr = table.cursor_row
+        selected_key = self._selected_key
+        if cr is not None and cr < len(old_map):
+            sel = old_map[cr]
+            if sel:
+                selected_key = sel.session_id
 
         self._flat_rows = flat
         saved_scroll_x = table.scroll_x
         saved_scroll_y = table.scroll_y
 
         table.clear()
+        n_cols = len(self._visible_cols)
+        last_group = None
+        row_map: list[Session | None] = []
         for s, cells in rendered:
+            if self.show_groups:
+                gk = _group_key(s.title)
+                if gk != last_group:
+                    count = sum(1 for x, _ in rendered if _group_key(x.title) == gk)
+                    label = (f"[dim]▸ {gk}[/]" if count < 2
+                             else f"[bold cyan]▸ {gk}[/] [dim]({count})[/]")
+                    header = [label] + [""] * (n_cols - 1)
+                    table.add_row(*header, key=f"__group__{gk}")
+                    row_map.append(None)
+                    last_group = gk
             table.add_row(*cells, key=s.session_id)
+            row_map.append(s)
+        self._row_map = row_map
 
         if selected_key:
-            for idx, s in enumerate(flat):
-                if s.session_id == selected_key:
+            for idx, s in enumerate(row_map):
+                if s and s.session_id == selected_key:
                     table.move_cursor(row=idx)
                     break
 
@@ -2501,6 +2551,11 @@ class ClaudeMonitor(App):
         self.refresh_sessions()
         self.notify(f"All sessions {'shown' if self.show_archived else 'recent only'}", timeout=3)
 
+    def action_toggle_groups(self) -> None:
+        self.show_groups = not self.show_groups
+        self.refresh_sessions()
+        self.notify(f"Grouping {'on' if self.show_groups else 'off'}", timeout=3)
+
     def _do_rename(self, s: Session, log_cat: str) -> None:
         ok = _send_to_terminal_session(s, "/rename")
         if ok:
@@ -2516,9 +2571,12 @@ class ClaudeMonitor(App):
     def action_rename_selected(self) -> None:
         """Send /rename to the currently selected session's terminal."""
         table = self.query_one(DataTable)
-        if table.cursor_row is None or table.cursor_row >= len(self._flat_rows):
+        cr = table.cursor_row
+        if cr is None or cr >= len(self._row_map):
             return
-        s = self._flat_rows[table.cursor_row]
+        s = self._row_map[cr]
+        if s is None:
+            return
         if s.status in ("archived", "closed"):
             self.notify("Session not running", timeout=3)
             return

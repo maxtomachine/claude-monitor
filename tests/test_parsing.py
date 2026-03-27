@@ -243,3 +243,25 @@ class TestMatchCandidates:
         s = make_session(title="Claude Code")
         cands = _resolve_match_candidates(s)
         assert "Claude Code" not in cands
+
+
+class TestGroupKey:
+    def test_prefix_grouping(self):
+        from claude_monitor import _group_key
+        assert _group_key("strategy-ideation") == "strategy"
+        assert _group_key("strategy-frameworks") == "strategy"
+        assert _group_key("strategy FSI") == "strategy"
+        assert _group_key("fix/googleworkspace") == "fix"
+        assert _group_key("tabby_ideation") == "tabby"
+
+    def test_explicit_at_grouping(self):
+        from claude_monitor import _group_key
+        assert _group_key("bugs@disclosey") == "disclosey"
+        assert _group_key("ideation@disclosey") == "disclosey"
+        assert _group_key("v2-plan@disclosey") == "disclosey"
+
+    def test_singleton_and_empty(self):
+        from claude_monitor import _group_key
+        assert _group_key("general") == "general"
+        assert _group_key("") == "ungrouped"
+        assert _group_key("@") == "ungrouped"
