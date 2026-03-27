@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# jumpback — raise the claude-monitor window from anywhere
+#
+# Bind this to a key via:
+#   Ghostty:  keybind = super+m=exec:~/Projects/claude-monitor/jumpback
+#   skhd:     cmd - m : ~/Projects/claude-monitor/jumpback
+#   Shortcuts.app: create a "Run Shell Script" shortcut, bind in System Settings
+
+exec osascript -l JavaScript -e '(() => {
+    const se = Application("System Events");
+    for (const appName of ["Ghostty", "iTerm2", "Terminal"]) {
+        let app, titles;
+        try {
+            app = Application(appName);
+            titles = app.windows.name();
+        } catch(e) { continue; }
+        const match = titles.find(t => t && t.includes("·MONITOR"));
+        if (!match) continue;
+
+        app.activate();
+        delay(0.1);
+        const proc = se.processes.byName(appName);
+
+        // Same-space fast path
+        try {
+            const w = proc.windows.byName(match);
+            w.actions["AXRaise"].perform();
+            try { w.attributes["AXMain"].value = true; } catch(e) {}
+            return "ok";
+        } catch(e) {}
+
+        // Cross-space: Window menu click
+        try {
+            const menu = proc.menuBars[0].menuBarItems.byName("Window").menus[0];
+            const items = menu.menuItems.name();
+            const item = items.find(n => n && n.includes("·MONITOR"));
+            if (item) { menu.menuItems.byName(item).click(); return "ok"; }
+        } catch(e) {}
+    }
+    return "not_found";
+})()'

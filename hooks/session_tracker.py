@@ -13,6 +13,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -94,6 +95,21 @@ def ensure_state_dir() -> None:
 
 def get_local_state_file(session_id: str) -> Path:
     return LOCAL_STATE_DIR / f"{session_id}.json"
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write to a same-directory tempfile then os.replace() into place."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def read_session_memory_title(transcript_path: str | None, session_id: str | None = None) -> str:
@@ -231,12 +247,22 @@ if not title:
     sys.exit(0)
 
 try:
+    import os, tempfile
     from datetime import datetime
+    mtime_before = state_file.stat().st_mtime
     data = json.loads(state_file.read_text())
     data["title"] = title
     data["title_source"] = "haiku"
     data["title_updated_at"] = datetime.now().isoformat()
-    state_file.write_text(json.dumps(data, indent=2) + "\\n")
+    # Skip if another hook wrote the file while we were working —
+    # we'd clobber a fresher state (e.g. thinking) with stale idle.
+    if state_file.stat().st_mtime != mtime_before:
+        sys.exit(0)
+    payload = json.dumps(data, indent=2) + "\\n"
+    fd, tmp = tempfile.mkstemp(dir=str(state_file.parent), prefix=state_file.name + ".")
+    with os.fdopen(fd, "w") as f:
+        f.write(payload)
+    os.replace(tmp, state_file)
 except Exception:
     pass
 '''
@@ -345,7 +371,7 @@ def write_state(
     if extra:
         data.update(extra)
 
-    local_file.write_text(json.dumps(data, indent=2) + "\n")
+    _atomic_write(local_file, json.dumps(data, indent=2) + "\n")
 
     # Only touch TTY on state/title changes — writing escape sequences
     # on every tool call corrupts the input buffer when background tasks
@@ -380,7 +406,7 @@ def mark_exited(session_id: str) -> None:
             data["state"] = "exited"
             data["exited_at"] = datetime.now().isoformat()
             data["timestamp"] = datetime.now().isoformat()
-            local_file.write_text(json.dumps(data, indent=2) + "\n")
+            _atomic_write(local_file, json.dumps(data, indent=2) + "\n")
         except (json.JSONDecodeError, OSError):
             pass
 

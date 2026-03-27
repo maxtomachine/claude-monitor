@@ -217,6 +217,9 @@ else
     else
       usage_json=$(cat "$usage_cache" 2>/dev/null)
     fi
+  elif [ -f "$usage_cache" ] && [ "$cache_age" -lt 3600 ]; then
+    # Keychain read failed — fall back to stale cache if < 1h old
+    usage_json=$(cat "$usage_cache" 2>/dev/null)
   fi
 fi
 

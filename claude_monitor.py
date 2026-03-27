@@ -653,7 +653,7 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
     # Statusline cache stores remaining %, so we flip it.
     try:
         remaining = int(_read_session_cache("ctx", session_id))
-        context_pct = 100 - remaining
+        context_pct = max(0, min(100, 100 - remaining))
     except ValueError:
         last_input = data["last_input_tokens"]
         if last_input == 0:
@@ -753,9 +753,11 @@ def _is_session_alive(session_id: str, display_title: str = "") -> bool:
         if pid is not None:
             _recently_resumed.pop(session_id, None)  # PID appeared, no longer need grace
             return True
-        return False
+        # pid is None → stale/dead PID file. Don't return False yet —
+        # fall through to the grace-period check so a freshly resumed
+        # session isn't flickered as closed before its new PID file lands.
 
-    # No PID file — check if we just resumed this session
+    # No live PID — check if we just resumed this session
     resumed_at = _recently_resumed.get(session_id)
     if resumed_at and (time.time() - resumed_at) < _RESUME_GRACE:
         return True
@@ -1458,12 +1460,8 @@ def _derive_cwd_from_transcript(transcript_path: str) -> str:
     return decoded
 
 
-def resume_session(session: Session, then_command: str = "") -> bool:
-    """Resume a Claude session in a new Ghostty tab (falls back to Terminal.app).
-
-    If then_command is set (e.g. "/rename"), the resume waits for Claude to
-    start and then sends that command via keystroke.
-    """
+def resume_session(session: Session) -> bool:
+    """Resume a Claude session in a new Ghostty tab (falls back to Terminal.app)."""
     cmd = f"claude --resume {session.session_id}"
     # Claude CLI resolves sessions by hashing the cwd. Use the original
     # launch directory: sessions-index projectPath > transcript path > last cwd.
@@ -1477,7 +1475,7 @@ def resume_session(session: Session, then_command: str = "") -> bool:
     # Verify the JSONL transcript exists before trying to resume
     jsonl_exists = bool(session.transcript_path) and Path(session.transcript_path).exists()
     mlog("resume", "attempt", sid=session.session_id[:12], title=session.title,
-         cwd=cwd, jsonl_exists=jsonl_exists, then=then_command or None)
+         cwd=cwd, jsonl_exists=jsonl_exists)
     if not jsonl_exists:
         mlog("resume", "no_jsonl", sid=session.session_id[:12],
              path=session.transcript_path)
@@ -2068,9 +2066,9 @@ class ClaudeMonitor(App):
         if saved_theme:
             self.theme = saved_theme
         self._rebuild_table_columns()
-        # Set terminal window title (skip in tests / non-tty)
+        # Set terminal window title with ·MONITOR marker for jumpback
         if sys.stdout.isatty() and "PYTEST_CURRENT_TEST" not in os.environ:
-            print("\033]2;Claude Monitor\007", end="", flush=True)
+            print("\033]2;◇ Claude Monitor ·MONITOR\007", end="", flush=True)
         self.refresh_sessions()
         self.set_interval(3, self.refresh_sessions)
         self.set_interval(0.132, self._tick_spinner)
@@ -2110,11 +2108,13 @@ class ClaudeMonitor(App):
         )]
 
     _refresh_pending: bool = False
+    _refresh_queued: bool = False  # set when a refresh is requested mid-flight
 
     def refresh_sessions(self) -> None:
         """Schedule a refresh — heavy work runs in a background thread."""
         if self._refresh_pending:
-            return  # Previous refresh still running, skip
+            self._refresh_queued = True  # run again once current worker finishes
+            return
         self._refresh_pending = True
         # Snapshot UI state before background work
         table = self.query_one("#session-table", DataTable)
@@ -2161,6 +2161,9 @@ class ClaudeMonitor(App):
             )
         finally:
             self._refresh_pending = False
+            if self._refresh_queued:
+                self._refresh_queued = False
+                self.call_from_thread(self.refresh_sessions)
 
     def _refresh_apply(self, sessions: list[Session], flat: list[Session],
                        rendered: list[tuple[Session, list[str]]],
@@ -2427,7 +2430,9 @@ class ClaudeMonitor(App):
         _pid_map_ts = 0  # Force fresh PID map
         _scan_cache.clear()  # Force re-read all transcripts
         _subagent_cache.clear()
-        self._refresh_pending = False  # Allow immediate refresh
+        # Don't clear _refresh_pending — that would dispatch a second worker
+        # concurrently mutating the module-global caches. refresh_sessions()
+        # queues a follow-up refresh if one is already in flight.
         self.refresh_sessions()
         self.notify("Refreshed", timeout=3)
 
