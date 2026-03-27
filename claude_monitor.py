@@ -2082,6 +2082,7 @@ class ClaudeMonitor(App):
     sessions: list[Session] = []
     _flat_rows: list[Session] = []
     _row_map: list["Session | None"] = []
+    _group_counts: dict[str, int] = {}
     _selected_key: str | None = None
     _visible_cols: list[str] = []
     _col_order: list[str] = []
@@ -2226,15 +2227,25 @@ class ClaudeMonitor(App):
                     s.status = self._dismissing_sessions[s.session_id]
 
             # When grouping, stable-sort by group key (preserves within-group
-            # sort from the earlier sort_mode pass). Singletons sink to the end.
+            # sort from the earlier sort_mode pass). Singletons collapse into
+            # one "ungrouped" bucket at the bottom.
             if self.show_groups:
                 groups: dict[str, list[Session]] = {}
                 for s in flat:
                     groups.setdefault(_group_key(s.title), []).append(s)
+                singles = [k for k, v in groups.items() if len(v) < 2]
+                if singles:
+                    ungrouped = groups.setdefault("ungrouped", [])
+                    for k in singles:
+                        if k != "ungrouped":
+                            ungrouped.extend(groups.pop(k))
                 ordered_keys = sorted(
-                    groups, key=lambda k: (len(groups[k]) < 2, k.lower())
+                    groups, key=lambda k: (k == "ungrouped", k.lower())
                 )
                 flat = [s for k in ordered_keys for s in groups[k]]
+                self._group_counts = {k: len(groups[k]) for k in ordered_keys}
+            else:
+                self._group_counts = {}
 
             # Pre-render rows in background thread (Rich markup generation)
             visible_cols = self._visible_cols
@@ -2295,10 +2306,15 @@ class ClaudeMonitor(App):
         for s, cells in rendered:
             if self.show_groups:
                 gk = _group_key(s.title)
+                # Singletons were merged into "ungrouped" upstream, so any
+                # session whose own key isn't a real group header must be
+                # part of that bucket.
+                if gk not in self._group_counts:
+                    gk = "ungrouped"
                 if gk != last_group:
-                    count = sum(1 for x, _ in rendered if _group_key(x.title) == gk)
-                    label = (f"[dim]▸ {gk}[/]" if count < 2
-                             else f"[bold cyan]▸ {gk}[/] [dim]({count})[/]")
+                    count = self._group_counts.get(gk, 1)
+                    style = "dim" if gk == "ungrouped" else "bold cyan"
+                    label = f"[{style}]▸ {gk}[/] [dim]({count})[/]"
                     header = [label] + [""] * (n_cols - 1)
                     table.add_row(*header, key=f"__group__{gk}")
                     row_map.append(None)
