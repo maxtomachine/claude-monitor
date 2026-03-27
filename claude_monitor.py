@@ -589,12 +589,24 @@ def parse_sessions(include_archived: bool = False,
         t_build += time.perf_counter() - tb
         if session:
             # Hide ghost sessions: ≤20 output tokens = just the greeting
-            # Keep only if we can confirm a live process
+            # Keep only if we can confirm a live process.
+            # Guard: if the file is large (>50KB) but tokens_out is still
+            # low, the scan cache is stale — force a rescan before filtering.
             if session.tokens_out <= 20:
-                n_alive_check += 1
-                if _is_session_alive(session_id) is not True:
-                    tg = time.perf_counter()
-                    continue
+                try:
+                    fsize = jsonl_path.stat().st_size
+                except OSError:
+                    fsize = 0
+                if fsize > 50_000 and _scan_cache.get(str(jsonl_path)):
+                    del _scan_cache[str(jsonl_path)]
+                    data = scan_full_file(str(jsonl_path))
+                    session.tokens_out = data.get("tokens_out", 0)
+                    session.tokens_in = data.get("tokens_in", 0)
+                if session.tokens_out <= 20:
+                    n_alive_check += 1
+                    if _is_session_alive(session_id) is not True:
+                        tg = time.perf_counter()
+                        continue
             if is_archived:
                 session.status = "archived"
             tc = time.perf_counter()
@@ -804,7 +816,18 @@ def _is_session_alive(session_id: str, display_title: str = "") -> bool:
         # fall through to the grace-period check so a freshly resumed
         # session isn't flickered as closed before its new PID file lands.
 
-    # No live PID — check if we just resumed this session
+    # No live PID file — check hook state as an alternative PID source.
+    # Some sessions don't create ~/.claude/sessions/*.json PID files
+    # but the hook still tracks them with a valid PID.
+    hook = read_hook_state(session_id)
+    if hook and hook.get("pid"):
+        try:
+            os.kill(int(hook["pid"]), 0)
+            return True
+        except (OSError, ValueError):
+            pass
+
+    # Last resort: check if we just resumed this session
     resumed_at = _recently_resumed.get(session_id)
     if resumed_at and (time.time() - resumed_at) < _RESUME_GRACE:
         return True
@@ -1370,9 +1393,32 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
 
             let targetName = null;
             let matchedCand = null;
-            for (const cand of candidates) {{
-                const match = allTitles.find(t => t && t.includes(cand));
-                if (match) {{ targetName = match; matchedCand = cand; break; }}
+
+            // Phase 1: find ·sid8 match and best name-based match
+            const sid8 = candidates[0];
+            const sidWindow = allTitles.find(t => t && t.includes(sid8));
+            let nameWindow = null;
+            let nameCand = null;
+            for (let i = 1; i < candidates.length; i++) {{
+                const m = allTitles.find(t => t && t.includes(candidates[i]));
+                if (m) {{ nameWindow = m; nameCand = candidates[i]; break; }}
+            }}
+
+            // Phase 2: resolve conflicts between sid marker and name match
+            if (sidWindow && nameWindow && sidWindow === nameWindow) {{
+                // Both point to the same window — ideal case
+                targetName = sidWindow; matchedCand = sid8;
+            }} else if (sidWindow && nameWindow && sidWindow !== nameWindow) {{
+                // ·sid8 marker is on a DIFFERENT window than the name
+                // match — the marker is stale (old tab from a resume,
+                // or Claude's auto-summary clobbered the marker on the
+                // active tab). Prefer the name match.
+                targetName = nameWindow;
+                matchedCand = nameCand + "+sid_stale";
+            }} else if (sidWindow) {{
+                targetName = sidWindow; matchedCand = sid8;
+            }} else if (nameWindow) {{
+                targetName = nameWindow; matchedCand = nameCand;
             }}
             if (!targetName) continue;
 
@@ -1394,7 +1440,10 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
             try {{
                 const menu = proc.menuBars[0].menuBarItems.byName("Window").menus[0];
                 const items = menu.menuItems.name();
-                const item = items.find(n => n && n.includes(matchedCand));
+                // matchedCand may carry a +sid_stale suffix for
+                // diagnostics — strip it for menu-item matching.
+                const menuCand = matchedCand.split("+")[0];
+                const item = items.find(n => n && n.includes(menuCand));
                 if (item) {{
                     menu.menuItems.byName(item).click();
                     if (thenText) {{ delay(0.3); se.keystroke(thenText); se.keyCode(36); }}
@@ -1416,6 +1465,11 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
         out = result.stdout.strip()
         mlog("jump", "jxa_result", result=out, sid=session.session_id[:12])
         if out.startswith("matched:"):
+            matched_on = out.split(":", 2)[1] if ":" in out else ""
+            if "+sid_stale" in matched_on:
+                mlog("DIVERGE", "stale_sid_marker",
+                     sid=session.session_id[:12], matched_on=matched_on,
+                     full=out)
             # Post-jump verification: if the raised window's title contains
             # a ·{sid8} marker for a DIFFERENT session, we jumped wrong.
             target_sid8 = session.session_id[:8]
@@ -1423,7 +1477,7 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
             if m and m.group(1) != target_sid8:
                 mlog("DIVERGE", "wrong_window",
                      target=target_sid8, raised=m.group(1),
-                     matched_on=out.split(":", 2)[1], full=out)
+                     matched_on=matched_on, full=out)
             return True
         return False
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
