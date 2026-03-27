@@ -522,7 +522,16 @@ def _gc_state_files() -> None:
             pass
 
 
+_PERF = os.environ.get("CLAUDE_MONITOR_PERF") == "1"
+def _perf(label: str, t0: float) -> float:
+    """Print elapsed time since t0 and return new perf_counter()."""
+    if _PERF:
+        print(f"[perf] {label}: {(time.perf_counter()-t0)*1000:.1f}ms", file=sys.stderr)
+    return time.perf_counter()
+
+
 def parse_sessions(include_archived: bool = False) -> list[Session]:
+    t0 = time.perf_counter()
     sessions = []
     now = time.time()
     active_cutoff = now - 86400
@@ -532,9 +541,14 @@ def parse_sessions(include_archived: bool = False) -> list[Session]:
         return sessions
 
     _gc_state_files()
+    t0 = _perf("  parse_sessions: _gc_state_files", t0)
 
     meta = load_index_metadata()
+    t0 = _perf("  parse_sessions: load_index_metadata", t0)
 
+    n_scanned = n_full_scan = n_stale_ok = n_alive_check = 0
+    t_rglob = t_build = t_compact = t_subagent = 0.0
+    tg = time.perf_counter()
     for jsonl_path in CLAUDE_DIR.rglob("*.jsonl"):
         if "subagents" in str(jsonl_path):
             continue
@@ -549,21 +563,44 @@ def parse_sessions(include_archived: bool = False) -> list[Session]:
         if mtime < archive_cutoff:
             continue
 
+        t_rglob += time.perf_counter() - tg
         session_id = jsonl_path.stem
         idx = meta.get(session_id, {})
         project = idx.get("project", jsonl_path.parent.name.split("-")[-1] or "~")
 
+        n_scanned += 1
+        # Track if scan_full_file will hit cache or do full read
+        cached = _scan_cache.get(str(jsonl_path))
+        hook = read_hook_state(session_id)
+        hook_fresh = False
+        if hook and hook.get("timestamp"):
+            try:
+                hook_fresh = (time.time() - parse_timestamp(hook["timestamp"])) < 30
+            except (ValueError, TypeError):
+                pass
+        if cached and (cached[0] == mtime or hook_fresh):
+            n_stale_ok += 1
+        else:
+            n_full_scan += 1
+
+        tb = time.perf_counter()
         session = build_session(str(jsonl_path), session_id, project, idx, mtime)
+        t_build += time.perf_counter() - tb
         if session:
             # Hide ghost sessions: ≤20 output tokens = just the greeting
             # Keep only if we can confirm a live process
             if session.tokens_out <= 20:
+                n_alive_check += 1
                 if _is_session_alive(session_id) is not True:
+                    tg = time.perf_counter()
                     continue
             if is_archived:
                 session.status = "archived"
+            tc = time.perf_counter()
             session.compact_count = count_compactions(str(jsonl_path))
+            t_compact += time.perf_counter() - tc
             if not is_archived:
+                ts = time.perf_counter()
                 for sub_path in find_subagent_paths(str(jsonl_path)):
                     sub = build_session(
                         str(sub_path), sub_path.stem, project, {},
@@ -571,8 +608,17 @@ def parse_sessions(include_archived: bool = False) -> list[Session]:
                     )
                     if sub:
                         session.subagents.append(sub)
+                t_subagent += time.perf_counter() - ts
             sessions.append(session)
+        tg = time.perf_counter()
 
+    if _PERF:
+        print(f"[perf]   parse_sessions: rglob iter: {t_rglob*1000:.1f}ms", file=sys.stderr)
+        print(f"[perf]   parse_sessions: build_session: {t_build*1000:.1f}ms "
+              f"({n_scanned} sessions, {n_full_scan} full scans, {n_stale_ok} cached/stale-ok)", file=sys.stderr)
+        print(f"[perf]   parse_sessions: count_compactions: {t_compact*1000:.1f}ms", file=sys.stderr)
+        print(f"[perf]   parse_sessions: subagents: {t_subagent*1000:.1f}ms", file=sys.stderr)
+        print(f"[perf]   parse_sessions: _is_session_alive checks: {n_alive_check}", file=sys.stderr)
     return sessions
 
 
@@ -1774,6 +1820,38 @@ class KanbanView(ModalScreen[str | None]):
         self.refresh(recompose=True)
 
 
+class RenamePrompt(ModalScreen[str | None]):
+    """Inline text prompt for editing a session name."""
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    CSS = """
+    RenamePrompt { align: center middle; }
+    #rename-box {
+        width: 60; height: auto; padding: 1 2;
+        background: $panel; border: thick $accent;
+    }
+    #rename-input { width: 100%; }
+    """
+
+    def __init__(self, current: str) -> None:
+        super().__init__()
+        self._current = current
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="rename-box"):
+            yield Label("Rename session [dim](sends /rename <name>)[/]")
+            yield Input(value=self._current, id="rename-input")
+
+    def on_mount(self) -> None:
+        self.query_one("#rename-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        name = event.value.strip()
+        self.dismiss(name or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class SessionMenu(ModalScreen[str]):
     BINDINGS = [
         Binding("escape", "dismiss_menu", "Close"),
@@ -2102,6 +2180,7 @@ class ClaudeMonitor(App):
         Binding("R", "restart", "Restart", show=False),
         Binding("j", "cursor_down", "↓", show=False),
         Binding("n", "rename_selected", "Rename", show=False),
+        Binding("e", "edit_name", "Edit", show=False),
         Binding("g", "toggle_groups", "Group"),
     ]
 
@@ -2142,12 +2221,15 @@ class ClaudeMonitor(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        t0 = time.perf_counter()
         self._visible_cols = get_visible_columns()
         self._col_order = get_column_order()
         saved_theme = load_prefs().get("theme")
         if saved_theme:
             self.theme = saved_theme
+        t0 = _perf("on_mount: load_prefs (cols+theme)", t0)
         self._rebuild_table_columns()
+        t0 = _perf("on_mount: _rebuild_table_columns", t0)
         # Set terminal window title with ·MONITOR marker for jumpback.
         # Textual captures stdout, so write to /dev/tty directly.
         if "PYTEST_CURRENT_TEST" not in os.environ:
@@ -2157,12 +2239,15 @@ class ClaudeMonitor(App):
                     tty.flush()
             except OSError:
                 pass
+        t0 = _perf("on_mount: /dev/tty title write", t0)
         self.refresh_sessions()
+        t0 = _perf("on_mount: first refresh_sessions (schedule)", t0)
         self.set_interval(3, self.refresh_sessions)
         self.set_interval(0.132, self._tick_spinner)
         self.set_interval(600, self._audit_stats)  # Every 10 minutes
         self.query_one("#session-table", DataTable).focus()
         mlog("app", "started")
+        t0 = _perf("on_mount: set_interval + focus + mlog", t0)
 
         # Teach the jumpback hotkey for the first 20 launches
         prefs = load_prefs()
@@ -2175,6 +2260,7 @@ class ClaudeMonitor(App):
                 f"[dim]({21 - launches} more reminders)[/]",
                 title="jumpback", timeout=6,
             )
+        _perf("on_mount: launch_count save_prefs + notify", t0)
 
     def _tick_spinner(self) -> None:
         """Advance spinner frame and update only working-status cells."""
@@ -2607,6 +2693,44 @@ class ClaudeMonitor(App):
         self.show_groups = not self.show_groups
         self.refresh_sessions()
         self.notify(f"Grouping {'on' if self.show_groups else 'off'}", timeout=3)
+
+    def action_edit_name(self) -> None:
+        """Open inline prompt, then send /rename <name> to the selected session."""
+        table = self.query_one(DataTable)
+        cr = table.cursor_row
+        if cr is None or cr >= len(self._row_map):
+            return
+        s = self._row_map[cr]
+        if (s is None
+                or s.status in ("archived", "closed")
+                or not _is_session_alive(s.session_id)):
+            self.notify("Rename requires a running session", timeout=3)
+            return
+
+        def on_submit(name: str | None) -> None:
+            if not name:
+                return
+            ok = _send_to_terminal_session(s, f"/rename {name}")
+            if ok:
+                # Optimistically update the hook state so the monitor shows
+                # the new name immediately (before the hook catches up).
+                state_path = Path.home() / ".claude" / "session-states" / f"{s.session_id}.json"
+                try:
+                    data = json.loads(state_path.read_text()) if state_path.exists() else {}
+                    data["title"] = name
+                    data["title_source"] = "user"
+                    data["title_updated_at"] = datetime.now().isoformat()
+                    state_path.write_text(json.dumps(data, indent=2) + "\n")
+                except (OSError, json.JSONDecodeError):
+                    pass
+                self.notify(f"Renamed → {name}", timeout=3)
+                self.refresh_sessions()
+            else:
+                self.notify("Could not reach session terminal", timeout=4,
+                            severity="warning")
+            mlog("action", "edit_name", sid=s.session_id[:12], name=name, ok=ok)
+
+        self.push_screen(RenamePrompt(s.title), on_submit)
 
     def _do_rename(self, s: Session, log_cat: str) -> None:
         ok = _send_to_terminal_session(s, "/rename")
