@@ -1755,14 +1755,152 @@ STATUS_ICON = {
 }
 
 STATUS_COLOR = {
-    "working": "green",
-    "needs_approval": "yellow",
-    "waiting": "dark_orange",
-    "idle": "grey70",
-    "closed": "grey50",
-    "archived": "grey50",
-    "debriefing": "magenta",
+    "working": "#5B8A72",
+    "needs_approval": "#B0A04F",
+    "waiting": "#B07D4F",
+    "idle": "#606060",
+    "closed": "#404040",
+    "archived": "#404040",
+    "debriefing": "#8B668B",
 }
+
+def _get_api_key() -> str:
+    """Find an Anthropic API key from standard locations."""
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if key:
+        return key
+    for path in [
+        Path.home() / "claude-monitor" / ".api_key",
+        Path.home() / ".config" / "anthropic" / "api_key",
+    ]:
+        if path.exists():
+            val = path.read_text().strip()
+            if val:
+                return val
+    return ""
+
+
+def _generate_session_summary(session: Session, time_range: str = "week") -> str:
+    """Generate a Haiku summary for a session. Reads transcript, checks for
+    existing summaries, and builds incrementally."""
+    api_key = _get_api_key()
+    if not api_key:
+        return "[yellow]No API key found[/] — add key to ~/claude-monitor/.api_key"
+
+    summary_file = HOOK_STATE_DIR / f"{session.session_id}.summary"
+    now = time.time()
+    lookback = 7 * 86400 if time_range == "week" else 30 * 86400
+    period_start = now - lookback
+
+    # Check existing summary
+    existing = None
+    if summary_file.exists():
+        try:
+            existing = json.loads(summary_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if existing and existing.get("summaries"):
+        latest = existing["summaries"][-1]
+        latest_end = latest.get("period_end", "")
+        if latest_end:
+            try:
+                from datetime import datetime
+                end_ts = datetime.fromisoformat(latest_end).timestamp()
+                if (now - end_ts) < lookback * 0.5:
+                    return existing.get("combined", latest.get("text", ""))
+            except (ValueError, TypeError):
+                pass
+
+    # Read transcript excerpt
+    transcript = session.transcript_path
+    user_messages = []
+    assistant_snippets = []
+    if transcript and Path(transcript).exists():
+        try:
+            lines = Path(transcript).read_text().splitlines()
+            for line in lines[-200:]:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("type") == "user":
+                    msg = entry.get("message", {})
+                    content = msg.get("content", "") if isinstance(msg, dict) else ""
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                content = block.get("text", "")
+                                break
+                    if isinstance(content, str) and content.strip():
+                        user_messages.append(content.strip()[:200])
+                elif entry.get("type") == "assistant":
+                    msg = entry.get("message", {})
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                content = block.get("text", "")
+                                break
+                    if isinstance(content, str) and content.strip():
+                        assistant_snippets.append(content.strip()[:150])
+        except OSError:
+            pass
+
+    if not user_messages:
+        return "[dim]No transcript data to summarize[/]"
+
+    # Build context — interleave user and assistant messages
+    context_parts = []
+    for i, um in enumerate(user_messages[-8:]):
+        context_parts.append(f"User: {um}")
+        if i < len(assistant_snippets):
+            context_parts.append(f"Assistant: {assistant_snippets[-(len(user_messages[-8:]) - i)][:100]}")
+    transcript_text = "\n".join(context_parts)
+
+    # Haiku API call
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+
+        prompt = f"Summarize this Claude Code session's activity in 2-3 sentences. Focus on what was accomplished, what's in progress, and any blockers. Be concise.\n\nSession: {session.title}\n\nRecent activity:\n{transcript_text}"
+
+        if existing and existing.get("combined"):
+            prompt = f"Previous summary: {existing['combined']}\n\nNew activity since then:\n{transcript_text}\n\nUpdate the summary in 2-3 sentences covering the full history. Focus on what was accomplished and current state."
+
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20250414",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        summary_text = resp.content[0].text.strip()
+    except Exception as e:
+        return f"[red]Summary failed:[/] {_escape_markup(str(e)[:80])}"
+
+    # Store incrementally
+    from datetime import datetime
+    new_entry = {
+        "period_end": datetime.now().isoformat(),
+        "text": summary_text,
+    }
+    if existing and existing.get("summaries"):
+        existing["summaries"].append(new_entry)
+        existing["combined"] = summary_text
+    else:
+        existing = {
+            "summaries": [new_entry],
+            "combined": summary_text,
+        }
+
+    try:
+        summary_file.write_text(json.dumps(existing, indent=2) + "\n")
+    except OSError:
+        pass
+
+    return summary_text
+
 
 LABEL_WIDTH = 16
 
@@ -2052,8 +2190,13 @@ class TimelineView(ModalScreen[str | None]):
     .timeline-chart { height: 1fr; overflow-y: auto; }
     .timeline-group { height: 1; }
     .timeline-bar { height: 1; }
-    .timeline-bar.-selected { background: $boost; }
+    .timeline-bar.-selected { background: #1a2a1a; }
     .timeline-spacer { height: 1; }
+    #timeline-summary {
+        height: auto; max-height: 25%; min-height: 3; padding: 0 2;
+        background: $boost; dock: bottom; border-top: solid $primary;
+        overflow-y: auto;
+    }
     """
 
     def __init__(self, sessions: list[Session], by_group: bool = False) -> None:
@@ -2140,13 +2283,12 @@ class TimelineView(ModalScreen[str | None]):
         end = max(end, start + 1)
         end = min(end, cw)
 
-        color = STATUS_COLOR.get(s.status, "grey50")
-        chars = [" "] * cw
-        # marks[i] = (char, markup_color) for overlay symbols
+        color = STATUS_COLOR.get(s.status, "#404040")
+        chars = ["·"] * cw
         marks: dict[int, tuple[str, str]] = {}
 
         for i in range(start, end):
-            chars[i] = "█"
+            chars[i] = "▬"
 
         # Start marker
         marks[start] = ("▸", "dim")
@@ -2172,7 +2314,7 @@ class TimelineView(ModalScreen[str | None]):
             elif start <= i < end:
                 bar_str += f"[{color}]{c}[/]"
             else:
-                bar_str += c
+                bar_str += f"[#2a2a2a]{c}[/]"
 
         return bar_str
 
@@ -2254,6 +2396,10 @@ class TimelineView(ModalScreen[str | None]):
                             )
                             session_idx += 1
                         widget_idx += 1
+        yield Static(
+            "[dim]Select a session and press Enter → Summarize to generate a period summary[/]",
+            id="timeline-summary",
+        )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -2306,8 +2452,15 @@ class TimelineView(ModalScreen[str | None]):
     def action_select(self) -> None:
         if 0 <= self._sel < len(self._flat):
             s = self._flat[self._sel]
-            handler = self.app._make_menu_handler(s)  # type: ignore[attr-defined]
-            self.app.push_screen(SessionMenu(s), handler)
+
+            def _timeline_handler(action: str | None) -> None:
+                if action == "summarize":
+                    self._summarize_session(s)
+                else:
+                    handler = self.app._make_menu_handler(s)  # type: ignore[attr-defined]
+                    handler(action)
+
+            self.app.push_screen(SessionMenu(s, context="timeline"), _timeline_handler)
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -2350,6 +2503,24 @@ class TimelineView(ModalScreen[str | None]):
     def _rebuild(self) -> None:
         self._populate(getattr(self.app, "sessions", []))
         self.refresh(recompose=True)
+
+    def _summarize_session(self, session: Session) -> None:
+        """Generate a Haiku summary in the background and update the panel."""
+        try:
+            panel = self.query_one("#timeline-summary", Static)
+        except Exception:
+            return
+        panel.update(f"[dim]Summarizing {_escape_markup(session.title[:30])}...[/]")
+
+        def _worker():
+            summary = _generate_session_summary(session, self._time_range)
+            try:
+                self.call_from_thread(panel.update, summary)
+            except Exception:
+                pass
+
+        import threading
+        threading.Thread(target=_worker, daemon=True).start()
 
 
 class RenamePrompt(ModalScreen[str | None]):
@@ -2408,9 +2579,10 @@ class SessionMenu(ModalScreen[str]):
     #menu-options { height: auto; }
     """
 
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, context: str = "") -> None:
         super().__init__()
         self.session = session
+        self.menu_context = context
 
     def compose(self) -> ComposeResult:
         s = self.session
@@ -2421,13 +2593,12 @@ class SessionMenu(ModalScreen[str]):
             options.append(Option("🖥   Jump to terminal", id="jump"))
             options.append(Option("▶   Resume in new tab", id="resume"))
             options.append(Option("🏷   Rename…", id="edit_name"))
+        if self.menu_context == "timeline":
+            options.append(Option("📊  Summarize period", id="summarize"))
         options.append(Option(f"📋  Copy session ID ({s.session_id[:8]}…)", id="copy_id"))
         if s.remote_url:
             options.append(Option("🔗  Open remote control", id="remote"))
         options.append(Option("📂  Open transcript", id="transcript"))
-        # Debrief requires a /debrief skill installed on the user's machine
-        # if s.status not in ("archived", "closed", "debriefing"):
-        #     options.append(Option("📝  Debrief & close", id="dismiss"))
         if s.status not in ("archived", "closed"):
             options.append(Option("❌  Kill process", id="kill"))
         options.append(Option("─" * 26, id="sep", disabled=True))
