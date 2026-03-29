@@ -1754,12 +1754,67 @@ STATUS_ICON = {
     "closed": "x",
 }
 
+STATUS_COLOR = {
+    "working": "green",
+    "needs_approval": "yellow",
+    "waiting": "dark_orange",
+    "idle": "grey70",
+    "closed": "grey50",
+    "archived": "grey50",
+    "debriefing": "magenta",
+}
+
+LABEL_WIDTH = 16
+
+
+def time_to_col(ts: float, t_min: float, range_secs: float, chart_width: int) -> int:
+    """Map a unix timestamp to a column index [0, chart_width-1]."""
+    if range_secs <= 0 or chart_width <= 0:
+        return 0
+    frac = (ts - t_min) / range_secs
+    return max(0, min(chart_width - 1, int(frac * chart_width)))
+
+
+def generate_ticks(t_min: float, t_max: float, chart_width: int) -> list[tuple[int, str]]:
+    """Generate (column_index, label) tick marks for a time axis."""
+    from datetime import datetime as dt
+    range_secs = t_max - t_min
+    if range_secs <= 0 or chart_width <= 0:
+        return []
+
+    if range_secs < 7200:       # < 2h → 15-min ticks
+        interval = 900
+        fmt = "%-I:%M"
+    elif range_secs < 86400:    # < 24h → hourly
+        interval = 3600
+        fmt = "%-I%p"
+    elif range_secs < 604800:   # < 7d → daily
+        interval = 86400
+        fmt = "%a"
+    else:                       # >= 7d → date
+        interval = 86400
+        fmt = "%b %-d"
+
+    # Round t_min up to the next interval boundary
+    first = ((int(t_min) // interval) + 1) * interval
+    ticks = []
+    last_col = -999
+    t = first
+    while t < t_max:
+        col = time_to_col(t, t_min, range_secs, chart_width)
+        label = dt.fromtimestamp(t).strftime(fmt).lower().replace("am", "a").replace("pm", "p")
+        if col - last_col >= len(label) + 2:
+            ticks.append((col, label))
+            last_col = col
+        t += interval
+    return ticks
+
 
 class KanbanView(ModalScreen[str | None]):
     BINDINGS = [
         Binding("escape", "close", "Close"),
-        Binding("k", "close", "Close", show=False),
         Binding("q", "close", "Close", show=False),
+        Binding("v", "next_view", "View"),
         Binding("up", "move('up')", "↑", show=False),
         Binding("down", "move('down')", "↓", show=False),
         Binding("left", "move('left')", "←", show=False),
@@ -1943,6 +1998,9 @@ class KanbanView(ModalScreen[str | None]):
     def action_close(self) -> None:
         self.dismiss(None)
 
+    def action_next_view(self) -> None:
+        self.dismiss("__next_view__")
+
     def action_passthrough(self, name: str) -> None:
         """Delegate to the main app's action, then refresh this view."""
         getattr(self.app, f"action_{name}")()
@@ -1963,6 +2021,280 @@ class KanbanView(ModalScreen[str | None]):
     def _rebuild_grid(self) -> None:
         """Re-populate cards from fresh app session data after a passthrough."""
         self._populate_grid(getattr(self.app, "sessions", []))
+        self.refresh(recompose=True)
+
+
+class TimelineView(ModalScreen[str | None]):
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("q", "close", "Close", show=False),
+        Binding("v", "next_view", "View"),
+        Binding("up", "move('up')", "↑", show=False),
+        Binding("down", "move('down')", "↓", show=False),
+        Binding("enter", "select", "Select"),
+        Binding("r", "passthrough('refresh')", "Refresh"),
+        Binding("z", "passthrough('toggle_archived')", "All", show=False),
+        Binding("d", "passthrough('toggle_debug')", "Debug", show=False),
+        Binding("t", "passthrough('toggle_theme')", "Theme", show=False),
+        Binding("R", "passthrough('restart')", "Restart", show=False),
+        Binding("n", "edit_name", "Rename", show=False),
+        Binding("g", "toggle_groups", "Group", show=False),
+    ]
+    CSS = """
+    TimelineView { background: $background; }
+    #timeline-outer { width: 100%; height: 100%; padding: 0 1; }
+    #timeline-title { text-align: center; text-style: bold; height: 1; }
+    #timeline-axis { height: 1; overflow: hidden; }
+    #timeline-sep { height: 1; color: $text-disabled; overflow: hidden; }
+    .timeline-chart { height: 1fr; overflow-y: auto; }
+    .timeline-group { height: 1; }
+    .timeline-bar { height: 1; }
+    .timeline-bar.-selected { background: $boost; }
+    """
+
+    def __init__(self, sessions: list[Session], by_group: bool = False) -> None:
+        super().__init__()
+        self._spin_idx = 0
+        self._sel = 0
+        self._by_group = by_group
+        self._flat: list[Session] = []
+        self._rows: list[Session | str | None] = []  # Session, group-key str, or None
+        self._t_min = 0.0
+        self._t_max = 0.0
+        self._range_secs = 0.0
+        self._chart_width = 80
+        self._populate(sessions)
+
+    def _populate(self, sessions: list[Session]) -> None:
+        active = [s for s in sessions if not s.is_subagent]
+        now = time.time()
+
+        if not active:
+            self._flat = []
+            self._rows = []
+            self._t_min = now - 60
+            self._t_max = now
+            self._range_secs = 60
+            return
+
+        self._t_min = min(s.created for s in active)
+        self._t_max = now
+        self._range_secs = max(self._t_max - self._t_min, 60)
+
+        flat: list[Session] = []
+        rows: list[Session | str | None] = []
+
+        if self._by_group:
+            groups: dict[str, list[Session]] = {}
+            for s in active:
+                groups.setdefault(_group_key(s.title), []).append(s)
+            singles = [k for k in list(groups) if len(groups[k]) < 2]
+            if singles:
+                ung = groups.setdefault("ungrouped", [])
+                for k in singles:
+                    if k != "ungrouped":
+                        ung.extend(groups.pop(k))
+            keys = sorted(groups, key=lambda k: (k == "ungrouped", k.lower()))
+            for gk in keys:
+                rows.append(gk)  # group header
+                for s in groups[gk]:
+                    rows.append(s)
+                    flat.append(s)
+        else:
+            for s in active:
+                rows.append(s)
+                flat.append(s)
+
+        self._flat = flat
+        self._rows = rows
+        if flat:
+            self._sel = min(self._sel, len(flat) - 1)
+
+    def _render_bar(self, s: Session) -> str:
+        cw = self._chart_width
+        if cw <= 0:
+            return ""
+        now = time.time()
+        start = time_to_col(s.created, self._t_min, self._range_secs, cw)
+        end_ts = now if s.status in ("working", "waiting", "needs_approval") else s.last_activity
+        end = time_to_col(end_ts, self._t_min, self._range_secs, cw)
+        end = max(end, start + 1)
+        end = min(end, cw)
+
+        color = STATUS_COLOR.get(s.status, "grey50")
+        chars = [" "] * cw
+        for i in range(start, end):
+            chars[i] = "█"
+
+        if s.status == "working":
+            frame = SPINNER_FRAMES[self._spin_idx % len(SPINNER_FRAMES)]
+            chars[min(end - 1, cw - 1)] = frame
+            bar_str = ""
+            for i, c in enumerate(chars):
+                if i == min(end - 1, cw - 1):
+                    bar_str += f"[#D97757]{c}[/#D97757]"
+                elif start <= i < end:
+                    bar_str += f"[{color}]{c}[/]"
+                else:
+                    bar_str += c
+        else:
+            bar_str = ""
+            for i, c in enumerate(chars):
+                if start <= i < end:
+                    bar_str += f"[{color}]{c}[/]"
+                else:
+                    bar_str += c
+
+        return bar_str
+
+    def _render_row(self, row_entry: Session | str) -> str:
+        if isinstance(row_entry, str):
+            # Group header
+            count = sum(1 for r in self._rows if isinstance(r, Session) and _group_key(r.title) == row_entry)
+            style = "dim" if row_entry == "ungrouped" else "bold cyan"
+            return f"[{style}]▸ {row_entry}[/] [dim]({count})[/]"
+        s = row_entry
+        name = _escape_markup(s.title[:LABEL_WIDTH - 2])
+        padded = name.ljust(LABEL_WIDTH - 2)
+        bar = self._render_bar(s)
+        return f"  {padded}{bar}"
+
+    def compose(self) -> ComposeResult:
+        try:
+            self._chart_width = self.app.size.width - LABEL_WIDTH - 2
+        except Exception:
+            self._chart_width = 80
+        self._chart_width = max(self._chart_width, 20)
+
+        mode = "Groups" if self._by_group else "All"
+        ticks = generate_ticks(self._t_min, self._t_max, self._chart_width)
+
+        # Build axis line
+        axis_chars = [" "] * self._chart_width
+        for col, label in ticks:
+            for i, ch in enumerate(label):
+                pos = col + i
+                if 0 <= pos < self._chart_width:
+                    axis_chars[pos] = ch
+        axis_line = " " * LABEL_WIDTH + "".join(axis_chars)
+
+        # Build separator line with tick marks
+        sep_chars = ["─"] * self._chart_width
+        for col, _ in ticks:
+            if 0 <= col < self._chart_width:
+                sep_chars[col] = "┼"
+        sep_line = " " * LABEL_WIDTH + "".join(sep_chars)
+
+        with Vertical(id="timeline-outer"):
+            yield Label(
+                f"[bold]Timeline · {mode}[/]  [dim]↑↓ nav · enter select · v next view · esc close[/]",
+                id="timeline-title",
+            )
+            yield Static(f"[dim]{axis_line}[/]", id="timeline-axis")
+            yield Static(f"[dim]{sep_line}[/]", id="timeline-sep")
+
+            with Vertical(classes="timeline-chart"):
+                if not self._rows:
+                    yield Static("[dim]No sessions[/]")
+                else:
+                    widget_idx = 0
+                    session_idx = 0
+                    for entry in self._rows:
+                        if isinstance(entry, str):
+                            yield Static(
+                                self._render_row(entry),
+                                classes="timeline-group",
+                                id=f"tl-g-{widget_idx}",
+                            )
+                        else:
+                            sel = session_idx == self._sel
+                            classes = "timeline-bar -selected" if sel else "timeline-bar"
+                            yield Static(
+                                self._render_row(entry),
+                                classes=classes,
+                                id=f"tl-{widget_idx}",
+                            )
+                            session_idx += 1
+                        widget_idx += 1
+        yield Footer()
+
+    def on_mount(self) -> None:
+        has_working = any(s.status == "working" for s in self._flat)
+        if has_working:
+            self.set_interval(0.132, self._tick_spinner)
+
+    def _tick_spinner(self) -> None:
+        self._spin_idx += 1
+        widget_idx = 0
+        session_idx = 0
+        for entry in self._rows:
+            if isinstance(entry, str):
+                widget_idx += 1
+                continue
+            if entry.status == "working":
+                try:
+                    bar = self.query_one(f"#tl-{widget_idx}", Static)
+                    bar.update(self._render_row(entry))
+                except Exception:
+                    pass
+            widget_idx += 1
+            session_idx += 1
+
+    def _refresh_selection(self) -> None:
+        for w in self.query(".timeline-bar"):
+            w.remove_class("-selected")
+        widget_idx = 0
+        session_idx = 0
+        for entry in self._rows:
+            if isinstance(entry, str):
+                widget_idx += 1
+                continue
+            if session_idx == self._sel:
+                try:
+                    bar = self.query_one(f"#tl-{widget_idx}", Static)
+                    bar.add_class("-selected")
+                    bar.scroll_visible(animate=False)
+                except Exception:
+                    pass
+                break
+            widget_idx += 1
+            session_idx += 1
+
+    def action_move(self, direction: str) -> None:
+        if not self._flat:
+            return
+        step = -1 if direction == "up" else 1
+        self._sel = (self._sel + step) % len(self._flat)
+        self._refresh_selection()
+
+    def action_select(self) -> None:
+        if 0 <= self._sel < len(self._flat):
+            s = self._flat[self._sel]
+            handler = self.app._make_menu_handler(s)  # type: ignore[attr-defined]
+            self.app.push_screen(SessionMenu(s), handler)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    def action_next_view(self) -> None:
+        self.dismiss("__next_view__")
+
+    def action_passthrough(self, name: str) -> None:
+        getattr(self.app, f"action_{name}")()
+        if name in ("refresh", "toggle_archived"):
+            self._rebuild()
+
+    def action_edit_name(self) -> None:
+        if 0 <= self._sel < len(self._flat):
+            self.app.action_edit_name()  # type: ignore[attr-defined]
+
+    def action_toggle_groups(self) -> None:
+        self._by_group = not self._by_group
+        self.app.show_groups = self._by_group  # type: ignore[attr-defined]
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        self._populate(getattr(self.app, "sessions", []))
         self.refresh(recompose=True)
 
 
@@ -2340,7 +2672,7 @@ class ClaudeMonitor(App):
         Binding("d", "toggle_debug", "Debug"),
         Binding("slash", "start_search", "Search", show=False),
         Binding("escape", "clear_search", "Clear", show=False),
-        Binding("k", "kanban", "Kanban"),
+        Binding("v", "cycle_view", "View"),
         Binding("t", "toggle_theme", "Theme", show=False),
         Binding("R", "restart", "Restart", show=False),
         Binding("j", "cursor_down", "↓", show=False),
@@ -2582,6 +2914,15 @@ class ClaudeMonitor(App):
             sel = old_map[cr]
             if sel:
                 selected_key = sel.session_id
+            else:
+                # Cursor on a group header or spacer — find nearest session
+                for offset in range(1, len(old_map)):
+                    for adj in (cr + offset, cr - offset):
+                        if 0 <= adj < len(old_map) and old_map[adj]:
+                            selected_key = old_map[adj].session_id
+                            break
+                    if selected_key != self._selected_key:
+                        break
 
         self._flat_rows = flat
         saved_scroll_x = table.scroll_x
@@ -2600,6 +2941,10 @@ class ClaudeMonitor(App):
                 if gk not in self._group_counts:
                     gk = "ungrouped"
                 if gk != last_group:
+                    if last_group is not None:
+                        spacer = [""] * n_cols
+                        table.add_row(*spacer, key=f"__spacer__{gk}")
+                        row_map.append(None)
                     count = self._group_counts.get(gk, 1)
                     style = "dim" if gk == "ungrouped" else "bold cyan"
                     label = f"[{style}]▸ {gk}[/] [dim]({count})[/]"
@@ -2932,8 +3277,37 @@ class ClaudeMonitor(App):
             return
         self._do_rename(s, "action")
 
-    def action_kanban(self) -> None:
-        self.push_screen(KanbanView(self.sessions, by_group=self.show_groups))
+    _view_modes = ["rows", "kanban", "timeline"]
+    _current_view = "rows"
+
+    def action_cycle_view(self) -> None:
+        idx = self._view_modes.index(self._current_view)
+        next_mode = self._view_modes[(idx + 1) % len(self._view_modes)]
+        self._open_view(next_mode)
+
+    def _open_view(self, mode: str) -> None:
+        self._current_view = mode
+        if mode == "kanban":
+            def on_kanban_dismiss(result: str | None) -> None:
+                if result == "__next_view__":
+                    self._open_view("timeline")
+                else:
+                    self._current_view = "rows"
+            self.push_screen(
+                KanbanView(self.sessions, by_group=self.show_groups),
+                on_kanban_dismiss,
+            )
+        elif mode == "timeline":
+            def on_timeline_dismiss(result: str | None) -> None:
+                if result == "__next_view__":
+                    self._open_view("rows")
+                else:
+                    self._current_view = "rows"
+            self.push_screen(
+                TimelineView(self.sessions, by_group=self.show_groups),
+                on_timeline_dismiss,
+            )
+        # mode == "rows" → just stay on the default screen (no modal to push)
 
     def action_restart(self) -> None:
         self.exit(return_code=RESTART_EXIT_CODE)

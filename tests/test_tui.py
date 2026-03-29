@@ -15,6 +15,7 @@ from claude_monitor import (
     SessionMenu,
     ColumnPicker,
     KanbanView,
+    TimelineView,
     StatsBar,
     Session,
     ALL_COLUMNS,
@@ -120,7 +121,7 @@ class TestKeyBindings:
                 await pilot.pause()
                 await pilot.press("j")
                 await pilot.press("j")
-                await pilot.press("k")
+                await pilot.press("v")
                 await pilot.pause()
 
     async def test_refresh_keybinding(self, sample_sessions):
@@ -377,7 +378,7 @@ class TestKanban:
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                await pilot.press("k")
+                await pilot.press("v")
                 await pilot.pause()
                 assert isinstance(pilot.app.screen, KanbanView)
                 await pilot.press("escape")
@@ -392,7 +393,7 @@ class TestKanban:
         with _mock_sessions(sessions):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                await pilot.press("k")
+                await pilot.press("v")
                 await pilot.pause()
                 screen = pilot.app.screen
                 cards = screen.query(".kanban-card")
@@ -404,7 +405,7 @@ class TestKanban:
         with _mock_sessions([parent]):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                await pilot.press("k")
+                await pilot.press("v")
                 await pilot.pause()
                 cards = pilot.app.screen.query(".kanban-card")
                 assert len(cards) == 1
@@ -418,7 +419,7 @@ class TestKanban:
         with _mock_sessions(sessions):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                await pilot.press("k")
+                await pilot.press("v")
                 await pilot.pause()
                 screen = pilot.app.screen
                 start_col = screen._col
@@ -435,7 +436,7 @@ class TestKanban:
         with _mock_sessions([s]):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                await pilot.press("k")
+                await pilot.press("v")
                 await pilot.pause()
                 await pilot.press("enter")
                 await pilot.pause()
@@ -446,3 +447,55 @@ class TestKanban:
                 await pilot.press("escape")
                 await pilot.pause()
                 assert isinstance(pilot.app.screen, KanbanView)
+
+
+class TestTimeline:
+    async def test_timeline_opens_and_closes(self, sample_sessions):
+        with _mock_sessions(sample_sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                # v once → kanban, v again → timeline
+                await pilot.press("v")
+                await pilot.pause()
+                assert isinstance(pilot.app.screen, KanbanView)
+                await pilot.press("v")
+                await pilot.pause()
+                assert isinstance(pilot.app.screen, TimelineView)
+                await pilot.press("escape")
+                await pilot.pause()
+                assert not isinstance(pilot.app.screen, TimelineView)
+
+    async def test_timeline_shows_bars(self):
+        sessions = [
+            make_session(session_id="w1", title="Worker", status="working"),
+            make_session(session_id="i1", title="Idler", status="idle"),
+        ]
+        with _mock_sessions(sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("v")
+                await pilot.pause()
+                await pilot.press("v")
+                await pilot.pause()
+                bars = pilot.app.screen.query(".timeline-bar")
+                assert len(bars) == 2
+
+    async def test_view_cycle_full_loop(self, sample_sessions):
+        """v cycles: rows → kanban → timeline → rows."""
+        with _mock_sessions(sample_sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                # Start in rows
+                assert not isinstance(pilot.app.screen, (KanbanView, TimelineView))
+                # v → kanban
+                await pilot.press("v")
+                await pilot.pause()
+                assert isinstance(pilot.app.screen, KanbanView)
+                # v → timeline
+                await pilot.press("v")
+                await pilot.pause()
+                assert isinstance(pilot.app.screen, TimelineView)
+                # v → rows (back to default)
+                await pilot.press("v")
+                await pilot.pause()
+                assert not isinstance(pilot.app.screen, (KanbanView, TimelineView))

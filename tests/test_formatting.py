@@ -11,6 +11,8 @@ from claude_monitor import (
     format_compactions,
     format_cost,
     estimate_cost,
+    time_to_col,
+    generate_ticks,
 )
 
 
@@ -173,3 +175,62 @@ class TestEstimateCost:
 
     def test_zero_tokens(self):
         assert estimate_cost("claude-opus-4-6", 0, 0) == 0.0
+
+
+class TestTimeToCol:
+    def test_at_min(self):
+        assert time_to_col(1000, 1000, 100, 50) == 0
+
+    def test_at_max(self):
+        assert time_to_col(1100, 1000, 100, 50) == 49
+
+    def test_midpoint(self):
+        col = time_to_col(1050, 1000, 100, 100)
+        assert col == 50
+
+    def test_before_min(self):
+        assert time_to_col(900, 1000, 100, 50) == 0
+
+    def test_after_max(self):
+        assert time_to_col(1200, 1000, 100, 50) == 49
+
+    def test_zero_range(self):
+        assert time_to_col(1000, 1000, 0, 50) == 0
+
+    def test_zero_width(self):
+        assert time_to_col(1000, 1000, 100, 0) == 0
+
+
+class TestGenerateTicks:
+    def test_empty_range(self):
+        assert generate_ticks(1000, 1000, 100) == []
+
+    def test_hourly_ticks(self):
+        # 6-hour range → hourly ticks
+        t_min = 1743400000.0
+        t_max = t_min + 6 * 3600
+        ticks = generate_ticks(t_min, t_max, 120)
+        assert len(ticks) >= 2
+        # Labels should be time-based
+        for _, label in ticks:
+            assert any(c.isdigit() for c in label)
+
+    def test_daily_ticks(self):
+        # 5-day range → daily ticks
+        t_min = 1743400000.0
+        t_max = t_min + 5 * 86400
+        ticks = generate_ticks(t_min, t_max, 120)
+        assert len(ticks) >= 2
+
+    def test_no_overlap(self):
+        # Ticks should not overlap
+        t_min = 1743400000.0
+        t_max = t_min + 3 * 86400
+        ticks = generate_ticks(t_min, t_max, 100)
+        for i in range(len(ticks) - 1):
+            col_a, label_a = ticks[i]
+            col_b, _ = ticks[i + 1]
+            assert col_b - col_a >= len(label_a) + 2
+
+    def test_zero_width(self):
+        assert generate_ticks(1000, 2000, 0) == []
