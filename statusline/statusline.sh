@@ -322,6 +322,14 @@ fi
 echo "$(date '+%H:%M:%S') OK ctx=${remaining:-?} quota=${quota_used:-?} tokens=${tokens}" >> "$SL_LOG"
 
 # ──────────────────────────────────────────────────────────────────────
+# SECTION: Jumpback hint (only when installed)
+# ──────────────────────────────────────────────────────────────────────
+jumpback_hint=""
+if [ -x "$HOME/.local/bin/jumpback" ]; then
+  jumpback_hint="${DIM}⌃⇧Space → monitor${RST}"
+fi
+
+# ──────────────────────────────────────────────────────────────────────
 # SECTION: Render output
 # Two-line mini HUD. No truncation — terminal clips naturally.
 # Order (left to right): bar  %  indicator  metrics
@@ -337,6 +345,7 @@ echo "$(date '+%H:%M:%S') OK ctx=${remaining:-?} quota=${quota_used:-?} tokens=$
       line1="${line1}          "
     fi
     line1="${line1}   ${DIM}${tok_field}${RST}"
+    [ -n "$jumpback_hint" ] && line1="${line1}    ${jumpback_hint}"
     printf '%b\033[K\n' "$line1"
   else
     printf '\033[K\n'

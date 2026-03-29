@@ -301,6 +301,7 @@ def write_state(
     existing_state_entered_at = ""
     existing_pid = 0
     existing_tty = ""
+    existing_cwd = ""
     if local_file.exists():
         try:
             existing = json.loads(local_file.read_text())
@@ -312,6 +313,7 @@ def write_state(
             existing_state_entered_at = existing.get("state_entered_at", "")
             existing_pid = existing.get("pid", 0)
             existing_tty = existing.get("tty", "")
+            existing_cwd = existing.get("cwd", "")
         except (json.JSONDecodeError, OSError):
             pass
 
@@ -319,6 +321,24 @@ def write_state(
     title_source = existing_title_source
     title_updated_at = existing_title_updated_at
     started_at = existing_started_at or datetime.now().isoformat()
+
+    # Read session name from statusline (Claude Code writes .session_name
+    # to /tmp/claude-name-{sid} on every statusline render). This is the
+    # canonical name the user sees in the Claude Code UI.
+    statusline_name = ""
+    try:
+        name_file = Path(f"/tmp/claude-name-{session_id}")
+        if name_file.exists():
+            statusline_name = name_file.read_text().strip()
+    except OSError:
+        pass
+
+    if statusline_name and (
+        not title or (title_source == "statusline" and statusline_name != title)
+    ):
+        title = statusline_name
+        title_source = "statusline"
+        title_updated_at = datetime.now().isoformat()
 
     if event == "stop":
         resolved_transcript = transcript_path or find_transcript_path(session_id)
@@ -351,8 +371,9 @@ def write_state(
     else:
         state_entered_at = existing_state_entered_at
 
-    # Terminal title: best known name, falling back to cwd basename
-    display_name = title or (Path(cwd).name if cwd else "") or "Claude"
+    # Terminal title: prefer the statusline session name (matches Claude Code UI),
+    # then stored title, then cwd basename.
+    display_name = statusline_name or title or (Path(cwd).name if cwd else "") or "Claude"
 
     data = {
         "session_id": session_id,
@@ -373,10 +394,12 @@ def write_state(
 
     _atomic_write(local_file, json.dumps(data, indent=2) + "\n")
 
-    # Only touch TTY on state/title changes — writing escape sequences
-    # on every tool call corrupts the input buffer when background tasks
-    # fire hooks while the user is typing.
-    if state != existing_state or title != existing_title:
+    # Only touch TTY on state/title/display-name changes — writing escape
+    # sequences on every tool call corrupts the input buffer when background
+    # tasks fire hooks while the user is typing.
+    old_cwd_name = Path(existing_cwd).name if existing_cwd else ""
+    old_display = existing_title or old_cwd_name or "Claude"
+    if state != existing_state or display_name != old_display:
         set_terminal_title(tty, state, session_id, display_name)
 
     # On Stop, Claude overwrites our title with its auto-generated summary

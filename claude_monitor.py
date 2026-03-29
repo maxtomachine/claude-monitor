@@ -126,6 +126,7 @@ ALL_COLUMNS = {
 class SortMode(Enum):
     ACTIVITY = "activity"
     STATUS = "status"
+    ALPHA = "alpha"
     CONTEXT = "context"
     TOKENS = "tokens"
     COST = "cost"
@@ -138,8 +139,8 @@ class SortMode(Enum):
     def label(self) -> str:
         return {
             SortMode.ACTIVITY: "Last Active", SortMode.STATUS: "Status",
-            SortMode.CONTEXT: "Context %", SortMode.TOKENS: "Tokens",
-            SortMode.COST: "Cost",
+            SortMode.ALPHA: "A–Z", SortMode.CONTEXT: "Context %",
+            SortMode.TOKENS: "Tokens", SortMode.COST: "Cost",
         }[self]
 
 
@@ -558,14 +559,18 @@ def parse_sessions(include_archived: bool = False,
         except OSError:
             continue
 
-        is_archived = mtime < active_cutoff
-        if is_archived and not include_archived:
-            continue
-        if mtime < archive_cutoff:
-            continue
-
         t_rglob += time.perf_counter() - tg
         session_id = jsonl_path.stem
+
+        is_archived = mtime < active_cutoff
+        if is_archived and not include_archived:
+            if not _is_session_alive(session_id):
+                tg = time.perf_counter()
+                continue
+            is_archived = False
+        if mtime < archive_cutoff and not _is_session_alive(session_id):
+            tg = time.perf_counter()
+            continue
         idx = meta.get(session_id, {})
         project = idx.get("project", jsonl_path.parent.name.split("-")[-1] or "~")
 
@@ -834,6 +839,36 @@ def _is_session_alive(session_id: str, display_title: str = "") -> bool:
 
     _recently_resumed.pop(session_id, None)
     return False
+
+
+def _heal_hook_state(session_id: str) -> None:
+    """Update hook state with correct PID/TTY from the PID file when the hook's
+    own PID is stale. This happens when a session is resumed — the PID file gets
+    a new entry but the hook state retains the old dead PID."""
+    _refresh_pid_map()
+    if session_id not in _pid_map or _pid_map[session_id] is None:
+        return
+    live_pid = _pid_map[session_id]
+    try:
+        tty = subprocess.check_output(
+            ["ps", "-p", str(live_pid), "-o", "tty="],
+            text=True, timeout=2,
+        ).strip()
+    except (subprocess.SubprocessError, OSError):
+        return
+    if not tty or tty == "??":
+        return
+    state_file = HOOK_STATE_DIR / f"{session_id}.json"
+    try:
+        data = json.loads(state_file.read_text()) if state_file.exists() else {}
+        data["pid"] = live_pid
+        data["tty"] = tty
+        state_file.write_text(json.dumps(data, indent=2) + "\n")
+        # Invalidate hook state cache
+        _hook_state_cache.pop(session_id, None)
+        mlog("heal", "hook_state_updated", sid=session_id[:12], pid=live_pid, tty=tty)
+    except (OSError, json.JSONDecodeError):
+        pass
 
 
 _hook_state_cache: dict[str, tuple[float, dict]] = {}  # session_id -> (mtime, data)
@@ -1157,6 +1192,8 @@ def sort_sessions(sessions: list[Session], mode: SortMode) -> list[Session]:
         return sorted(sessions, key=lambda s: s.last_activity, reverse=True)
     elif mode == SortMode.STATUS:
         return sorted(sessions, key=lambda s: (STATUS_PRIORITY.get(s.status, 9), -s.last_activity))
+    elif mode == SortMode.ALPHA:
+        return sorted(sessions, key=lambda s: (s.title or s.session_id).lower())
     elif mode == SortMode.CONTEXT:
         return sorted(sessions, key=lambda s: s.context_pct)
     elif mode == SortMode.TOKENS:
@@ -1509,9 +1546,59 @@ def session_has_debrief(transcript_path: str) -> bool:
     return b"/debrief" in tail or b'"skill":"debrief"' in tail
 
 
-def _send_to_terminal_session(session: Session, text: str) -> bool:
-    """Raise the session's terminal and type text + Enter."""
-    return _raise_window_by_content(session, then_text=text)
+def _send_to_terminal_session(session: Session, text: str, return_to_monitor: bool = False) -> bool:
+    """Send text to the session's terminal. If return_to_monitor is True,
+    raise the monitor window back after typing."""
+    ok = _raise_window_by_content(session, then_text=text)
+    if ok and return_to_monitor:
+        import threading
+        def _bounce_back():
+            time.sleep(0.5)
+            _raise_monitor_window()
+            mlog("jump", "bounce_back", sid=session.session_id[:12])
+        threading.Thread(target=_bounce_back, daemon=True).start()
+    return ok
+
+
+def _raise_monitor_window() -> None:
+    """Raise the Claude Monitor window via its ·MONITOR title marker.
+    Mirrors the jumpback script: activate() first for cross-space, then
+    AXRaise for same-space, then Window menu click as fallback."""
+    script = '''(() => {
+        const se = Application("System Events");
+        const app = Application("Ghostty");
+        let titles;
+        try { titles = app.windows.name(); } catch(e) { return "no_app"; }
+        const match = titles.find(t => t && t.includes("·MONITOR"));
+        if (!match) return "no_match";
+
+        app.activate();
+        delay(0.1);
+        const proc = se.processes.byName("ghostty");
+
+        try {
+            const w = proc.windows.byName(match);
+            w.actions["AXRaise"].perform();
+            try { w.attributes["AXMain"].value = true; } catch(e) {}
+            return "ok";
+        } catch(e) {}
+
+        try {
+            const menu = proc.menuBars[0].menuBarItems.byName("Window").menus[0];
+            const items = menu.menuItems.name();
+            const item = items.find(n => n && n.includes("·MONITOR"));
+            if (item) { menu.menuItems.byName(item).click(); return "ok"; }
+        } catch(e) {}
+
+        return "no_raise";
+    })()'''
+    try:
+        subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", script],
+            capture_output=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        pass
 
 
 def _close_terminal_tab(session: Session) -> bool:
@@ -1684,7 +1771,7 @@ class KanbanView(ModalScreen[str | None]):
         Binding("d", "passthrough('toggle_debug')", "Debug", show=False),
         Binding("t", "passthrough('toggle_theme')", "Theme", show=False),
         Binding("R", "passthrough('restart')", "Restart", show=False),
-        Binding("n", "rename_selected", "Rename", show=False),
+        Binding("n", "edit_name", "Rename", show=False),
         Binding("g", "toggle_groups", "Group", show=False),
     ]
     CSS = """
@@ -1768,28 +1855,33 @@ class KanbanView(ModalScreen[str | None]):
         self._col = next((i for i, c in enumerate(self._grid) if c), 0)
         self._row = 0
 
-    def _card_text(self, col_idx: int, body: str) -> str:
+    def _card_text(self, col_idx: int, body: str, session: Session | None = None) -> str:
         key = self._columns[col_idx][0]
-        if not self._by_group and key == "working":
+        is_working = (key == "working") or (session and session.status == "working")
+        if is_working:
             icon = SPINNER_FRAMES[self._spin_idx % len(SPINNER_FRAMES)]
             return f"[bold][#D97757]{icon}[/#D97757] {body}"
         icon = STATUS_ICON.get(key, "·")
         return f"[bold]{icon} {body}"
 
     def on_mount(self) -> None:
-        wc = self._working_col
-        if wc >= 0 and self._grid[wc]:
+        has_working = any(
+            s.status == "working"
+            for col in self._grid for s, _ in col
+        )
+        if has_working:
             self.set_interval(0.132, self._tick_spinner)
 
     def _tick_spinner(self) -> None:
         self._spin_idx += 1
-        wc = self._working_col
-        for row_idx, (_, body) in enumerate(self._grid[wc]):
-            try:
-                card = self.query_one(f"#kc-{wc}-{row_idx}", Static)
-                card.update(self._card_text(wc, body))
-            except Exception:
-                pass
+        for col_idx, col in enumerate(self._grid):
+            for row_idx, (s, body) in enumerate(col):
+                if s.status == "working":
+                    try:
+                        card = self.query_one(f"#kc-{col_idx}-{row_idx}", Static)
+                        card.update(self._card_text(col_idx, body, session=s))
+                    except Exception:
+                        pass
 
     def compose(self) -> ComposeResult:
         mode = "Groups" if self._by_group else "Status"
@@ -1806,10 +1898,10 @@ class KanbanView(ModalScreen[str | None]):
                         with Vertical(classes="kanban-cards"):
                             if not self._grid[col_idx]:
                                 yield Static("[dim]—[/]", classes="kanban-empty")
-                            for row_idx, (_, body) in enumerate(self._grid[col_idx]):
+                            for row_idx, (s, body) in enumerate(self._grid[col_idx]):
                                 sel = col_idx == self._col and row_idx == self._row
                                 classes = "kanban-card -selected" if sel else "kanban-card"
-                                yield Static(self._card_text(col_idx, body),
+                                yield Static(self._card_text(col_idx, body, session=s),
                                              classes=classes,
                                              id=f"kc-{col_idx}-{row_idx}")
         yield Footer()
@@ -1857,11 +1949,10 @@ class KanbanView(ModalScreen[str | None]):
         if name in ("refresh", "toggle_archived"):
             self._rebuild_grid()
 
-    def action_rename_selected(self) -> None:
+    def action_edit_name(self) -> None:
         col = self._grid[self._col] if 0 <= self._col < len(self._grid) else []
         if 0 <= self._row < len(col):
-            s, _ = col[self._row]
-            self.app._do_rename(s, "kanban")  # type: ignore[attr-defined]
+            self.app.action_edit_name()  # type: ignore[attr-defined]
 
     def action_toggle_groups(self) -> None:
         self._by_group = not self._by_group
@@ -1877,7 +1968,10 @@ class KanbanView(ModalScreen[str | None]):
 
 class RenamePrompt(ModalScreen[str | None]):
     """Inline text prompt for editing a session name."""
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "submit", "Submit"),
+    ]
     CSS = """
     RenamePrompt { align: center middle; }
     #rename-box {
@@ -1895,12 +1989,17 @@ class RenamePrompt(ModalScreen[str | None]):
         with Vertical(id="rename-box"):
             yield Label("Rename session [dim](sends /rename <name>)[/]")
             yield Input(value=self._current, id="rename-input")
+        yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#rename-input", Input).focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         name = event.value.strip()
+        self.dismiss(name or None)
+
+    def action_submit(self) -> None:
+        name = self.query_one("#rename-input", Input).value.strip()
         self.dismiss(name or None)
 
     def action_cancel(self) -> None:
@@ -1911,6 +2010,7 @@ class SessionMenu(ModalScreen[str]):
     BINDINGS = [
         Binding("escape", "dismiss_menu", "Close"),
         Binding("q", "dismiss_menu", "Close", show=False),
+        Binding("enter", "select", "Select"),
     ]
     CSS = """
     SessionMenu { background: rgba(0, 0, 0, 0.5); align: center middle; }
@@ -1933,7 +2033,8 @@ class SessionMenu(ModalScreen[str]):
             options.append(Option("▶   Resume session", id="resume"))
         else:
             options.append(Option("🖥   Jump to terminal", id="jump"))
-            options.append(Option("🏷   Send /rename", id="rename"))
+            options.append(Option("▶   Resume in new tab", id="resume"))
+            options.append(Option("🏷   Rename…", id="edit_name"))
         options.append(Option(f"📋  Copy session ID ({s.session_id[:8]}…)", id="copy_id"))
         if s.remote_url:
             options.append(Option("🔗  Open remote control", id="remote"))
@@ -1949,9 +2050,16 @@ class SessionMenu(ModalScreen[str]):
         with Vertical(id="menu-container"):
             yield Label(f"[bold]{s.title}[/]", id="menu-title")
             yield OptionList(*options, id="menu-options")
+        yield Footer()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         self.dismiss(event.option.id)
+
+    def action_select(self) -> None:
+        ol = self.query_one("#menu-options", OptionList)
+        if ol.highlighted is not None:
+            opt = ol.get_option_at_index(ol.highlighted)
+            self.dismiss(opt.id)
 
     def action_dismiss_menu(self) -> None:
         self.dismiss("close")
@@ -1962,8 +2070,8 @@ class ColumnPicker(ModalScreen[list[str]]):
         Binding("escape", "done", "Done"),
         Binding("enter", "toggle_col", "Toggle"),
         Binding("space", "toggle_col", "Toggle", show=False),
-        Binding("shift+up", "move_up", "Move Up", show=False),
-        Binding("shift+down", "move_down", "Move Down", show=False),
+        Binding("shift+up", "move_up", "↑ Move"),
+        Binding("shift+down", "move_down", "↓ Move"),
     ]
     CSS = """
     ColumnPicker { background: rgba(0, 0, 0, 0.5); align: center middle; }
@@ -1990,7 +2098,7 @@ class ColumnPicker(ModalScreen[list[str]]):
         with Vertical(id="picker-container"):
             yield Label("[bold]Column Picker[/]", id="picker-title")
             yield OptionList(*options, id="picker-list")
-            yield Label("[dim]Enter/Space toggle · Shift+↑↓ reorder · Esc done[/]", id="picker-hint")
+        yield Footer()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         """Enter key on OptionList fires this — use it to toggle."""
@@ -2181,6 +2289,7 @@ class StatsBar(Horizontal):
         yield Label("", id="stats-total-cost")
         yield Label("", id="stats-sort")
         yield Input(placeholder="🔍 filter...", id="search-bar")
+        yield Label("[dim]/ search[/]", id="search-hint")
 
     def update_stats(self, sessions: list[Session], sort_mode: SortMode) -> None:
         working = sum(1 for s in sessions if s.status == "working")
@@ -2211,6 +2320,7 @@ class ClaudeMonitor(App):
         background: transparent; display: none;
     }
     #search-bar:focus { display: block; background: $boost; }
+    #search-hint { width: auto; dock: right; }
     #session-table { height: 1fr; }
     #detail-panel {
         height: auto; max-height: 35%; min-height: 5; padding: 0 2;
@@ -2228,21 +2338,24 @@ class ClaudeMonitor(App):
         Binding("c", "pick_columns", "Columns"),
         # Binding("l", "statusline_config", "Statusline"),  # TODO: re-enable after statusline merge
         Binding("d", "toggle_debug", "Debug"),
-        Binding("slash", "start_search", "Search"),
+        Binding("slash", "start_search", "Search", show=False),
         Binding("escape", "clear_search", "Clear", show=False),
         Binding("k", "kanban", "Kanban"),
         Binding("t", "toggle_theme", "Theme", show=False),
         Binding("R", "restart", "Restart", show=False),
         Binding("j", "cursor_down", "↓", show=False),
-        Binding("n", "rename_selected", "Rename", show=False),
-        Binding("e", "edit_name", "Edit", show=False),
+        Binding("n", "edit_name", "Rename"),
         Binding("g", "toggle_groups", "Group"),
+        Binding("pageup", "prev_group", "PgUp", show=False, priority=True),
+        Binding("pagedown", "next_group", "PgDn", show=False, priority=True),
+        Binding("home", "table_home", "Home", show=False, priority=True),
+        Binding("end", "table_end", "End", show=False, priority=True),
     ]
 
-    sort_mode: reactive[SortMode] = reactive(SortMode.ACTIVITY)
+    sort_mode: reactive[SortMode] = reactive(SortMode.ALPHA)
     show_subagents: reactive[bool] = reactive(False)
     show_archived: reactive[bool] = reactive(False)
-    show_groups: reactive[bool] = reactive(False)
+    show_groups: reactive[bool] = reactive(True)
     debug_logging: reactive[bool] = reactive(True)  # ON by default
     sessions: list[Session] = []
     _flat_rows: list[Session] = []
@@ -2270,7 +2383,7 @@ class ClaudeMonitor(App):
             "[dim]↑↓/jk navigate · [bold]Enter[/] menu · "
             "[bold]s[/] sort · [bold]a[/] agents · "
             "[bold]z[/] all · [bold]c[/] columns · "
-            "[bold]d[/] debug · [bold]/[/] search[/]",
+            "[bold]n[/] rename · [bold]d[/] debug[/]",
             id="detail-panel"
         )
         yield Footer()
@@ -2524,11 +2637,12 @@ class ClaudeMonitor(App):
                         mlog("DIVERGE", "alive_but_unfound",
                              sid=s.session_id[:12], title=s.title,
                              candidates=_resolve_match_candidates(s))
+                        # Heal stale hook state — find the real PID/TTY
+                        _heal_hook_state(s.session_id)
                         self.notify(
-                            "Session running but window not found — "
-                            "title marker may be stale. Try /rename in that "
-                            "session, or check other spaces manually.",
-                            timeout=8, severity="warning",
+                            f"Window not found for {s.title[:20]}. "
+                            "Press Enter → Resume to open in a new tab.",
+                            timeout=6, severity="warning",
                         )
                     else:
                         ok = resume_session(s)
@@ -2537,8 +2651,8 @@ class ClaudeMonitor(App):
                         else:
                             self.notify("Could not find or resume session", timeout=4)
                 mlog("menu", "jump_result", sid=s.session_id[:12], success=ok)
-            elif action == "rename":
-                self._do_rename(s, "menu")
+            elif action == "edit_name":
+                self.action_edit_name()
             elif action == "resume":
                 ok = resume_session(s)
                 if ok:
@@ -2705,6 +2819,7 @@ class ClaudeMonitor(App):
     def action_start_search(self) -> None:
         search_bar = self.query_one("#search-bar", Input)
         search_bar.display = True
+        self.query_one("#search-hint", Label).display = False
         search_bar.focus()
 
     def action_clear_search(self) -> None:
@@ -2716,6 +2831,7 @@ class ClaudeMonitor(App):
         search_bar = self.query_one("#search-bar", Input)
         search_bar.value = ""
         search_bar.display = False
+        self.query_one("#search-hint", Label).display = True
         self._filter = ""
         self.refresh_sessions()
         self.query_one("#session-table", DataTable).focus()
@@ -2768,7 +2884,7 @@ class ClaudeMonitor(App):
         def on_submit(name: str | None) -> None:
             if not name:
                 return
-            ok = _send_to_terminal_session(s, f"/rename {name}")
+            ok = _send_to_terminal_session(s, f"/rename {name}", return_to_monitor=True)
             if ok:
                 # Optimistically update the hook state so the monitor shows
                 # the new name immediately (before the hook catches up).
@@ -2828,6 +2944,42 @@ class ClaudeMonitor(App):
         prefs["theme"] = self.theme
         save_prefs(prefs)
         self.notify(f"Theme: {self.theme.replace('textual-', '')}", timeout=2)
+
+    def _group_header_indices(self) -> list[int]:
+        """Return row indices of group header rows in _row_map."""
+        return [i for i, s in enumerate(self._row_map) if s is None]
+
+    def action_prev_group(self) -> None:
+        if not self.show_groups:
+            return
+        table = self.query_one("#session-table", DataTable)
+        cur = table.cursor_row or 0
+        headers = self._group_header_indices()
+        prev = [i for i in headers if i < cur]
+        if prev:
+            table.move_cursor(row=prev[-1])
+        elif headers:
+            table.move_cursor(row=headers[-1])
+
+    def action_next_group(self) -> None:
+        if not self.show_groups:
+            return
+        table = self.query_one("#session-table", DataTable)
+        cur = table.cursor_row or 0
+        headers = self._group_header_indices()
+        nxt = [i for i in headers if i > cur]
+        if nxt:
+            table.move_cursor(row=nxt[0])
+        elif headers:
+            table.move_cursor(row=headers[0])
+
+    def action_table_home(self) -> None:
+        table = self.query_one("#session-table", DataTable)
+        table.move_cursor(row=0)
+
+    def action_table_end(self) -> None:
+        table = self.query_one("#session-table", DataTable)
+        table.move_cursor(row=table.row_count - 1)
 
     def action_pick_columns(self) -> None:
         picker = ColumnPicker(self._visible_cols, self._col_order)
