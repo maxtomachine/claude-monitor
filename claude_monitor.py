@@ -2032,6 +2032,7 @@ class TimelineView(ModalScreen[str | None]):
         Binding("up", "move('up')", "↑", show=False),
         Binding("down", "move('down')", "↓", show=False),
         Binding("enter", "select", "Select"),
+        Binding("p", "cycle_range", "Period"),
         Binding("r", "passthrough('refresh')", "Refresh"),
         Binding("z", "passthrough('toggle_archived')", "All", show=False),
         Binding("d", "passthrough('toggle_debug')", "Debug", show=False),
@@ -2039,6 +2040,8 @@ class TimelineView(ModalScreen[str | None]):
         Binding("R", "passthrough('restart')", "Restart", show=False),
         Binding("n", "edit_name", "Rename", show=False),
         Binding("g", "toggle_groups", "Group", show=False),
+        Binding("pageup", "prev_group", "PgUp", show=False, priority=True),
+        Binding("pagedown", "next_group", "PgDn", show=False, priority=True),
     ]
     CSS = """
     TimelineView { background: $background; }
@@ -2050,6 +2053,7 @@ class TimelineView(ModalScreen[str | None]):
     .timeline-group { height: 1; }
     .timeline-bar { height: 1; }
     .timeline-bar.-selected { background: $boost; }
+    .timeline-spacer { height: 1; }
     """
 
     def __init__(self, sessions: list[Session], by_group: bool = False) -> None:
@@ -2057,8 +2061,10 @@ class TimelineView(ModalScreen[str | None]):
         self._spin_idx = 0
         self._sel = 0
         self._by_group = by_group
+        self._time_range = "week"
         self._flat: list[Session] = []
         self._rows: list[Session | str | None] = []  # Session, group-key str, or None
+        self._group_first_sel: list[int] = []  # _sel indices of first session per group
         self._t_min = 0.0
         self._t_max = 0.0
         self._range_secs = 0.0
@@ -2069,20 +2075,27 @@ class TimelineView(ModalScreen[str | None]):
         active = [s for s in sessions if not s.is_subagent]
         now = time.time()
 
+        # Filter by time range
+        lookback = 7 * 86400 if self._time_range == "week" else 30 * 86400
+        cutoff = now - lookback
+        active = [s for s in active if s.last_activity >= cutoff or s.created >= cutoff]
+
         if not active:
             self._flat = []
             self._rows = []
-            self._t_min = now - 60
+            self._group_first_sel = []
+            self._t_min = now - lookback
             self._t_max = now
-            self._range_secs = 60
+            self._range_secs = lookback
             return
 
-        self._t_min = min(s.created for s in active)
+        self._t_min = now - lookback
         self._t_max = now
         self._range_secs = max(self._t_max - self._t_min, 60)
 
         flat: list[Session] = []
         rows: list[Session | str | None] = []
+        group_first_sel: list[int] = []
 
         if self._by_group:
             groups: dict[str, list[Session]] = {}
@@ -2095,8 +2108,13 @@ class TimelineView(ModalScreen[str | None]):
                     if k != "ungrouped":
                         ung.extend(groups.pop(k))
             keys = sorted(groups, key=lambda k: (k == "ungrouped", k.lower()))
+            first_group = True
             for gk in keys:
+                if not first_group:
+                    rows.append(None)  # spacer between groups
+                first_group = False
                 rows.append(gk)  # group header
+                group_first_sel.append(len(flat))
                 for s in groups[gk]:
                     rows.append(s)
                     flat.append(s)
@@ -2107,6 +2125,7 @@ class TimelineView(ModalScreen[str | None]):
 
         self._flat = flat
         self._rows = rows
+        self._group_first_sel = group_first_sel
         if flat:
             self._sel = min(self._sel, len(flat) - 1)
 
@@ -2123,27 +2142,37 @@ class TimelineView(ModalScreen[str | None]):
 
         color = STATUS_COLOR.get(s.status, "grey50")
         chars = [" "] * cw
+        # marks[i] = (char, markup_color) for overlay symbols
+        marks: dict[int, tuple[str, str]] = {}
+
         for i in range(start, end):
             chars[i] = "█"
 
+        # Start marker
+        marks[start] = ("▸", "dim")
+
+        # Compaction events — space evenly along the bar
+        if s.compact_count > 0:
+            bar_len = end - start
+            for ci in range(s.compact_count):
+                pos = start + int((ci + 1) * bar_len / (s.compact_count + 1))
+                if start < pos < end - 1:
+                    marks[pos] = ("◆", "dim")
+
+        # Working spinner at trailing edge
         if s.status == "working":
             frame = SPINNER_FRAMES[self._spin_idx % len(SPINNER_FRAMES)]
-            chars[min(end - 1, cw - 1)] = frame
-            bar_str = ""
-            for i, c in enumerate(chars):
-                if i == min(end - 1, cw - 1):
-                    bar_str += f"[#D97757]{c}[/#D97757]"
-                elif start <= i < end:
-                    bar_str += f"[{color}]{c}[/]"
-                else:
-                    bar_str += c
-        else:
-            bar_str = ""
-            for i, c in enumerate(chars):
-                if start <= i < end:
-                    bar_str += f"[{color}]{c}[/]"
-                else:
-                    bar_str += c
+            marks[min(end - 1, cw - 1)] = (frame, "#D97757")
+
+        bar_str = ""
+        for i, c in enumerate(chars):
+            if i in marks:
+                mc, mc_color = marks[i]
+                bar_str += f"[{mc_color}]{mc}[/{mc_color}]"
+            elif start <= i < end:
+                bar_str += f"[{color}]{c}[/]"
+            else:
+                bar_str += c
 
         return bar_str
 
@@ -2154,7 +2183,12 @@ class TimelineView(ModalScreen[str | None]):
             style = "dim" if row_entry == "ungrouped" else "bold cyan"
             return f"[{style}]▸ {row_entry}[/] [dim]({count})[/]"
         s = row_entry
-        name = _escape_markup(s.title[:LABEL_WIDTH - 2])
+        display_name = s.title
+        if self._by_group:
+            gk = _group_key(s.title)
+            if display_name != gk and display_name.startswith(gk):
+                display_name = display_name[len(gk):]
+        name = _escape_markup(display_name[:LABEL_WIDTH - 2])
         padded = name.ljust(LABEL_WIDTH - 2)
         bar = self._render_bar(s)
         return f"  {padded}{bar}"
@@ -2166,7 +2200,8 @@ class TimelineView(ModalScreen[str | None]):
             self._chart_width = 80
         self._chart_width = max(self._chart_width, 20)
 
-        mode = "Groups" if self._by_group else "All"
+        group_label = "Groups" if self._by_group else "All"
+        range_label = self._time_range.capitalize()
         ticks = generate_ticks(self._t_min, self._t_max, self._chart_width)
 
         # Build axis line
@@ -2187,7 +2222,7 @@ class TimelineView(ModalScreen[str | None]):
 
         with Vertical(id="timeline-outer"):
             yield Label(
-                f"[bold]Timeline · {mode}[/]  [dim]↑↓ nav · enter select · v next view · esc close[/]",
+                f"[bold]Timeline · {group_label} · {range_label}[/]  [dim]↑↓ nav · enter select · p period · v next view · esc close[/]",
                 id="timeline-title",
             )
             yield Static(f"[dim]{axis_line}[/]", id="timeline-axis")
@@ -2200,7 +2235,10 @@ class TimelineView(ModalScreen[str | None]):
                     widget_idx = 0
                     session_idx = 0
                     for entry in self._rows:
-                        if isinstance(entry, str):
+                        if entry is None:
+                            yield Static("", classes="timeline-spacer",
+                                         id=f"tl-sp-{widget_idx}")
+                        elif isinstance(entry, str):
                             yield Static(
                                 self._render_row(entry),
                                 classes="timeline-group",
@@ -2226,9 +2264,8 @@ class TimelineView(ModalScreen[str | None]):
     def _tick_spinner(self) -> None:
         self._spin_idx += 1
         widget_idx = 0
-        session_idx = 0
         for entry in self._rows:
-            if isinstance(entry, str):
+            if entry is None or isinstance(entry, str):
                 widget_idx += 1
                 continue
             if entry.status == "working":
@@ -2238,7 +2275,6 @@ class TimelineView(ModalScreen[str | None]):
                 except Exception:
                     pass
             widget_idx += 1
-            session_idx += 1
 
     def _refresh_selection(self) -> None:
         for w in self.query(".timeline-bar"):
@@ -2246,7 +2282,7 @@ class TimelineView(ModalScreen[str | None]):
         widget_idx = 0
         session_idx = 0
         for entry in self._rows:
-            if isinstance(entry, str):
+            if entry is None or isinstance(entry, str):
                 widget_idx += 1
                 continue
             if session_idx == self._sel:
@@ -2292,6 +2328,24 @@ class TimelineView(ModalScreen[str | None]):
         self._by_group = not self._by_group
         self.app.show_groups = self._by_group  # type: ignore[attr-defined]
         self._rebuild()
+
+    def action_cycle_range(self) -> None:
+        self._time_range = "month" if self._time_range == "week" else "week"
+        self._rebuild()
+
+    def action_prev_group(self) -> None:
+        if not self._by_group or not self._group_first_sel:
+            return
+        prev = [i for i in self._group_first_sel if i < self._sel]
+        self._sel = prev[-1] if prev else self._group_first_sel[-1]
+        self._refresh_selection()
+
+    def action_next_group(self) -> None:
+        if not self._by_group or not self._group_first_sel:
+            return
+        nxt = [i for i in self._group_first_sel if i > self._sel]
+        self._sel = nxt[0] if nxt else self._group_first_sel[0]
+        self._refresh_selection()
 
     def _rebuild(self) -> None:
         self._populate(getattr(self.app, "sessions", []))
@@ -2693,6 +2747,7 @@ class ClaudeMonitor(App):
     _flat_rows: list[Session] = []
     _row_map: list["Session | None"] = []
     _group_counts: dict[str, int] = {}
+    _group_header_rows: list[int] = []
     _selected_key: str | None = None
     _visible_cols: list[str] = []
     _col_order: list[str] = []
@@ -2701,6 +2756,7 @@ class ClaudeMonitor(App):
     _dismiss_failed: set[str] = set()  # sids where dismiss failed (can't reach terminal)
     _prev_statuses: dict[str, str] = {}  # sid -> previous status (for transition logging)
     _spin_idx: int = 0
+    _last_cursor_row: int = 0
 
     def notify(self, message, *, timeout: float | None = 5, **kwargs):
         """Override to log every toast notification."""
@@ -2910,19 +2966,12 @@ class ClaudeMonitor(App):
         old_map = self._row_map
         cr = table.cursor_row
         selected_key = self._selected_key
+        saved_row_idx = cr
         if cr is not None and cr < len(old_map):
             sel = old_map[cr]
             if sel:
                 selected_key = sel.session_id
-            else:
-                # Cursor on a group header or spacer — find nearest session
-                for offset in range(1, len(old_map)):
-                    for adj in (cr + offset, cr - offset):
-                        if 0 <= adj < len(old_map) and old_map[adj]:
-                            selected_key = old_map[adj].session_id
-                            break
-                    if selected_key != self._selected_key:
-                        break
+                saved_row_idx = None  # will restore by key instead
 
         self._flat_rows = flat
         saved_scroll_x = table.scroll_x
@@ -2932,6 +2981,7 @@ class ClaudeMonitor(App):
         n_cols = len(self._visible_cols)
         last_group = None
         row_map: list[Session | None] = []
+        group_header_rows: list[int] = []
         for s, cells in rendered:
             if self.show_groups:
                 gk = _group_key(s.title)
@@ -2949,6 +2999,7 @@ class ClaudeMonitor(App):
                     style = "dim" if gk == "ungrouped" else "bold cyan"
                     label = f"[{style}]▸ {gk}[/] [dim]({count})[/]"
                     header = [label] + [""] * (n_cols - 1)
+                    group_header_rows.append(len(row_map))
                     table.add_row(*header, key=f"__group__{gk}")
                     row_map.append(None)
                     last_group = gk
@@ -2957,12 +3008,15 @@ class ClaudeMonitor(App):
             table.add_row(*cells, key=s.session_id)
             row_map.append(s)
         self._row_map = row_map
+        self._group_header_rows = group_header_rows
 
-        if selected_key:
+        if saved_row_idx is None and selected_key:
             for idx, s in enumerate(row_map):
                 if s and s.session_id == selected_key:
                     table.move_cursor(row=idx)
                     break
+        elif saved_row_idx is not None:
+            table.move_cursor(row=min(saved_row_idx, len(row_map) - 1))
 
         table.scroll_to(saved_scroll_x, saved_scroll_y, animate=False)
         self.query_one(StatsBar).update_stats(self.sessions, self.sort_mode)
@@ -3123,9 +3177,26 @@ class ClaudeMonitor(App):
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if not (event.row_key and event.row_key.value):
             return
-        s = next((s for s in self._flat_rows if s.session_id == event.row_key.value), None)
+        key = event.row_key.value
+        # Skip spacer rows — move in the same direction the user was going
+        if key.startswith("__spacer__"):
+            table = self.query_one("#session-table", DataTable)
+            cr = table.cursor_row
+            if cr is not None:
+                direction = 1 if cr >= self._last_cursor_row else -1
+                target = cr + direction
+                if 0 <= target < table.row_count:
+                    table.move_cursor(row=target)
+            return
+        # Group headers are valid for PgUp/PgDn navigation
+        if key.startswith("__group__"):
+            self._last_cursor_row = table.cursor_row or 0 if (table := self.query_one("#session-table", DataTable)) else 0
+            return
+        s = next((s for s in self._flat_rows if s.session_id == key), None)
         if not s:
             return
+        table = self.query_one("#session-table", DataTable)
+        self._last_cursor_row = table.cursor_row or 0
 
         icon, color = STATUS_DISPLAY.get(s.status, ("?", "white"))
         header = f"[bold]{s.title}[/] [{color}]{icon}[/]"
@@ -3320,8 +3391,8 @@ class ClaudeMonitor(App):
         self.notify(f"Theme: {self.theme.replace('textual-', '')}", timeout=2)
 
     def _group_header_indices(self) -> list[int]:
-        """Return row indices of group header rows in _row_map."""
-        return [i for i, s in enumerate(self._row_map) if s is None]
+        """Return row indices of group header rows (not spacers)."""
+        return list(self._group_header_rows)
 
     def action_prev_group(self) -> None:
         if not self.show_groups:
