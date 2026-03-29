@@ -108,19 +108,19 @@ TEXT_GERUND_PATTERNS = [
 ]
 
 ALL_COLUMNS = {
-    "status":    {"label": "Status",   "default": True},
     "session":   {"label": "Session",  "default": True},
-    "project":   {"label": "Project",  "default": True},
-    "model":     {"label": "Model",    "default": True},
-    "context":   {"label": "Context",  "default": True},
-    "compact":   {"label": "Compacts", "default": True},
-    "tokens":    {"label": "Tokens",   "default": True},
-    "cost":      {"label": "Cost",     "default": True},
+    "status":    {"label": "Status",   "default": True},
+    "duration":  {"label": "Duration", "default": True},
+    "doing":     {"label": "Doing",    "default": True},
+    "project":   {"label": "Project",  "default": False},
+    "model":     {"label": "Model",    "default": False},
+    "context":   {"label": "Context",  "default": False},
+    "compact":   {"label": "Compacts", "default": False},
+    "tokens":    {"label": "Tokens",   "default": False},
+    "cost":      {"label": "Cost",     "default": False},
     "mcp":       {"label": "MCP",      "default": False},
     "msgs":      {"label": "Msgs",     "default": False},
-    "duration":  {"label": "Duration", "default": False},
-    "active":    {"label": "Active",   "default": True},
-    "doing":     {"label": "Doing",    "default": True},
+    "active":    {"label": "Active",   "default": False},
 }
 
 
@@ -1512,7 +1512,7 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
             // "strategy" from matching "strategy-patterns".
             function nameMatch(title, cand) {{
                 // Strip emoji prefix and ·sid8 suffix to get bare name
-                let bare = title.replace(/^[^\w]*\s*/, "").replace(/\s*·[0-9a-f]{{8}}$/, "").trim();
+                let bare = title.replace(/^[^\\w]*\\s*/, "").replace(/\\s*·[0-9a-f]{{8}}$/, "").trim();
                 return bare === cand;
             }}
             for (let i = 1; i < candidates.length; i++) {{
@@ -2039,11 +2039,11 @@ class KanbanView(ModalScreen[str | None]):
         Binding("enter", "select", "Select"),
         # Mirrored from main view
         Binding("r", "passthrough('refresh')", "Refresh"),
-        Binding("z", "passthrough('toggle_archived')", "All", show=False),
+        Binding("h", "passthrough('toggle_archived')", "History", show=False),
         Binding("d", "passthrough('toggle_debug')", "Debug", show=False),
         Binding("t", "passthrough('toggle_theme')", "Theme", show=False),
         Binding("R", "passthrough('restart')", "Restart", show=False),
-        Binding("n", "edit_name", "Rename", show=False),
+        Binding("n", "edit_name", "Name", show=False),
         Binding("g", "toggle_groups", "Group", show=False),
     ]
     CSS = """
@@ -2251,11 +2251,11 @@ class TimelineView(ModalScreen[str | None]):
         Binding("enter", "select", "Select"),
         Binding("p", "cycle_range", "Period"),
         Binding("r", "passthrough('refresh')", "Refresh"),
-        Binding("z", "passthrough('toggle_archived')", "All", show=False),
+        Binding("h", "passthrough('toggle_archived')", "History", show=False),
         Binding("d", "passthrough('toggle_debug')", "Debug", show=False),
         Binding("t", "passthrough('toggle_theme')", "Theme", show=False),
         Binding("R", "passthrough('restart')", "Restart", show=False),
-        Binding("n", "edit_name", "Rename", show=False),
+        Binding("n", "edit_name", "Name", show=False),
         Binding("g", "toggle_groups", "Group", show=False),
         Binding("pageup", "prev_group", "PgUp", show=False, priority=True),
         Binding("pagedown", "next_group", "PgDn", show=False, priority=True),
@@ -2916,6 +2916,28 @@ class StatuslineConfig(ModalScreen[dict[str, bool] | None]):
 # ── Main App ──────────────────────────────────────────────────────────────────
 
 
+class DosFooter(Static):
+    """DOS-style hotkey bar: the key letter is highlighted within the word."""
+
+    DEFAULT_CSS = """
+    DosFooter { dock: bottom; height: 1; background: $panel; padding: 0 1; }
+    """
+
+    def __init__(self, items: list[tuple[str, str]], **kwargs) -> None:
+        # items: [(key, label), ...] where key is the highlighted letter
+        parts = []
+        for key, label in items:
+            idx = label.lower().find(key.lower())
+            if idx >= 0:
+                before = label[:idx]
+                letter = label[idx]
+                after = label[idx + 1:]
+                parts.append(f"{before}[bold #D97757]{letter}[/]{after}")
+            else:
+                parts.append(f"[bold #D97757]{key}[/] {label}")
+        super().__init__("  ".join(parts), **kwargs)
+
+
 class StatsBar(Horizontal):
     def compose(self) -> ComposeResult:
         yield Label("", id="stats-working")
@@ -2970,7 +2992,7 @@ class ClaudeMonitor(App):
         Binding("r", "refresh", "Refresh"),
         Binding("s", "cycle_sort", "Sort"),
         Binding("a", "toggle_subagents", "Agents"),
-        Binding("z", "toggle_archived", "All"),
+        Binding("h", "toggle_archived", "History"),
         Binding("c", "pick_columns", "Columns"),
         # Binding("l", "statusline_config", "Statusline"),  # TODO: re-enable after statusline merge
         Binding("d", "toggle_debug", "Debug", show=False),
@@ -2980,7 +3002,7 @@ class ClaudeMonitor(App):
         Binding("t", "toggle_theme", "Theme", show=False),
         Binding("R", "restart", "Restart", show=False),
         Binding("j", "cursor_down", "↓", show=False),
-        Binding("n", "edit_name", "Rename"),
+        Binding("n", "edit_name", "Name"),
         Binding("g", "toggle_groups", "Group"),
         Binding("pageup", "prev_group", "PgUp", show=False, priority=True),
         Binding("pagedown", "next_group", "PgDn", show=False, priority=True),
@@ -3018,13 +3040,14 @@ class ClaudeMonitor(App):
         yield StatsBar()
         yield DataTable(id="session-table", cursor_type="row")
         yield Static(
-            "[dim]↑↓/jk navigate · [bold]Enter[/] menu · "
-            "[bold]s[/] sort · [bold]a[/] agents · "
-            "[bold]z[/] all · [bold]c[/] columns · "
-            "[bold]n[/] rename[/]",
+            "",
             id="detail-panel"
         )
-        yield Footer()
+        yield DosFooter([
+            ("Q", "Quit"), ("R", "Refresh"), ("S", "Sort"), ("A", "Agents"),
+            ("H", "History"), ("C", "Columns"), ("V", "View"), ("N", "Name"),
+            ("G", "Group"),
+        ])
 
     def on_mount(self) -> None:
         t0 = time.perf_counter()

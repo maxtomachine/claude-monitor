@@ -286,10 +286,10 @@ class TestArchived:
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
                 assert pilot.app.show_archived is False
-                await pilot.press("z")
+                await pilot.press("h")
                 await pilot.pause()
                 assert pilot.app.show_archived is True
-                await pilot.press("z")
+                await pilot.press("h")
                 await pilot.pause()
                 assert pilot.app.show_archived is False
 
@@ -311,7 +311,7 @@ class TestArchived:
                 await pilot.pause()
                 table = pilot.app.query_one("#session-table", DataTable)
                 before = table.row_count
-                await pilot.press("z")
+                await pilot.press("h")
                 await pilot.pause()
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count > before  # archived session appeared
