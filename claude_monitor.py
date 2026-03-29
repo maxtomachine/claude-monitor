@@ -631,6 +631,64 @@ def parse_sessions(include_archived: bool = False,
             sessions.append(session)
         tg = time.perf_counter()
 
+    # Second pass: discover alive sessions from PID files that have no transcript
+    _refresh_pid_map()
+    found_sids = {s.session_id for s in sessions}
+    n_orphans = 0
+    for sid, pid in _pid_map.items():
+        if pid is None or sid in found_sids:
+            continue
+        # Read the PID file for metadata
+        pid_file = SESSIONS_DIR / f"{pid}.json"
+        try:
+            pdata = json.loads(pid_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if pdata.get("kind") != "interactive":
+            continue
+        # Build title from best available source
+        hook = read_hook_state(sid)
+        sl_name = _read_session_cache("name", sid)
+        title = (
+            pdata.get("name")
+            or sl_name
+            or (hook.get("title") if hook else "")
+            or "Claude"
+        )
+        status = "idle"
+        if hook:
+            hs = hook.get("state", "")
+            if hs == "thinking":
+                status = "working"
+            elif hs == "approval":
+                status = "needs_approval"
+            elif hs == "exited":
+                status = "closed"
+        created = pdata.get("startedAt", 0) / 1000.0
+        updated = pdata.get("updatedAt", 0) / 1000.0
+        cwd = pdata.get("cwd", "")
+        project = Path(cwd).name if cwd and Path(cwd).name != Path.home().name else "~"
+        session = Session(
+            session_id=sid,
+            project=project,
+            title=title,
+            status=status,
+            model="",
+            model_id="",
+            cost=0.0,
+            tokens_in=0,
+            tokens_out=0,
+            context_pct=0,
+            message_count=0,
+            last_activity=updated or created or now,
+            created=created or now,
+            cwd=cwd,
+            transcript_path="",
+            status_name=sl_name or title,
+        )
+        sessions.append(session)
+        n_orphans += 1
+
     if _PERF:
         print(f"[perf]   parse_sessions: rglob iter: {t_rglob*1000:.1f}ms", file=sys.stderr)
         print(f"[perf]   parse_sessions: build_session: {t_build*1000:.1f}ms "
@@ -638,6 +696,8 @@ def parse_sessions(include_archived: bool = False,
         print(f"[perf]   parse_sessions: count_compactions: {t_compact*1000:.1f}ms", file=sys.stderr)
         print(f"[perf]   parse_sessions: subagents: {t_subagent*1000:.1f}ms", file=sys.stderr)
         print(f"[perf]   parse_sessions: _is_session_alive checks: {n_alive_check}", file=sys.stderr)
+        if n_orphans:
+            print(f"[perf]   parse_sessions: PID-file orphans added: {n_orphans}", file=sys.stderr)
     return sessions
 
 
