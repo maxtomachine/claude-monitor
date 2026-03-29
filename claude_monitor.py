@@ -8,6 +8,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -841,6 +842,76 @@ def _is_session_alive(session_id: str, display_title: str = "") -> bool:
     return False
 
 
+def _reconcile_sessions() -> None:
+    """Periodic sweep: heal stale hook states, refresh names from /tmp, and
+    re-stamp terminal titles with ·sid8 markers. PID files are the authority
+    for what's running — everything else is healed to match."""
+    _refresh_pid_map()
+    healed = stamped = 0
+    for sid, pid in _pid_map.items():
+        if pid is None:
+            continue
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            continue
+        # Heal hook state PID/TTY
+        try:
+            tty = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "tty="],
+                text=True, timeout=2,
+            ).strip()
+        except (subprocess.SubprocessError, OSError):
+            continue
+        if not tty or tty == "??":
+            continue
+        state_file = HOOK_STATE_DIR / f"{sid}.json"
+        try:
+            data = json.loads(state_file.read_text()) if state_file.exists() else {}
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        if data.get("pid") != pid or data.get("tty") != tty:
+            data["pid"] = pid
+            data["tty"] = tty
+            data["session_id"] = sid
+            try:
+                state_file.write_text(json.dumps(data, indent=2) + "\n")
+                _hook_state_cache.pop(sid, None)
+                healed += 1
+            except OSError:
+                pass
+        # Refresh title from /tmp name file (statusline writes this)
+        title = data.get("title", "")
+        name_file = Path(f"/tmp/claude-name-{sid}")
+        try:
+            sl_name = name_file.read_text().strip() if name_file.exists() else ""
+        except OSError:
+            sl_name = ""
+        if sl_name and (not title or title == "Claude"):
+            title = sl_name
+            data["title"] = title
+            data["title_source"] = "statusline"
+            data["session_id"] = sid
+            try:
+                state_file.write_text(json.dumps(data, indent=2) + "\n")
+                _hook_state_cache.pop(sid, None)
+                healed += 1
+            except OSError:
+                pass
+        # Re-stamp terminal title
+        tty_path = Path(f"/dev/{tty}")
+        if tty_path.exists():
+            sid8 = sid[:8]
+            name = title[:31] + "\u2026" if len(title) > 32 else (title or "Claude")
+            try:
+                with open(tty_path, "w") as f:
+                    f.write(f"\x1b]2;\u2733 {name} \u00b7{sid8}\x07")
+                stamped += 1
+            except OSError:
+                pass
+    mlog("reconcile", "sweep", healed=healed, stamped=stamped)
+
+
 def _heal_hook_state(session_id: str) -> None:
     """Update hook state with correct PID/TTY from the PID file when the hook's
     own PID is stale. This happens when a session is resumed — the PID file gets
@@ -1436,8 +1507,16 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
             const sidWindow = allTitles.find(t => t && t.includes(sid8));
             let nameWindow = null;
             let nameCand = null;
+            // Extract the session name from a title like "✳ name ·sid8"
+            // and do exact match against the candidate. This prevents
+            // "strategy" from matching "strategy-patterns".
+            function nameMatch(title, cand) {{
+                // Strip emoji prefix and ·sid8 suffix to get bare name
+                let bare = title.replace(/^[^\w]*\s*/, "").replace(/\s*·[0-9a-f]{{8}}$/, "").trim();
+                return bare === cand;
+            }}
             for (let i = 1; i < candidates.length; i++) {{
-                const m = allTitles.find(t => t && t.includes(candidates[i]));
+                const m = allTitles.find(t => t && nameMatch(t, candidates[i]));
                 if (m) {{ nameWindow = m; nameCand = candidates[i]; break; }}
             }}
 
@@ -1562,8 +1641,8 @@ def _send_to_terminal_session(session: Session, text: str, return_to_monitor: bo
 
 def _raise_monitor_window() -> None:
     """Raise the Claude Monitor window via its ·MONITOR title marker.
-    Mirrors the jumpback script: activate() first for cross-space, then
-    AXRaise for same-space, then Window menu click as fallback."""
+    Uses Window menu click (works cross-space) without activate() to
+    avoid raising all Ghostty windows."""
     script = '''(() => {
         const se = Application("System Events");
         const app = Application("Ghostty");
@@ -1572,22 +1651,22 @@ def _raise_monitor_window() -> None:
         const match = titles.find(t => t && t.includes("·MONITOR"));
         if (!match) return "no_match";
 
-        app.activate();
-        delay(0.1);
         const proc = se.processes.byName("ghostty");
 
-        try {
-            const w = proc.windows.byName(match);
-            w.actions["AXRaise"].perform();
-            try { w.attributes["AXMain"].value = true; } catch(e) {}
-            return "ok";
-        } catch(e) {}
-
+        // Try Window menu click — works cross-space without activate()
         try {
             const menu = proc.menuBars[0].menuBarItems.byName("Window").menus[0];
             const items = menu.menuItems.name();
             const item = items.find(n => n && n.includes("·MONITOR"));
             if (item) { menu.menuItems.byName(item).click(); return "ok"; }
+        } catch(e) {}
+
+        // Fallback: AXRaise (same-space only)
+        try {
+            const w = proc.windows.byName(match);
+            w.actions["AXRaise"].perform();
+            try { w.attributes["AXMain"].value = true; } catch(e) {}
+            return "ok";
         } catch(e) {}
 
         return "no_raise";
@@ -2894,7 +2973,7 @@ class ClaudeMonitor(App):
         Binding("z", "toggle_archived", "All"),
         Binding("c", "pick_columns", "Columns"),
         # Binding("l", "statusline_config", "Statusline"),  # TODO: re-enable after statusline merge
-        Binding("d", "toggle_debug", "Debug"),
+        Binding("d", "toggle_debug", "Debug", show=False),
         Binding("slash", "start_search", "Search", show=False),
         Binding("escape", "clear_search", "Clear", show=False),
         Binding("v", "cycle_view", "View"),
@@ -2942,7 +3021,7 @@ class ClaudeMonitor(App):
             "[dim]↑↓/jk navigate · [bold]Enter[/] menu · "
             "[bold]s[/] sort · [bold]a[/] agents · "
             "[bold]z[/] all · [bold]c[/] columns · "
-            "[bold]n[/] rename · [bold]d[/] debug[/]",
+            "[bold]n[/] rename[/]",
             id="detail-panel"
         )
         yield Footer()
@@ -2967,10 +3046,14 @@ class ClaudeMonitor(App):
             except OSError:
                 pass
         t0 = _perf("on_mount: /dev/tty title write", t0)
+        # One-time sweep: heal stale hook states and re-stamp terminal titles
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            threading.Thread(target=_reconcile_sessions, daemon=True).start()
         self.refresh_sessions()
         t0 = _perf("on_mount: first refresh_sessions (schedule)", t0)
         self.set_interval(3, self.refresh_sessions)
         self.set_interval(0.132, self._tick_spinner)
+        self.set_interval(30, self._periodic_reconcile)
         self.set_interval(600, self._audit_stats)  # Every 10 minutes
         self.query_one("#session-table", DataTable).focus()
         mlog("app", "started")
@@ -2988,6 +3071,10 @@ class ClaudeMonitor(App):
                 title="jumpback", timeout=6,
             )
         _perf("on_mount: launch_count save_prefs + notify", t0)
+
+    def _periodic_reconcile(self) -> None:
+        """Run the reconciliation sweep in a background thread every 30s."""
+        threading.Thread(target=_reconcile_sessions, daemon=True).start()
 
     def _tick_spinner(self) -> None:
         """Advance spinner frame and update only working-status cells."""
@@ -3428,6 +3515,7 @@ class ClaudeMonitor(App):
         _pid_map_ts = 0  # Force fresh PID map
         _scan_cache.clear()  # Force re-read all transcripts
         _subagent_cache.clear()
+        threading.Thread(target=_reconcile_sessions, daemon=True).start()
         # Don't clear _refresh_pending — that would dispatch a second worker
         # concurrently mutating the module-global caches. refresh_sessions()
         # queues a follow-up refresh if one is already in flight.

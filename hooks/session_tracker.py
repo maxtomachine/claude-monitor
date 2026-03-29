@@ -399,7 +399,7 @@ def write_state(
     # tasks fire hooks while the user is typing.
     old_cwd_name = Path(existing_cwd).name if existing_cwd else ""
     old_display = existing_title or old_cwd_name or "Claude"
-    if state != existing_state or display_name != old_display:
+    if state != existing_state or display_name != old_display or event == "session_start":
         set_terminal_title(tty, state, session_id, display_name)
 
     # On Stop, Claude overwrites our title with its auto-generated summary
