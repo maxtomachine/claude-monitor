@@ -1803,6 +1803,29 @@ def _derive_cwd_from_transcript(transcript_path: str) -> str:
     return decoded
 
 
+def _auto_rename_after_resume(old_name: str) -> None:
+    """Wait for the resumed session to start, then send /rename to restore
+    the old session's name. Types into the frontmost terminal."""
+    time.sleep(4)  # Wait for claude --resume to fully start
+    jxa = f"""(() => {{
+        const se = Application("System Events");
+        const proc = se.processes.byName("ghostty");
+        if (!proc.frontmost()) return "not_front";
+        se.keystroke("/rename {old_name}");
+        delay(0.1);
+        se.keyCode(36);
+        return "ok";
+    }})()"""
+    try:
+        result = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", jxa],
+            capture_output=True, text=True, timeout=8,
+        )
+        mlog("resume", "auto_rename", name=old_name, result=result.stdout.strip())
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
 def resume_session(session: Session) -> bool:
     """Resume a Claude session in a new Ghostty tab (falls back to Terminal.app)."""
     cmd = f"claude --resume {session.session_id}"
@@ -1864,6 +1887,13 @@ def resume_session(session: Session) -> bool:
              via=out, rc=result.returncode)
         if result.returncode == 0 and out in ("Ghostty", "iTerm2", "Terminal"):
             _recently_resumed[session.session_id] = time.time()
+            # Auto-rename the new session to match the old name
+            if session.title and session.title not in ("Claude", ""):
+                threading.Thread(
+                    target=_auto_rename_after_resume,
+                    args=(session.title,),
+                    daemon=True,
+                ).start()
             return True
         return False
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
