@@ -2264,7 +2264,11 @@ class KanbanView(ModalScreen[str | None]):
                 if name.startswith(prefix + sep):
                     name = name[len(prefix):]
                     break
-        title = _escape_markup(name.replace("-", "-\n"))
+        # Break on hyphens for wrapping, but preserve leading hyphen on line 1
+        if name.startswith("-"):
+            title = _escape_markup("-" + name[1:].replace("-", "-\n"))
+        else:
+            title = _escape_markup(name.replace("-", "-\n"))
         activity = generate_activity(s)
         body = f"{title}[/]"
         if activity:
