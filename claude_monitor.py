@@ -1436,10 +1436,7 @@ def render_row(s: Session, visible_cols: list[str], spin_idx: int = 0) -> list[s
                 else:
                     cells.append(activity_escaped)
             else:
-                if not _get_api_key():
-                    cells.append("[dim #D97757]Add API key for haiku summaries — press K[/]")
-                else:
-                    cells.append("[dim]—[/]")
+                cells.append("[dim]—[/]")
 
     # Dim all cells for archived sessions
     if s.status == "archived":
@@ -3713,6 +3710,9 @@ class ClaudeMonitor(App):
         elif s.last_assistant_text:
             preview = _escape_markup(s.last_assistant_text[:400])
             detail_parts.append(f"[italic]{preview}[/italic]")
+
+        if not _get_api_key():
+            detail_parts.append("[dim #D97757]Press K to add API key for haiku session summaries[/]")
 
         self.query_one("#detail-panel", Static).update("\n".join(detail_parts))
 
