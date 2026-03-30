@@ -37,6 +37,8 @@ SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 PREFS_PATH = Path.home() / ".claude" / "monitor-prefs.json"
 DOING_MAX_WIDTH = 40
 RESTART_EXIT_CODE = 99
+_update_available: str = ""  # Commit summary when remote is ahead
+_REPO_DIR = Path(__file__).resolve().parent
 
 MODEL_PRICING = {
     "claude-opus-4-6": (15.0, 75.0),
@@ -902,6 +904,33 @@ def _is_session_alive(session_id: str, display_title: str = "") -> bool:
     return False
 
 
+def _check_for_updates() -> None:
+    """Fetch from origin and check if we're behind. Sets _update_available."""
+    global _update_available
+    try:
+        subprocess.run(
+            ["git", "fetch", "origin", "main", "--quiet"],
+            cwd=_REPO_DIR, capture_output=True, timeout=15,
+        )
+        result = subprocess.run(
+            ["git", "rev-list", "HEAD..origin/main", "--count"],
+            cwd=_REPO_DIR, capture_output=True, text=True, timeout=5,
+        )
+        count = int(result.stdout.strip() or "0")
+        if count > 0:
+            log_result = subprocess.run(
+                ["git", "log", "origin/main", f"-{min(count, 3)}", "--pretty=%s"],
+                cwd=_REPO_DIR, capture_output=True, text=True, timeout=5,
+            )
+            changes = log_result.stdout.strip().split("\n")
+            _update_available = changes[0] if changes else "New update available"
+            mlog("update", "available", commits=count, latest=_update_available)
+        else:
+            _update_available = ""
+    except (subprocess.SubprocessError, OSError, ValueError):
+        pass
+
+
 def _reconcile_sessions() -> None:
     """Periodic sweep: heal stale hook states, refresh names from /tmp, and
     re-stamp terminal titles with ·sid8 markers. PID files are the authority
@@ -1407,7 +1436,10 @@ def render_row(s: Session, visible_cols: list[str], spin_idx: int = 0) -> list[s
                 else:
                     cells.append(activity_escaped)
             else:
-                cells.append("[dim]—[/]")
+                if not _get_api_key():
+                    cells.append("[dim #D97757]Add API key for haiku summaries — press K[/]")
+                else:
+                    cells.append("[dim]—[/]")
 
     # Dim all cells for archived sessions
     if s.status == "archived":
@@ -2115,6 +2147,50 @@ def generate_ticks(t_min: float, t_max: float, chart_width: int) -> list[tuple[i
             last_col = col
         t += interval
     return ticks
+
+
+class ApiKeyPrompt(ModalScreen[str | None]):
+    """Prompt for an Anthropic API key."""
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "submit", "Save"),
+    ]
+    DEFAULT_CSS = """
+    ApiKeyPrompt { align: center middle; }
+    #apikey-box { width: 70; height: auto; padding: 1 2; background: $panel; border: solid $primary; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="apikey-box"):
+            yield Label("[bold]Anthropic API Key[/]")
+            yield Label("[dim]Used for session summaries and title generation. "
+                        "Stored at ~/claude-monitor/.api_key[/]")
+            yield Input(
+                placeholder="sk-ant-...",
+                password=True,
+                id="apikey-input",
+            )
+        yield Footer()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._save(event.value.strip())
+
+    def action_submit(self) -> None:
+        self._save(self.query_one("#apikey-input", Input).value.strip())
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _save(self, key: str) -> None:
+        if not key:
+            self.dismiss(None)
+            return
+        key_dir = Path.home() / "claude-monitor"
+        key_dir.mkdir(exist_ok=True)
+        key_file = key_dir / ".api_key"
+        key_file.write_text(key + "\n")
+        key_file.chmod(0o600)
+        self.dismiss(key)
 
 
 class KanbanView(ModalScreen[str | None]):
@@ -3011,6 +3087,7 @@ class DosFooter(Static):
 
     DEFAULT_CSS = """
     DosFooter { dock: bottom; height: 1; background: $panel; padding: 0 1; }
+    #update-banner { height: 1; background: #2a1f14; display: none; padding: 0 2; }
     """
 
     def __init__(self, items: list[tuple[str, str]], **kwargs) -> None:
@@ -3086,6 +3163,7 @@ class ClaudeMonitor(App):
         Binding("c", "pick_columns", "Columns"),
         # Binding("l", "statusline_config", "Statusline"),  # TODO: re-enable after statusline merge
         Binding("d", "toggle_debug", "Debug", show=False),
+        Binding("K", "setup_api_key", "API Key", show=False),
         Binding("slash", "start_search", "Search", show=False),
         Binding("escape", "clear_search", "Clear", show=False),
         Binding("v", "cycle_view", "View"),
@@ -3128,6 +3206,7 @@ class ClaudeMonitor(App):
     def compose(self) -> ComposeResult:
         yield Header()
         yield StatsBar()
+        yield Static("", id="update-banner")
         yield DataTable(id="session-table", cursor_type="row")
         yield Static(
             "",
@@ -3167,7 +3246,10 @@ class ClaudeMonitor(App):
         self.set_interval(3, self.refresh_sessions)
         self.set_interval(0.132, self._tick_spinner)
         self.set_interval(30, self._periodic_reconcile)
+        self.set_interval(600, self._check_updates)
         self.set_interval(600, self._audit_stats)  # Every 10 minutes
+        # Initial update check after a brief delay
+        self.set_timer(5, self._check_updates)
         self.query_one("#session-table", DataTable).focus()
         mlog("app", "started")
         t0 = _perf("on_mount: set_interval + focus + mlog", t0)
@@ -3188,6 +3270,43 @@ class ClaudeMonitor(App):
     def _periodic_reconcile(self) -> None:
         """Run the reconciliation sweep in a background thread every 30s."""
         threading.Thread(target=_reconcile_sessions, daemon=True).start()
+
+    def _check_updates(self) -> None:
+        """Check for upstream updates in a background thread."""
+        def _worker():
+            _check_for_updates()
+            if _update_available:
+                self.call_from_thread(self._show_update_banner)
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _show_api_key_hint(self) -> None:
+        """Show a one-time hint about setting up an API key."""
+        self.notify(
+            "No API key configured — session summaries disabled.\n"
+            "Add key: echo 'sk-ant-...' > ~/claude-monitor/.api_key",
+            timeout=10,
+        )
+
+    def action_setup_api_key(self) -> None:
+        """Open the API key setup prompt."""
+        def _on_result(key: str | None) -> None:
+            if key:
+                self.notify(f"API key saved ({key[:12]}...)", timeout=4)
+            else:
+                self.notify("API key setup cancelled", timeout=3)
+        self.push_screen(ApiKeyPrompt(), callback=_on_result)
+
+    def _show_update_banner(self) -> None:
+        """Show a persistent update banner below the stats bar."""
+        try:
+            banner = self.query_one("#update-banner", Static)
+            banner.update(
+                f"[bold #D97757]⬆ Update:[/] {_escape_markup(_update_available)}"
+                "  [dim]Press Shift+R to update[/]"
+            )
+            banner.display = True
+        except Exception:
+            pass
 
     def _tick_spinner(self) -> None:
         """Advance spinner frame and update only working-status cells."""
@@ -3753,6 +3872,11 @@ class ClaudeMonitor(App):
         # mode == "rows" → just stay on the default screen (no modal to push)
 
     def action_restart(self) -> None:
+        if _update_available:
+            subprocess.run(
+                ["git", "pull", "--ff-only"],
+                cwd=_REPO_DIR, capture_output=True, timeout=15,
+            )
         self.exit(return_code=RESTART_EXIT_CODE)
 
     def action_toggle_theme(self) -> None:
