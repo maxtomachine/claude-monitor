@@ -1543,13 +1543,15 @@ def _resolve_match_candidates(session: Session) -> list[str]:
     # substring-matches any window title containing the username.
     if cwd_name and cwd_name == Path.home().name:
         cwd_name = ""
-    for name in [
-        _read_session_cache("name", session.session_id),
-        (read_hook_state(session.session_id) or {}).get("title", ""),
-        session.status_name,
-        session.title,
-        cwd_name,
-    ]:
+    hook = read_hook_state(session.session_id) or {}
+    hook_title = hook.get("title", "")
+    sl_name = _read_session_cache("name", session.session_id)
+    # User-set titles are most reliable; statusline name can be stale after rename
+    if hook.get("title_source") == "user":
+        name_order = [hook_title, sl_name, session.status_name, session.title, cwd_name]
+    else:
+        name_order = [sl_name, hook_title, session.status_name, session.title, cwd_name]
+    for name in name_order:
         if name and name not in candidates and name not in ("Claude Code", "~"):
             candidates.append(name)
     return candidates
@@ -3814,7 +3816,13 @@ class ClaudeMonitor(App):
                     data["title_source"] = "user"
                     data["title_updated_at"] = datetime.now().isoformat()
                     state_path.write_text(json.dumps(data, indent=2) + "\n")
+                    _hook_state_cache.pop(s.session_id, None)
                 except (OSError, json.JSONDecodeError):
+                    pass
+                # Also update the statusline name file so jump candidates stay in sync
+                try:
+                    Path(f"/tmp/claude-name-{s.session_id}").write_text(name)
+                except OSError:
                     pass
                 self.notify(f"Renamed → {name}", timeout=3)
                 self.refresh_sessions()
