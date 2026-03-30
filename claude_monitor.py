@@ -2254,8 +2254,15 @@ class KanbanView(ModalScreen[str | None]):
         self._columns: list[tuple[str, str, str]] = []
         self._populate_grid(sessions)
 
-    def _make_body(self, s: Session) -> str:
-        title = _escape_markup(s.title.replace("-", "-\n"))
+    def _make_body(self, s: Session, group_key: str = "") -> str:
+        name = s.title
+        if group_key and self._by_group and name != group_key:
+            prefix = group_key
+            for sep in ("-", "_", "/", " ", "."):
+                if name.startswith(prefix + sep):
+                    name = name[len(prefix):]
+                    break
+        title = _escape_markup(name.replace("-", "-\n"))
         activity = generate_activity(s)
         body = f"{title}[/]"
         if activity:
@@ -2278,7 +2285,7 @@ class KanbanView(ModalScreen[str | None]):
                         ung.extend(groups.pop(k))
             keys = sorted(groups, key=lambda k: (k == "ungrouped", k.lower()))
             self._columns = [(k, k, "cyan") for k in keys]
-            self._grid = [[(s, self._make_body(s)) for s in groups[k]] for k in keys]
+            self._grid = [[(s, self._make_body(s, group_key=k)) for s in groups[k]] for k in keys]
             self._working_col = -1
         else:
             self._columns = list(KANBAN_COLUMNS)
