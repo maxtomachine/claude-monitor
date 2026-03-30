@@ -1737,30 +1737,33 @@ def _raise_monitor_window() -> None:
     avoid raising all Ghostty windows."""
     script = '''(() => {
         const se = Application("System Events");
-        const app = Application("Ghostty");
-        let titles;
-        try { titles = app.windows.name(); } catch(e) { return "no_app"; }
-        const match = titles.find(t => t && t.includes("·MONITOR"));
-        if (!match) return "no_match";
+        for (const appName of ["Ghostty", "iTerm2", "Terminal"]) {
+            let app, titles;
+            try {
+                app = Application(appName);
+                titles = app.windows.name();
+            } catch(e) { continue; }
+            const match = titles.find(t => t && t.includes("·MONITOR"));
+            if (!match) continue;
 
-        const proc = se.processes.byName("ghostty");
+            const proc = se.processes.byName(appName);
 
-        // Try Window menu click — works cross-space without activate()
-        try {
-            const menu = proc.menuBars[0].menuBarItems.byName("Window").menus[0];
-            const items = menu.menuItems.name();
-            const item = items.find(n => n && n.includes("·MONITOR"));
-            if (item) { menu.menuItems.byName(item).click(); return "ok"; }
-        } catch(e) {}
+            // Try Window menu click — works cross-space without activate()
+            try {
+                const menu = proc.menuBars[0].menuBarItems.byName("Window").menus[0];
+                const items = menu.menuItems.name();
+                const item = items.find(n => n && n.includes("·MONITOR"));
+                if (item) { menu.menuItems.byName(item).click(); return "ok"; }
+            } catch(e) {}
 
-        // Fallback: AXRaise (same-space only)
-        try {
-            const w = proc.windows.byName(match);
-            w.actions["AXRaise"].perform();
-            try { w.attributes["AXMain"].value = true; } catch(e) {}
-            return "ok";
-        } catch(e) {}
-
+            // Fallback: AXRaise (same-space only)
+            try {
+                const w = proc.windows.byName(match);
+                w.actions["AXRaise"].perform();
+                try { w.attributes["AXMain"].value = true; } catch(e) {}
+                return "ok";
+            } catch(e) {}
+        }
         return "no_raise";
     })()'''
     try:
@@ -1841,8 +1844,8 @@ def _auto_rename_after_resume(old_name: str) -> None:
     time.sleep(4)  # Wait for claude --resume to fully start
     jxa = f"""(() => {{
         const se = Application("System Events");
-        const proc = se.processes.byName("ghostty");
-        if (!proc.frontmost()) return "not_front";
+        const front = se.processes.whose({{frontmost: true}});
+        if (front.length === 0) return "no_front";
         se.keystroke("/rename {old_name}");
         delay(0.1);
         se.keyCode(36);
@@ -3748,6 +3751,7 @@ class ClaudeMonitor(App):
         _scan_cache.clear()  # Force re-read all transcripts
         _subagent_cache.clear()
         threading.Thread(target=_reconcile_sessions, daemon=True).start()
+        self._check_updates()
         # Don't clear _refresh_pending — that would dispatch a second worker
         # concurrently mutating the module-global caches. refresh_sessions()
         # queues a follow-up refresh if one is already in flight.
