@@ -3278,6 +3278,7 @@ class ClaudeMonitor(App):
         """Check for upstream updates in a background thread."""
         def _worker():
             _check_for_updates()
+            mlog("update", "check_done", available=_update_available or "(none)")
             if _update_available:
                 self.call_from_thread(self._show_update_banner)
         threading.Thread(target=_worker, daemon=True).start()
@@ -3876,11 +3877,10 @@ class ClaudeMonitor(App):
         # mode == "rows" → just stay on the default screen (no modal to push)
 
     def action_restart(self) -> None:
-        if _update_available:
-            subprocess.run(
-                ["git", "pull", "--ff-only"],
-                cwd=_REPO_DIR, capture_output=True, timeout=15,
-            )
+        subprocess.run(
+            ["git", "pull", "--ff-only"],
+            cwd=_REPO_DIR, capture_output=True, timeout=15,
+        )
         self.exit(return_code=RESTART_EXIT_CODE)
 
     def action_toggle_theme(self) -> None:
