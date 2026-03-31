@@ -1837,27 +1837,94 @@ def _derive_cwd_from_transcript(transcript_path: str) -> str:
     return decoded
 
 
-def _auto_rename_after_resume(old_name: str) -> None:
-    """Wait for the resumed session to start, then send /rename to restore
-    the old session's name. Types into the frontmost terminal."""
-    time.sleep(4)  # Wait for claude --resume to fully start
+def _snapshot_window_sids() -> set[str]:
+    """Return the set of ·sid8 markers currently visible in terminal windows."""
+    jxa = """(() => {
+        const sidRe = /\u00b7([0-9a-f]{8})/;
+        const sids = [];
+        for (const appName of ["Ghostty", "iTerm2", "Terminal"]) {
+            try {
+                const titles = Application(appName).windows.name();
+                for (const t of titles) {
+                    const m = t && t.match(sidRe);
+                    if (m) sids.push(m[1]);
+                }
+            } catch(e) {}
+        }
+        return JSON.stringify(sids);
+    })()"""
+    try:
+        result = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", jxa],
+            capture_output=True, text=True, timeout=5,
+        )
+        return set(json.loads(result.stdout.strip() or "[]"))
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+        return set()
+
+
+def _auto_rename_after_resume(old_name: str, prior_sids: set[str]) -> None:
+    """Wait for the resumed session's window to appear, then send /rename.
+
+    Polls for a new ·sid8 marker (one not in prior_sids) — that's the
+    resumed session's hook-written title. Raises that specific window
+    before typing, so focus loss during the wait doesn't misfire.
+    """
+    deadline = time.time() + 15
+    new_sid8 = None
+    while time.time() < deadline:
+        time.sleep(0.8)
+        current = _snapshot_window_sids()
+        fresh = current - prior_sids
+        if fresh:
+            new_sid8 = next(iter(fresh))
+            break
+    if not new_sid8:
+        mlog("DIVERGE", "auto_rename_no_new_window",
+             name=old_name, prior_sids=sorted(prior_sids))
+        return
+
+    name_json = json.dumps(old_name)
+    sid_marker = f"\u00b7{new_sid8}"
     jxa = f"""(() => {{
         const se = Application("System Events");
-        const front = se.processes.whose({{frontmost: true}});
-        if (front.length === 0) return "no_front";
-        se.keystroke("/rename {old_name}");
-        delay(0.1);
-        se.keyCode(36);
-        return "ok";
+        const marker = "{sid_marker}";
+        const renameText = "/rename " + {name_json};
+        for (const appName of ["Ghostty", "iTerm2", "Terminal"]) {{
+            let titles;
+            try {{ titles = Application(appName).windows.name(); }}
+            catch(e) {{ continue; }}
+            const target = titles.find(t => t && t.includes(marker));
+            if (!target) continue;
+            Application(appName).activate();
+            delay(0.1);
+            const proc = se.processes.byName(appName);
+            try {{
+                const w = proc.windows.byName(target);
+                w.actions["AXRaise"].perform();
+                try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
+            }} catch(e) {{
+                const menu = proc.menuBars[0].menuBarItems.byName("Window").menus[0];
+                const item = menu.menuItems.name().find(n => n && n.includes(marker));
+                if (item) menu.menuItems.byName(item).click();
+            }}
+            delay(0.2);
+            se.keystroke(renameText);
+            delay(0.1);
+            se.keyCode(36);
+            return "sent:" + marker;
+        }}
+        return "not_found:" + marker;
     }})()"""
     try:
         result = subprocess.run(
             ["osascript", "-l", "JavaScript", "-e", jxa],
             capture_output=True, text=True, timeout=8,
         )
-        mlog("resume", "auto_rename", name=old_name, result=result.stdout.strip())
+        mlog("resume", "auto_rename", name=old_name, new_sid8=new_sid8,
+             result=result.stdout.strip())
     except (subprocess.TimeoutExpired, OSError):
-        pass
+        mlog("resume", "auto_rename_error", name=old_name, new_sid8=new_sid8)
 
 
 def resume_session(session: Session) -> bool:
@@ -1880,6 +1947,9 @@ def resume_session(session: Session) -> bool:
         mlog("resume", "no_jsonl", sid=session.session_id[:12],
              path=session.transcript_path)
         return False
+
+    # Snapshot existing ·sid8 markers so auto-rename can detect the new one
+    prior_sids = _snapshot_window_sids()
 
     # Ghostty: open new tab via keystroke, then type the command
     quoted_cwd = shlex.quote(cwd)
@@ -1925,7 +1995,7 @@ def resume_session(session: Session) -> bool:
             if session.title and session.title not in ("Claude", ""):
                 threading.Thread(
                     target=_auto_rename_after_resume,
-                    args=(session.title,),
+                    args=(session.title, prior_sids),
                     daemon=True,
                 ).start()
             return True
