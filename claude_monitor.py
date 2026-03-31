@@ -3438,7 +3438,7 @@ class ClaudeMonitor(App):
         # Snapshot UI state before background work
         table = self.query_one("#session-table", DataTable)
         cr = table.cursor_row
-        if cr is not None and cr < len(self._row_map):
+        if cr is not None and 0 <= cr < len(self._row_map):
             sel = self._row_map[cr]
             if sel:
                 self._selected_key = sel.session_id
