@@ -1904,11 +1904,20 @@ def _auto_rename_after_resume(old_name: str, prior_sids: set[str]) -> None:
                 w.actions["AXRaise"].perform();
                 try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
             }} catch(e) {{
-                const menu = proc.menuBars[0].menuBarItems.byName("Window").menus[0];
-                const item = menu.menuItems.name().find(n => n && n.includes(marker));
-                if (item) menu.menuItems.byName(item).click();
+                try {{
+                    const menu = proc.menuBars[0].menuBarItems.byName("Window").menus[0];
+                    const item = menu.menuItems.name().find(n => n && n.includes(marker));
+                    if (item) menu.menuItems.byName(item).click();
+                }} catch(e2) {{}}
             }}
-            delay(0.2);
+            delay(0.25);
+            // Safety: only type if the frontmost window's title actually
+            // carries our marker — otherwise we'd rename the wrong session.
+            let frontTitle = "";
+            try {{ frontTitle = proc.windows[0].name(); }} catch(e) {{}}
+            if (!frontTitle || !frontTitle.includes(marker)) {{
+                return "abort_wrong_front:" + marker + ":" + frontTitle;
+            }}
             se.keystroke(renameText);
             delay(0.1);
             se.keyCode(36);
@@ -1921,8 +1930,12 @@ def _auto_rename_after_resume(old_name: str, prior_sids: set[str]) -> None:
             ["osascript", "-l", "JavaScript", "-e", jxa],
             capture_output=True, text=True, timeout=8,
         )
+        out = result.stdout.strip()
         mlog("resume", "auto_rename", name=old_name, new_sid8=new_sid8,
-             result=result.stdout.strip())
+             result=out)
+        if out.startswith("abort_wrong_front:"):
+            mlog("DIVERGE", "auto_rename_wrong_front", name=old_name,
+                 new_sid8=new_sid8, result=out)
     except (subprocess.TimeoutExpired, OSError):
         mlog("resume", "auto_rename_error", name=old_name, new_sid8=new_sid8)
 
@@ -1991,8 +2004,12 @@ def resume_session(session: Session) -> bool:
              via=out, rc=result.returncode)
         if result.returncode == 0 and out in ("Ghostty", "iTerm2", "Terminal"):
             _recently_resumed[session.session_id] = time.time()
-            # Auto-rename the new session to match the old name
-            if session.title and session.title not in ("Claude", ""):
+            # Auto-rename the new session to match the old name. Skip junk
+            # fallback titles (home-dir basename, sid8, generic placeholders)
+            # — applying those would overwrite a better auto-generated name.
+            junk = {"", "Claude", "Claude Code", "~",
+                    Path.home().name, session.session_id[:8]}
+            if session.title and session.title not in junk and len(session.title) >= 3:
                 threading.Thread(
                     target=_auto_rename_after_resume,
                     args=(session.title, prior_sids),
