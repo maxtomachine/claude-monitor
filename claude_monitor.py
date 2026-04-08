@@ -27,6 +27,52 @@ from textual.widgets import (
     Header, Footer, Static, DataTable, Label, OptionList, Checkbox, Input,
 )
 from textual.widgets.option_list import Option
+from textual.theme import Theme
+
+
+# Gruvbox themes mirroring ~/.config/ghostty/themes/gruvbox-custom-{dark,light}
+GRUVBOX_DARK = Theme(
+    name="gruvbox-dark",
+    dark=True,
+    background="#282828",
+    foreground="#b2ebbb",
+    surface="#32302f",
+    panel="#3c3836",
+    boost="#504945",
+    primary="#83a598",
+    secondary="#d3869b",
+    accent="#fabd2f",
+    success="#b8bb26",
+    warning="#d79921",
+    error="#fb4934",
+)
+GRUVBOX_LIGHT = Theme(
+    name="gruvbox-light",
+    dark=False,
+    background="#fbf1c7",
+    foreground="#282828",
+    surface="#f2e5bc",
+    panel="#ebdbb2",
+    boost="#d5c4a1",
+    primary="#076678",
+    secondary="#8f3f71",
+    accent="#b57614",
+    success="#79740e",
+    warning="#b57614",
+    error="#9d0006",
+)
+
+
+def _system_is_dark() -> bool:
+    """macOS appearance — `defaults` exits 1 when light mode is active."""
+    try:
+        r = subprocess.run(
+            ["defaults", "read", "-g", "AppleInterfaceStyle"],
+            capture_output=True, text=True, timeout=2,
+        )
+        return r.returncode == 0 and r.stdout.strip() == "Dark"
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return True
 
 
 CLAUDE_DIR = Path.home() / ".claude" / "projects"
@@ -2535,7 +2581,7 @@ class TimelineView(ModalScreen[str | None]):
     .timeline-chart { height: 1fr; overflow-y: auto; }
     .timeline-group { height: 1; }
     .timeline-bar { height: 1; }
-    .timeline-bar.-selected { background: #1a2a1a; }
+    .timeline-bar.-selected { background: $boost; }
     .timeline-spacer { height: 1; }
     #timeline-summary {
         height: auto; max-height: 25%; min-height: 3; padding: 0 2;
@@ -3187,7 +3233,7 @@ class DosFooter(Static):
 
     DEFAULT_CSS = """
     DosFooter { dock: bottom; height: 1; background: $panel; padding: 0 1; }
-    #update-banner { height: 1; background: #2a1f14; display: none; padding: 0 2; }
+    #update-banner { height: 1; background: $boost; color: $warning; display: none; padding: 0 2; }
     """
 
     def __init__(self, items: list[tuple[str, str]], **kwargs) -> None:
@@ -3320,11 +3366,15 @@ class ClaudeMonitor(App):
 
     def on_mount(self) -> None:
         t0 = time.perf_counter()
+        self.register_theme(GRUVBOX_DARK)
+        self.register_theme(GRUVBOX_LIGHT)
         self._visible_cols = get_visible_columns()
         self._col_order = get_column_order()
         saved_theme = load_prefs().get("theme")
-        if saved_theme:
+        if saved_theme in ("gruvbox-dark", "gruvbox-light"):
             self.theme = saved_theme
+        else:
+            self.theme = "gruvbox-dark" if _system_is_dark() else "gruvbox-light"
         t0 = _perf("on_mount: load_prefs (cols+theme)", t0)
         self._rebuild_table_columns()
         t0 = _perf("on_mount: _rebuild_table_columns", t0)
@@ -3990,11 +4040,11 @@ class ClaudeMonitor(App):
         self.exit(return_code=RESTART_EXIT_CODE)
 
     def action_toggle_theme(self) -> None:
-        self.theme = "textual-light" if "dark" in self.theme else "textual-dark"
+        self.theme = "gruvbox-light" if "dark" in self.theme else "gruvbox-dark"
         prefs = load_prefs()
         prefs["theme"] = self.theme
         save_prefs(prefs)
-        self.notify(f"Theme: {self.theme.replace('textual-', '')}", timeout=2)
+        self.notify(f"Theme: {self.theme.replace('gruvbox-', '')}", timeout=2)
 
     def _group_header_indices(self) -> list[int]:
         """Return row indices of group header rows (not spacers)."""
