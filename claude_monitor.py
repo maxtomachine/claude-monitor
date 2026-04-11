@@ -1675,10 +1675,12 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
             }}
             if (!targetName) continue;
 
-            app.activate();
-            delay(0.1);
-
+            // proc.frontmost (not app.activate()) — activate() can switch
+            // spaces to wherever the app's key window is, then race the
+            // menu click and snap back to the wrong desktop.
             const proc = se.processes.byName(appName);
+            try {{ proc.frontmost = true; }} catch(e) {{}}
+            delay(0.1);
 
             // Fast path: AXRaise if window is on the current space
             try {{
@@ -1696,7 +1698,12 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
                 // matchedCand may carry a +sid_stale suffix for
                 // diagnostics — strip it for menu-item matching.
                 const menuCand = matchedCand.split("+")[0];
-                const item = items.find(n => n && n.includes(menuCand));
+                // Only consider the window-list section (after the last
+                // separator) — earlier items are commands like
+                // "Move to <display>" that would relocate the window.
+                const lastSep = items.lastIndexOf(null);
+                const windowItems = lastSep >= 0 ? items.slice(lastSep + 1) : items;
+                const item = windowItems.find(n => n && n.includes(menuCand));
                 if (item) {{
                     menu.menuItems.byName(item).click();
                     if (thenText) {{ delay(0.3); se.keystroke(thenText); se.keyCode(36); }}
