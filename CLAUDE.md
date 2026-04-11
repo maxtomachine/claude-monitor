@@ -64,6 +64,7 @@ Single file: `claude_monitor.py`. Key sections:
 | `R` | Restart monitor (picks up code changes) |
 | `j` | Cursor down |
 | `n` | Send `/rename` to selected session |
+| `P` | Broadcast `/proactive` to all sessions in cursor's group |
 | `Enter` | Session context menu |
 
 ## Statusline integration

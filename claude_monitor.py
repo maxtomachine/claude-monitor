@@ -3324,6 +3324,7 @@ class ClaudeMonitor(App):
         Binding("R", "restart", "Restart", show=False),
         Binding("j", "cursor_down", "↓", show=False),
         Binding("n", "edit_name", "Name"),
+        Binding("P", "proactive_group", "/proactive→group", show=False),
         Binding("g", "toggle_groups", "Group"),
         Binding("pageup", "prev_group", "PgUp", show=False, priority=True),
         Binding("pagedown", "next_group", "PgDn", show=False, priority=True),
@@ -3992,6 +3993,70 @@ class ClaudeMonitor(App):
             else:
                 self.notify("Could not find or resume session", timeout=4)
         mlog(log_cat, "rename", sid=s.session_id[:12], success=ok)
+
+    def _resolve_cursor_group(self) -> tuple[str, list[Session]]:
+        """Return (group_key, live_sessions) for the row under the cursor.
+
+        Works whether the cursor is on a group header or a session row.
+        Only returns sessions whose process is alive.
+        """
+        table = self.query_one(DataTable)
+        cr = table.cursor_row
+        if cr is None or not (0 <= cr < len(self._row_map)):
+            return "", []
+        sel = self._row_map[cr]
+        if sel is None:
+            # Group header — first session after it belongs to this group
+            for i in range(cr + 1, len(self._row_map)):
+                if self._row_map[i] is not None:
+                    sel = self._row_map[i]
+                    break
+            if sel is None:
+                return "", []
+        gk = _group_key(sel.title)
+        if gk not in self._group_counts:
+            gk = "ungrouped"
+        members = [
+            s for s in self._flat_rows
+            if not s.is_subagent
+            and s.status not in ("archived", "closed")
+            and (_group_key(s.title) == gk
+                 or (gk == "ungrouped" and _group_key(s.title) not in self._group_counts))
+            and _is_session_alive(s.session_id)
+        ]
+        return gk, members
+
+    def action_proactive_group(self) -> None:
+        """Send /proactive to every live session in the cursor's group."""
+        gk, members = self._resolve_cursor_group()
+        if not members:
+            self.notify("No live sessions in group", timeout=3)
+            return
+        if gk == "ungrouped":
+            self.notify("Cursor is in 'ungrouped' — pick a named group",
+                        timeout=4, severity="warning")
+            return
+        self.notify(f"Sending /proactive to {len(members)} in '{gk}'…", timeout=3)
+        self.run_worker(
+            lambda m=members, g=gk: self._broadcast_command(m, "/proactive", g),
+            thread=True,
+        )
+
+    def _broadcast_command(self, sessions: list[Session], cmd: str, group: str) -> None:
+        sent = 0
+        for s in sessions:
+            ok = _send_to_terminal_session(s, cmd)
+            mlog("broadcast", "send", group=group, sid=s.session_id[:12],
+                 title=s.title, cmd=cmd, ok=ok)
+            if ok:
+                sent += 1
+            time.sleep(0.3)
+        _raise_monitor_window()
+        self.call_from_thread(
+            self.notify,
+            f"Sent {cmd} to {sent}/{len(sessions)} in '{group}'",
+            timeout=5,
+        )
 
     def action_rename_selected(self) -> None:
         """Send /rename to the currently selected session's terminal."""

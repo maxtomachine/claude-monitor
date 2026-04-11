@@ -449,6 +449,89 @@ class TestKanban:
                 assert isinstance(pilot.app.screen, KanbanView)
 
 
+class TestProactiveGroup:
+    @pytest.fixture
+    def grouped_sessions(self):
+        return [
+            make_session(session_id="bash-1", title="bashing-alpha", status="idle"),
+            make_session(session_id="bash-2", title="bashing-beta", status="working"),
+            make_session(session_id="bash-3", title="bashing-gamma", status="waiting"),
+            make_session(session_id="other-1", title="other-thing", status="idle"),
+        ]
+
+    async def test_resolve_cursor_group_on_session(self, grouped_sessions):
+        with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
+             patch("claude_monitor._is_session_alive", return_value=True):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                # Find a bashing-* session row (skip group header)
+                for i, s in enumerate(pilot.app._row_map):
+                    if s and s.title.startswith("bashing-"):
+                        table.move_cursor(row=i)
+                        break
+                gk, members = pilot.app._resolve_cursor_group()
+                assert gk == "bashing"
+                assert {m.session_id for m in members} == {"bash-1", "bash-2", "bash-3"}
+
+    async def test_resolve_cursor_group_on_header(self, grouped_sessions):
+        with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
+             patch("claude_monitor._is_session_alive", return_value=True):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                # Find the bashing group header row (None in _row_map)
+                for i, s in enumerate(pilot.app._row_map):
+                    if s is None and i + 1 < len(pilot.app._row_map):
+                        nxt = pilot.app._row_map[i + 1]
+                        if nxt and nxt.title.startswith("bashing-"):
+                            table.move_cursor(row=i)
+                            break
+                gk, members = pilot.app._resolve_cursor_group()
+                assert gk == "bashing"
+                assert len(members) == 3
+
+    async def test_P_broadcasts_to_group(self, grouped_sessions):
+        captured = {}
+        def fake_broadcast(self, sessions, cmd, group):
+            captured["sessions"] = [s.session_id for s in sessions]
+            captured["cmd"] = cmd
+            captured["group"] = group
+        with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
+             patch("claude_monitor._is_session_alive", return_value=True), \
+             patch.object(ClaudeMonitor, "_broadcast_command", fake_broadcast):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                for i, s in enumerate(pilot.app._row_map):
+                    if s and s.title.startswith("bashing-"):
+                        table.move_cursor(row=i)
+                        break
+                await pilot.press("P")
+                await pilot.pause()
+                # Worker runs in thread; give it a beat
+                await pilot.app.workers.wait_for_complete()
+                assert captured.get("cmd") == "/proactive"
+                assert captured.get("group") == "bashing"
+                assert set(captured.get("sessions", [])) == {"bash-1", "bash-2", "bash-3"}
+
+    async def test_P_refuses_ungrouped(self, grouped_sessions):
+        # Only one "other-*" session → singleton → ungrouped bucket
+        with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
+             patch("claude_monitor._is_session_alive", return_value=True), \
+             patch.object(ClaudeMonitor, "_broadcast_command") as mock_bc:
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                for i, s in enumerate(pilot.app._row_map):
+                    if s and s.session_id == "other-1":
+                        table.move_cursor(row=i)
+                        break
+                await pilot.press("P")
+                await pilot.pause()
+                mock_bc.assert_not_called()
+
+
 class TestTimeline:
     async def test_timeline_opens_and_closes(self, sample_sessions):
         with _mock_sessions(sample_sessions):
