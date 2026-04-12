@@ -1827,6 +1827,26 @@ def _raise_monitor_window() -> None:
         pass
 
 
+def _frontmost_terminal_title() -> str:
+    """Return the frontmost Ghostty/iTerm2/Terminal window title (or '')."""
+    jxa = """(() => {
+        const se = Application("System Events");
+        for (const appName of ["Ghostty", "iTerm2", "Terminal"]) {
+            try {
+                const proc = se.processes.byName(appName);
+                if (proc.frontmost()) return proc.windows[0].name();
+            } catch(e) {}
+        }
+        return "";
+    })()"""
+    try:
+        r = subprocess.run(["osascript", "-l", "JavaScript", "-e", jxa],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+
+
 def _close_terminal_tab(session: Session) -> bool:
     """Close the terminal tab for a session by sending 'exit' + Enter."""
     return _raise_window_by_content(session, then_text="exit")
@@ -3722,13 +3742,10 @@ class ClaudeMonitor(App):
             elif action == "kill":
                 pid = _find_claude_pid(s)
                 if pid:
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                        mlog("menu", "kill", sid=s.session_id[:12], pid=pid)
-                        self.notify(f"Killed {s.title[:20]} (PID {pid})", timeout=4)
-                    except OSError as e:
-                        mlog("menu", "kill_error", sid=s.session_id[:12], error=str(e))
-                        self.notify(f"Kill failed: {e}", timeout=4)
+                    self.run_worker(
+                        lambda s=s, pid=pid: self._kill_and_close_tab(s, pid),
+                        thread=True,
+                    )
                 else:
                     self.notify("No process found", timeout=4)
         return handle_action
@@ -3759,6 +3776,61 @@ class ClaudeMonitor(App):
             lambda s=session, hd=has_debrief: self._dismiss_sync(s, hd),
             thread=True,
         )
+
+    def _kill_and_close_tab(self, s: Session, pid: int) -> None:
+        """Background worker: raise window, SIGTERM the process, then close
+        the tab by typing `exit` once the shell reclaims the prompt.
+
+        The window must be raised BEFORE killing — once the process exits,
+        zsh shell-integration rewrites the title and the ·sid8 marker is
+        gone, so the tab can't be found afterwards.
+        """
+        sid8 = s.session_id[:8]
+        raised = _raise_window_by_content(s)
+        front = _frontmost_terminal_title() if raised else ""
+        front_ok = f"\u00b7{sid8}" in front
+
+        try:
+            os.kill(pid, signal.SIGTERM)
+            mlog("menu", "kill", sid=s.session_id[:12], pid=pid,
+                 raised=raised, front_ok=front_ok)
+        except OSError as e:
+            mlog("menu", "kill_error", sid=s.session_id[:12], error=str(e))
+            self.call_from_thread(self.notify, f"Kill failed: {e}", timeout=4)
+            return
+
+        closed = False
+        if front_ok:
+            time.sleep(0.6)
+            # Safety: a bare shell after the process exits has a cwd title
+            # (no ·). Any · means a live session or the monitor — abort
+            # rather than type `exit` into it.
+            after = _frontmost_terminal_title()
+            if "\u00b7" in (after or ""):
+                mlog("DIVERGE", "kill_tab_close_abort", sid=s.session_id[:12],
+                     front_before=front, front_after=after)
+            else:
+                try:
+                    subprocess.run(
+                        ["osascript", "-l", "JavaScript", "-e",
+                         '(() => { const se = Application("System Events"); '
+                         'se.keystroke("exit"); delay(0.05); se.keyCode(36); })()'],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    closed = True
+                    mlog("menu", "kill_tab_closed", sid=s.session_id[:12])
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+        elif raised:
+            mlog("DIVERGE", "kill_raise_wrong_front",
+                 sid=s.session_id[:12], front=front)
+
+        _raise_monitor_window()
+        suffix = " + tab closed" if closed else ""
+        self.call_from_thread(
+            self.notify, f"Killed {s.title[:20]} (PID {pid}){suffix}", timeout=4,
+        )
+        self.call_from_thread(self.refresh_sessions)
 
     def _dismiss_sync(self, session: Session, has_debrief: bool) -> None:
         """Background worker: debrief (if needed), wait for exit, close tab."""
