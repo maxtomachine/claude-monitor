@@ -3636,7 +3636,7 @@ class ClaudeMonitor(App):
         cr = table.cursor_row
         selected_key = self._selected_key
         saved_row_idx = cr
-        if cr is not None and cr < len(old_map):
+        if cr is not None and 0 <= cr < len(old_map):
             sel = old_map[cr]
             if sel:
                 selected_key = sel.session_id

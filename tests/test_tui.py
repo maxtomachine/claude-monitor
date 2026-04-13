@@ -449,6 +449,19 @@ class TestKanban:
                 assert isinstance(pilot.app.screen, KanbanView)
 
 
+class TestEmptyState:
+    async def test_mount_with_no_sessions_does_not_crash(self):
+        # Regression: cursor_row is -1 on an empty DataTable; must not index
+        # into _row_map / old_map with that.
+        with patch("claude_monitor.parse_sessions", return_value=[]):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                # Explicitly drive a refresh cycle too
+                pilot.app.refresh_sessions()
+                await pilot.pause()
+                assert pilot.app._row_map == []
+
+
 class TestProactiveGroup:
     @pytest.fixture
     def grouped_sessions(self):
