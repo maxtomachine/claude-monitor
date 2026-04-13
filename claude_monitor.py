@@ -1687,7 +1687,7 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
                 const w = proc.windows.byName(targetName);
                 w.actions["AXRaise"].perform();
                 try {{ w.attributes["AXMain"].value = true; }} catch(e) {{}}
-                if (thenText) {{ delay(0.15); se.keystroke(thenText); se.keyCode(36); }}
+                if (thenText) {{ delay(0.15); se.keystroke(thenText); delay(0.1); se.keyCode(36); }}
                 return "matched:" + matchedCand + ":" + targetName;
             }} catch(e) {{}}
 
@@ -1706,7 +1706,7 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
                 const item = windowItems.find(n => n && n.includes(menuCand));
                 if (item) {{
                     menu.menuItems.byName(item).click();
-                    if (thenText) {{ delay(0.3); se.keystroke(thenText); se.keyCode(36); }}
+                    if (thenText) {{ delay(0.3); se.keystroke(thenText); delay(0.1); se.keyCode(36); }}
                     return "matched:" + matchedCand + ":menu:" + item;
                 }}
             }} catch(e) {{
