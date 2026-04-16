@@ -3401,6 +3401,7 @@ class ClaudeMonitor(App):
         saved_theme = load_prefs().get("theme")
         if saved_theme in ("gruvbox-dark", "gruvbox-light"):
             self.theme = saved_theme
+            self._theme_pinned = True
         else:
             self.theme = "gruvbox-dark" if _system_is_dark() else "gruvbox-light"
         t0 = _perf("on_mount: load_prefs (cols+theme)", t0)
@@ -3610,6 +3611,7 @@ class ClaudeMonitor(App):
                        rendered: list[tuple[Session, list[str]]],
                        cleaned: list[str]) -> None:
         """Main thread: apply computed results to UI."""
+        self._sync_system_theme()
         self.sessions = sessions
 
         if cleaned:
@@ -4183,12 +4185,23 @@ class ClaudeMonitor(App):
         )
         self.exit(return_code=RESTART_EXIT_CODE)
 
+    _theme_pinned: bool = False
+
     def action_toggle_theme(self) -> None:
         self.theme = "gruvbox-light" if "dark" in self.theme else "gruvbox-dark"
+        self._theme_pinned = True
         prefs = load_prefs()
         prefs["theme"] = self.theme
         save_prefs(prefs)
-        self.notify(f"Theme: {self.theme.replace('gruvbox-', '')}", timeout=2)
+        self.notify(f"Theme: {self.theme.replace('gruvbox-', '')} (pinned)", timeout=2)
+
+    def _sync_system_theme(self) -> None:
+        """Follow macOS appearance unless the user manually toggled."""
+        if self._theme_pinned:
+            return
+        want = "gruvbox-dark" if _system_is_dark() else "gruvbox-light"
+        if self.theme != want:
+            self.theme = want
 
     def _group_header_indices(self) -> list[int]:
         """Return row indices of group header rows (not spacers)."""
