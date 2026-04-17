@@ -3589,9 +3589,14 @@ class ClaudeMonitor(App):
             visible_cols = self._visible_cols
             rendered = [(s, render_row(s, visible_cols)) for s in flat]
 
+            # Check system appearance in background thread (avoids
+            # subprocess.run on Textual's main thread)
+            sys_dark = _system_is_dark()
+
             # Post to main thread for UI update
             self.call_from_thread(
                 self._refresh_apply, sessions, flat, rendered, cleaned,
+                sys_dark,
             )
         finally:
             self._refresh_pending = False
@@ -3601,9 +3606,10 @@ class ClaudeMonitor(App):
 
     def _refresh_apply(self, sessions: list[Session], flat: list[Session],
                        rendered: list[tuple[Session, list[str]]],
-                       cleaned: list[str]) -> None:
+                       cleaned: list[str],
+                       sys_dark: bool = True) -> None:
         """Main thread: apply computed results to UI."""
-        self._sync_system_theme()
+        self._sync_system_theme(sys_dark)
         self.sessions = sessions
 
         if cleaned:
@@ -4177,9 +4183,9 @@ class ClaudeMonitor(App):
         )
         self.exit(return_code=RESTART_EXIT_CODE)
 
-    def _sync_system_theme(self) -> None:
+    def _sync_system_theme(self, sys_dark: bool) -> None:
         """Always follow macOS appearance."""
-        want = "gruvbox-dark" if _system_is_dark() else "gruvbox-light"
+        want = "gruvbox-dark" if sys_dark else "gruvbox-light"
         if self.theme != want:
             self.theme = want
 
