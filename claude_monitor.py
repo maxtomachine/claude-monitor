@@ -2369,7 +2369,6 @@ class KanbanView(ModalScreen[str | None]):
         Binding("r", "passthrough('refresh')", "Refresh"),
         Binding("h", "passthrough('toggle_archived')", "History", show=False),
         Binding("d", "passthrough('toggle_debug')", "Debug", show=False),
-        Binding("t", "passthrough('toggle_theme')", "Theme", show=False),
         Binding("R", "passthrough('restart')", "Restart", show=False),
         Binding("n", "edit_name", "Name", show=False),
         Binding("g", "toggle_groups", "Group", show=False),
@@ -2592,7 +2591,6 @@ class TimelineView(ModalScreen[str | None]):
         Binding("r", "passthrough('refresh')", "Refresh"),
         Binding("h", "passthrough('toggle_archived')", "History", show=False),
         Binding("d", "passthrough('toggle_debug')", "Debug", show=False),
-        Binding("t", "passthrough('toggle_theme')", "Theme", show=False),
         Binding("R", "passthrough('restart')", "Restart", show=False),
         Binding("n", "edit_name", "Name", show=False),
         Binding("g", "toggle_groups", "Group", show=False),
@@ -3340,7 +3338,6 @@ class ClaudeMonitor(App):
         Binding("slash", "start_search", "Search", show=False),
         Binding("escape", "clear_search", "Clear", show=False),
         Binding("v", "cycle_view", "View"),
-        Binding("t", "toggle_theme", "Theme", show=False),
         Binding("R", "restart", "Restart", show=False),
         Binding("j", "cursor_down", "↓", show=False),
         Binding("n", "edit_name", "Name"),
@@ -3398,12 +3395,7 @@ class ClaudeMonitor(App):
         self.register_theme(GRUVBOX_LIGHT)
         self._visible_cols = get_visible_columns()
         self._col_order = get_column_order()
-        saved_theme = load_prefs().get("theme")
-        if saved_theme in ("gruvbox-dark", "gruvbox-light"):
-            self.theme = saved_theme
-            self._theme_pinned = True
-        else:
-            self.theme = "gruvbox-dark" if _system_is_dark() else "gruvbox-light"
+        self.theme = "gruvbox-dark" if _system_is_dark() else "gruvbox-light"
         t0 = _perf("on_mount: load_prefs (cols+theme)", t0)
         self._rebuild_table_columns()
         t0 = _perf("on_mount: _rebuild_table_columns", t0)
@@ -4185,20 +4177,8 @@ class ClaudeMonitor(App):
         )
         self.exit(return_code=RESTART_EXIT_CODE)
 
-    _theme_pinned: bool = False
-
-    def action_toggle_theme(self) -> None:
-        self.theme = "gruvbox-light" if "dark" in self.theme else "gruvbox-dark"
-        self._theme_pinned = True
-        prefs = load_prefs()
-        prefs["theme"] = self.theme
-        save_prefs(prefs)
-        self.notify(f"Theme: {self.theme.replace('gruvbox-', '')} (pinned)", timeout=2)
-
     def _sync_system_theme(self) -> None:
-        """Follow macOS appearance unless the user manually toggled."""
-        if self._theme_pinned:
-            return
+        """Always follow macOS appearance."""
         want = "gruvbox-dark" if _system_is_dark() else "gruvbox-light"
         if self.theme != want:
             self.theme = want
