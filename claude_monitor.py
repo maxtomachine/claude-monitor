@@ -3690,6 +3690,17 @@ class ClaudeMonitor(App):
         elif saved_row_idx is not None:
             table.move_cursor(row=min(saved_row_idx, len(row_map) - 1))
 
+        # Force session column to 50% of terminal width — must be set after
+        # rows are added because DataTable auto-sizes columns to content.
+        if "session" in self._visible_cols:
+            try:
+                col = table.columns["session"]
+                col.width = max(20, self.size.width // 2)
+                col.auto_width = False
+                col.content_width = 0
+            except KeyError:
+                pass
+
         table.scroll_to(saved_scroll_x, saved_scroll_y, animate=False)
         self.query_one(StatsBar).update_stats(self.sessions, self.sort_mode)
 
