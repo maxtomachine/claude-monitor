@@ -3502,7 +3502,10 @@ class ClaudeMonitor(App):
         table.clear(columns=True)
         for col_key in self._visible_cols:
             info = ALL_COLUMNS.get(col_key, {})
-            table.add_column(info.get("label", col_key), key=col_key)
+            width = None
+            if col_key == "session":
+                width = max(20, self.size.width // 2)
+            table.add_column(info.get("label", col_key), key=col_key, width=width)
 
     def _filter_sessions(self, sessions: list[Session]) -> list[Session]:
         if not self._filter:
