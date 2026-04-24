@@ -912,6 +912,21 @@ _recently_resumed: dict[str, float] = {}  # sid -> timestamp (set by resume_sess
 _RESUME_GRACE = 60  # seconds to treat a resumed session as alive without a PID
 
 
+def _pid_is_claude(pid: int) -> bool:
+    """True iff PID is alive AND is a claude CLI process — guards against
+    recycled PIDs where an old session's PID now belongs to e.g. mdworker."""
+    try:
+        comm = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "comm="],
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip().lower()
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return ("claude" in comm and "monitor" not in comm
+            and "helper" not in comm and "crashpad" not in comm
+            and ".app" not in comm)
+
+
 def _is_session_alive(session_id: str, display_title: str = "") -> bool:
     """Check if the Claude process for this session is still running.
 
@@ -936,9 +951,9 @@ def _is_session_alive(session_id: str, display_title: str = "") -> bool:
     hook = read_hook_state(session_id)
     if hook and hook.get("pid"):
         try:
-            os.kill(int(hook["pid"]), 0)
-            return True
-        except (OSError, ValueError):
+            if _pid_is_claude(int(hook["pid"])):
+                return True
+        except ValueError:
             pass
 
     # Last resort: check if we just resumed this session
