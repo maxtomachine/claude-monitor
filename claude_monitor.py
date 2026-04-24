@@ -194,11 +194,12 @@ class SortMode(Enum):
 
 
 STATUS_PRIORITY = {
-    "working": 0, "debriefing": 1, "needs_approval": 2,
-    "waiting": 3, "idle": 4, "closed": 5, "archived": 6,
+    "working": 0, "background": 1, "debriefing": 2, "needs_approval": 3,
+    "waiting": 4, "idle": 5, "closed": 6, "archived": 7,
 }
 STATUS_DISPLAY = {
     "working": ("● WORKING", "green"),
+    "background": ("◐ BUSY", "cyan"),
     "debriefing": ("⏳ DEBRIEFING", "magenta"),
     "needs_approval": ("◉ APPROVE", "yellow"),
     "waiting": ("○ WAITING", "dark_orange"),
@@ -237,6 +238,7 @@ class Session:
     last_assistant_text: str = ""
     status_name: str = ""
     project_path: str = ""  # Original launch directory (for resume)
+    background_count: int = 0
 
 
 # ── Preferences ───────────────────────────────────────────────────────────────
@@ -452,6 +454,35 @@ def count_compactions(parent_path: str) -> int:
 
 def find_subagent_paths(parent_path: str) -> list[Path]:
     return _scan_subagent_dir(parent_path)[1]
+
+
+_BACKGROUND_WINDOW_S = 15.0
+
+
+def count_background_activity(transcript_path: str) -> int:
+    """How many subagent/workflow transcripts under this session were written
+    to in the last _BACKGROUND_WINDOW_S seconds — i.e., spawned work that is
+    still running while the main loop sits idle."""
+    p = Path(transcript_path)
+    base = p.parent / p.stem
+    now = time.time()
+    n = 0
+    for sub in ("subagents", "workflows"):
+        d = base / sub
+        if not d.is_dir():
+            continue
+        try:
+            for f in d.iterdir():
+                if f.suffix != ".jsonl":
+                    continue
+                try:
+                    if now - f.stat().st_mtime < _BACKGROUND_WINDOW_S:
+                        n += 1
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return n
 
 
 @dataclass
@@ -820,7 +851,8 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
             or session_id[:8]
         )
 
-    status = determine_status(session_id, data["last_assistant_time"], display_title)
+    status = determine_status(session_id, data["last_assistant_time"], display_title, path)
+    bg_count = count_background_activity(path) if status == "background" else 0
 
     # Context %: how much context is USED (burnt).
     # Statusline cache stores remaining %, so we flip it.
@@ -873,6 +905,7 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
         last_assistant_text=data["last_assistant_text"],
         status_name=status_name,
         project_path=idx.get("projectPath", ""),
+        background_count=bg_count,
     )
 
 
@@ -1114,10 +1147,15 @@ def read_hook_state(session_id: str) -> dict | None:
 
 
 def determine_status(session_id: str, last_assistant_time: float,
-                     display_title: str = "") -> str:
+                     display_title: str = "", transcript_path: str = "") -> str:
     alive = _is_session_alive(session_id)
     if not alive:
         return "closed"
+
+    def _idle_or_background(base: str) -> str:
+        if transcript_path and count_background_activity(transcript_path) > 0:
+            return "background"
+        return base
 
     # Tier 1: hook state files (real-time, event-driven)
     hook = read_hook_state(session_id)
@@ -1135,10 +1173,10 @@ def determine_status(session_id: str, last_assistant_time: float,
             if entered:
                 try:
                     elapsed = time.time() - parse_timestamp(entered)
-                    return "idle" if elapsed > 300 else "waiting"
+                    return _idle_or_background("idle" if elapsed > 300 else "waiting")
                 except (ValueError, TypeError):
                     pass
-            return "waiting"
+            return _idle_or_background("waiting")
 
     # Tier 2: signal files (legacy)
     if SIGNALS_DIR.exists():
@@ -1158,8 +1196,8 @@ def determine_status(session_id: str, last_assistant_time: float,
         if elapsed < 30:
             return "working"
         elif elapsed < 300:
-            return "waiting"
-    return "idle"
+            return _idle_or_background("waiting")
+    return _idle_or_background("idle")
 
 
 # ── Formatting ────────────────────────────────────────────────────────────────
@@ -1370,6 +1408,10 @@ def generate_activity(s: Session) -> str:
     Waiting → gerund:     "Editing claude_monitor.py"
     Idle → past tense:    "Edited claude_monitor.py"
     """
+    if s.status == "background":
+        n = s.background_count
+        return f"{n} agent{'s' if n != 1 else ''} running"
+
     # Tier 1: hook state (real-time tool + target)
     hook = read_hook_state(s.session_id)
     gerund = ""
@@ -2118,6 +2160,7 @@ KANBAN_COLUMNS = [
     ("idle",           "◌ Idle",     "grey70"),
     ("waiting",        "○ Waiting",  "dark_orange"),
     ("needs_approval", "◉ Approval", "yellow"),
+    ("background",     "◐ Busy",     "cyan"),
     ("working",        "● Working",  "green"),
 ]
 
