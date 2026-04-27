@@ -18,7 +18,11 @@ from pathlib import Path
 def _escape_markup(text: str) -> str:
     """Escape all [ for Textual markup (rich.markup.escape misses some)."""
     return text.replace("[", "\\[")
+from textual import events
 from textual.app import App, ComposeResult
+from textual.coordinate import Coordinate
+from textual.message import Message
+from textual.widgets.data_table import RowKey
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
@@ -194,11 +198,12 @@ class SortMode(Enum):
 
 
 STATUS_PRIORITY = {
-    "working": 0, "debriefing": 1, "needs_approval": 2,
-    "waiting": 3, "idle": 4, "closed": 5, "archived": 6,
+    "working": 0, "background": 1, "debriefing": 2, "needs_approval": 3,
+    "waiting": 4, "idle": 5, "closed": 6, "archived": 7,
 }
 STATUS_DISPLAY = {
     "working": ("● WORKING", "green"),
+    "background": ("◐ BUSY", "cyan"),
     "debriefing": ("⏳ DEBRIEFING", "magenta"),
     "needs_approval": ("◉ APPROVE", "yellow"),
     "waiting": ("○ WAITING", "dark_orange"),
@@ -237,6 +242,7 @@ class Session:
     last_assistant_text: str = ""
     status_name: str = ""
     project_path: str = ""  # Original launch directory (for resume)
+    background_count: int = 0
 
 
 # ── Preferences ───────────────────────────────────────────────────────────────
@@ -452,6 +458,35 @@ def count_compactions(parent_path: str) -> int:
 
 def find_subagent_paths(parent_path: str) -> list[Path]:
     return _scan_subagent_dir(parent_path)[1]
+
+
+_BACKGROUND_WINDOW_S = 15.0
+
+
+def count_background_activity(transcript_path: str) -> int:
+    """How many subagent/workflow transcripts under this session were written
+    to in the last _BACKGROUND_WINDOW_S seconds — i.e., spawned work that is
+    still running while the main loop sits idle."""
+    p = Path(transcript_path)
+    base = p.parent / p.stem
+    now = time.time()
+    n = 0
+    for sub in ("subagents", "workflows"):
+        d = base / sub
+        if not d.is_dir():
+            continue
+        try:
+            for f in d.iterdir():
+                if f.suffix != ".jsonl":
+                    continue
+                try:
+                    if now - f.stat().st_mtime < _BACKGROUND_WINDOW_S:
+                        n += 1
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return n
 
 
 @dataclass
@@ -820,7 +855,8 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
             or session_id[:8]
         )
 
-    status = determine_status(session_id, data["last_assistant_time"], display_title)
+    status = determine_status(session_id, data["last_assistant_time"], display_title, path)
+    bg_count = count_background_activity(path) if status == "background" else 0
 
     # Context %: how much context is USED (burnt).
     # Statusline cache stores remaining %, so we flip it.
@@ -873,6 +909,7 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
         last_assistant_text=data["last_assistant_text"],
         status_name=status_name,
         project_path=idx.get("projectPath", ""),
+        background_count=bg_count,
     )
 
 
@@ -912,6 +949,21 @@ _recently_resumed: dict[str, float] = {}  # sid -> timestamp (set by resume_sess
 _RESUME_GRACE = 60  # seconds to treat a resumed session as alive without a PID
 
 
+def _pid_is_claude(pid: int) -> bool:
+    """True iff PID is alive AND is a claude CLI process — guards against
+    recycled PIDs where an old session's PID now belongs to e.g. mdworker."""
+    try:
+        comm = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "comm="],
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip().lower()
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return ("claude" in comm and "monitor" not in comm
+            and "helper" not in comm and "crashpad" not in comm
+            and ".app" not in comm)
+
+
 def _is_session_alive(session_id: str, display_title: str = "") -> bool:
     """Check if the Claude process for this session is still running.
 
@@ -936,9 +988,9 @@ def _is_session_alive(session_id: str, display_title: str = "") -> bool:
     hook = read_hook_state(session_id)
     if hook and hook.get("pid"):
         try:
-            os.kill(int(hook["pid"]), 0)
-            return True
-        except (OSError, ValueError):
+            if _pid_is_claude(int(hook["pid"])):
+                return True
+        except ValueError:
             pass
 
     # Last resort: check if we just resumed this session
@@ -1099,10 +1151,15 @@ def read_hook_state(session_id: str) -> dict | None:
 
 
 def determine_status(session_id: str, last_assistant_time: float,
-                     display_title: str = "") -> str:
+                     display_title: str = "", transcript_path: str = "") -> str:
     alive = _is_session_alive(session_id)
     if not alive:
         return "closed"
+
+    def _idle_or_background(base: str) -> str:
+        if transcript_path and count_background_activity(transcript_path) > 0:
+            return "background"
+        return base
 
     # Tier 1: hook state files (real-time, event-driven)
     hook = read_hook_state(session_id)
@@ -1120,10 +1177,10 @@ def determine_status(session_id: str, last_assistant_time: float,
             if entered:
                 try:
                     elapsed = time.time() - parse_timestamp(entered)
-                    return "idle" if elapsed > 300 else "waiting"
+                    return _idle_or_background("idle" if elapsed > 300 else "waiting")
                 except (ValueError, TypeError):
                     pass
-            return "waiting"
+            return _idle_or_background("waiting")
 
     # Tier 2: signal files (legacy)
     if SIGNALS_DIR.exists():
@@ -1143,8 +1200,8 @@ def determine_status(session_id: str, last_assistant_time: float,
         if elapsed < 30:
             return "working"
         elif elapsed < 300:
-            return "waiting"
-    return "idle"
+            return _idle_or_background("waiting")
+    return _idle_or_background("idle")
 
 
 # ── Formatting ────────────────────────────────────────────────────────────────
@@ -1355,6 +1412,10 @@ def generate_activity(s: Session) -> str:
     Waiting → gerund:     "Editing claude_monitor.py"
     Idle → past tense:    "Edited claude_monitor.py"
     """
+    if s.status == "background":
+        n = s.background_count
+        return f"{n} agent{'s' if n != 1 else ''} running"
+
     # Tier 1: hook state (real-time tool + target)
     hook = read_hook_state(s.session_id)
     gerund = ""
@@ -2103,6 +2164,7 @@ KANBAN_COLUMNS = [
     ("idle",           "◌ Idle",     "grey70"),
     ("waiting",        "○ Waiting",  "dark_orange"),
     ("needs_approval", "◉ Approval", "yellow"),
+    ("background",     "◐ Busy",     "cyan"),
     ("working",        "● Working",  "green"),
 ]
 
@@ -3302,6 +3364,32 @@ class StatsBar(Horizontal):
         self.query_one("#stats-sort", Label).update(f" [magenta]sort: {sort_mode.label}[/]")
 
 
+class SessionTable(DataTable):
+    """DataTable that owns mouse clicks: single-click highlights only,
+    double-click posts RowDoubleClicked. Keyboard Enter still fires the
+    stock RowSelected (→ context menu)."""
+
+    class RowDoubleClicked(Message):
+        def __init__(self, row_key: RowKey) -> None:
+            self.row_key = row_key
+            super().__init__()
+
+    def on_click(self, event: events.Click) -> None:
+        meta = event.style.meta
+        row = meta.get("row")
+        if row is None or row < 0:
+            return  # header / out-of-bounds — let default handling run
+        event.prevent_default()
+        event.stop()
+        self.cursor_coordinate = Coordinate(row, meta.get("column", 0) or 0)
+        if event.chain == 2:
+            try:
+                key = self.ordered_rows[row].key
+            except IndexError:
+                return
+            self.post_message(self.RowDoubleClicked(key))
+
+
 class ClaudeMonitor(App):
     TITLE = "Claude Monitor"
     ENABLE_COMMAND_PALETTE = False
@@ -3378,7 +3466,7 @@ class ClaudeMonitor(App):
         yield Header()
         yield StatsBar()
         yield Static("", id="update-banner")
-        yield DataTable(id="session-table", cursor_type="row")
+        yield SessionTable(id="session-table", cursor_type="row")
         yield Static(
             "",
             id="detail-panel"
@@ -3765,13 +3853,24 @@ class ClaudeMonitor(App):
         return handle_action
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Enter key pressed on a row — open context menu."""
+        """Enter key on a row — open context menu.
+        (Mouse clicks no longer reach here; SessionTable.on_click owns them.)"""
         if not (event.row_key and event.row_key.value):
             return
         s = next((s for s in self._flat_rows if s.session_id == event.row_key.value), None)
         if not s:
             return
         self.push_screen(SessionMenu(s), self._make_menu_handler(s))
+
+    def on_session_table_row_double_clicked(
+        self, event: "SessionTable.RowDoubleClicked"
+    ) -> None:
+        if not event.row_key or not event.row_key.value:
+            return
+        s = next((s for s in self._flat_rows if s.session_id == event.row_key.value), None)
+        if not s:
+            return
+        self._make_menu_handler(s)("jump")
 
     def _start_dismiss(self, session: Session) -> None:
         sid = session.session_id
