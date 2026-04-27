@@ -143,6 +143,40 @@ class TestSessionMenu:
                 await pilot.pause()
                 assert len(pilot.app.screen_stack) > 1
 
+    async def test_single_click_highlights_only(self, sample_sessions):
+        with _mock_sessions(sample_sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                # click row index 1 (offset y=2: y=0 header, y=1 row0, y=2 row1)
+                await pilot.click("#session-table", offset=(2, 2), times=1)
+                await pilot.pause()
+                assert table.cursor_row == 1
+                assert len(pilot.app.screen_stack) == 1  # no menu
+
+    async def test_double_click_jumps(self, sample_sessions):
+        with _mock_sessions(sample_sessions), \
+             patch("claude_monitor.focus_terminal_session", return_value=True) as mock_jump:
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.click("#session-table", offset=(2, 2), times=2)
+                await pilot.pause()
+                assert mock_jump.called
+                assert len(pilot.app.screen_stack) == 1  # no menu
+
+    async def test_double_click_on_highlighted_row_jumps(self, sample_sessions):
+        """Regression: dbl-click on the already-selected row must not open
+        the menu on the first click."""
+        with _mock_sessions(sample_sessions), \
+             patch("claude_monitor.focus_terminal_session", return_value=True) as mock_jump:
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                # row 0 is highlighted on mount
+                await pilot.click("#session-table", offset=(2, 1), times=2)
+                await pilot.pause()
+                assert mock_jump.called
+                assert len(pilot.app.screen_stack) == 1
+
     async def test_menu_shows_options(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
