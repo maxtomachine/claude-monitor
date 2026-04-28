@@ -4265,6 +4265,28 @@ class ClaudeMonitor(App):
             self._selection = set()
             self._selection_anchor = None
             self._delete_armed_for = None
+            # Land the cursor on the nearest surviving row so refresh restores
+            # by that key instead of the just-hidden one (which would reset to 0).
+            table = self.query_one("#session-table", DataTable)
+            cr = table.cursor_row or 0
+            survivor = None
+            for i in range(cr, len(self._row_map)):
+                s = self._row_map[i]
+                if s and s.session_id not in self._hidden:
+                    survivor = i
+                    break
+            if survivor is None:
+                for i in range(cr - 1, -1, -1):
+                    s = self._row_map[i]
+                    if s and s.session_id not in self._hidden:
+                        survivor = i
+                        break
+            if survivor is not None:
+                self._extending_cursor = True
+                try:
+                    table.move_cursor(row=survivor)
+                finally:
+                    self._extending_cursor = False
             self.refresh_sessions()
         else:
             self._delete_armed_for = frozenset(eligible)

@@ -90,6 +90,8 @@ This project layers multiple technologies in unusual ways: bash statusline scrip
 
 **Before editing any section**, read the full surrounding context to understand what else depends on the same variables, ordering, or state. After making changes, visually verify ALL parts of the statusline or TUI — not just the part you changed.
 
+4. **Any action that calls `refresh_sessions()` must preserve cursor position.** The refresh path restores the cursor by `_selected_key` (the sid under the cursor when refresh was scheduled). If your action removes/filters/re-sorts rows such that the cursor's sid is no longer in the new table, the cursor silently resets to row 0. Before calling `refresh_sessions()`, move the cursor to a row that will survive the refresh — or set `_selected_key` to a survivor's sid directly.
+
 ## Key conventions
 
 - **No direct pushes to main** — all changes go through PRs

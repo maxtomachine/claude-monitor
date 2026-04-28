@@ -737,6 +737,22 @@ class TestHideAndMultiSelect:
             await pilot.pause()
             assert pilot.app._hidden >= {"arch-1", "arch-2"}
 
+    async def test_hide_preserves_cursor_at_survivor(self, archived_sessions):
+        async with await self._app(archived_sessions) as pilot:
+            table = pilot.app.query_one("#session-table", DataTable)
+            # cursor on row 1 (arch-2)
+            pilot.app._extending_cursor = True
+            table.move_cursor(row=1)
+            pilot.app._extending_cursor = False
+            await pilot.pause()
+            await pilot.press("backspace", "backspace")
+            await pilot.pause()
+            assert "arch-2" in pilot.app._hidden
+            # arch-2 gone; cursor should land on next survivor (arch-3), not row 0
+            cur = pilot.app._row_map[table.cursor_row]
+            assert cur is not None
+            assert cur.session_id != "arch-1"  # not reset to top
+
     async def test_cursor_move_disarms_delete(self, archived_sessions):
         async with await self._app(archived_sessions) as pilot:
             table = pilot.app.query_one("#session-table", DataTable)
