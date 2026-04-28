@@ -3518,6 +3518,7 @@ class ClaudeMonitor(App):
         self._col_order = get_column_order()
         self._hidden = load_hidden_sessions()
         self._selection = set()
+        self._load_view_state()
         self.theme = "gruvbox-dark" if _system_is_dark() else "gruvbox-light"
         t0 = _perf("on_mount: load_prefs (cols+theme)", t0)
         self._rebuild_table_columns()
@@ -3775,6 +3776,10 @@ class ClaudeMonitor(App):
         saved_scroll_x = table.scroll_x
         saved_scroll_y = table.scroll_y
 
+        # Everything between clear() and cursor-restore can fire spurious
+        # RowHighlighted events (e.g. for row 0 after re-add). Hold the guard
+        # until those queued messages have drained.
+        self._extending_cursor = True
         table.clear()
         self._last_rendered = {}
         n_cols = len(self._visible_cols)
@@ -3811,17 +3816,14 @@ class ClaudeMonitor(App):
         self._row_map = row_map
         self._group_header_rows = group_header_rows
 
-        self._extending_cursor = True
-        try:
-            if saved_row_idx is None and selected_key:
-                for idx, s in enumerate(row_map):
-                    if s and s.session_id == selected_key:
-                        table.move_cursor(row=idx)
-                        break
-            elif saved_row_idx is not None:
-                table.move_cursor(row=min(saved_row_idx, len(row_map) - 1))
-        finally:
-            self._extending_cursor = False
+        if saved_row_idx is None and selected_key:
+            for idx, s in enumerate(row_map):
+                if s and s.session_id == selected_key:
+                    table.move_cursor(row=idx)
+                    break
+        elif saved_row_idx is not None:
+            table.move_cursor(row=min(saved_row_idx, len(row_map) - 1))
+        self.call_after_refresh(self._release_cursor_guard)
 
         # Force session column to 50% of terminal width — must be set after
         # rows are added because DataTable auto-sizes columns to content.
@@ -3836,6 +3838,10 @@ class ClaudeMonitor(App):
 
         table.scroll_to(saved_scroll_x, saved_scroll_y, animate=False)
         self.query_one(StatsBar).update_stats(self.sessions, self.sort_mode)
+
+        if self._pending_view_restore:
+            mode, self._pending_view_restore = self._pending_view_restore, None
+            self._open_view(mode)
 
     def _make_menu_handler(self, s: Session):
         """Build the SessionMenu dismiss callback for a session."""
@@ -4186,6 +4192,9 @@ class ClaudeMonitor(App):
 
     _SELECTION_BG = "on rgb(58,58,80)"
 
+    def _release_cursor_guard(self) -> None:
+        self._extending_cursor = False
+
     def _with_selection_style(self, sid: str, cells: list[str]) -> list[str]:
         if sid not in self._selection:
             return cells
@@ -4459,6 +4468,37 @@ class ClaudeMonitor(App):
 
     _view_modes = ["rows", "kanban", "timeline"]
     _current_view = "rows"
+    _pending_view_restore: str | None = None
+
+    def _save_view_state(self) -> None:
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            return
+        prefs = load_prefs()
+        prefs["view_state"] = {
+            "sort_mode": self.sort_mode.value,
+            "show_subagents": self.show_subagents,
+            "show_archived": self.show_archived,
+            "show_groups": self.show_groups,
+            "view": self._current_view,
+        }
+        save_prefs(prefs)
+
+    def _load_view_state(self) -> None:
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            return
+        vs = load_prefs().get("view_state") or {}
+        if not vs:
+            return
+        try:
+            self.sort_mode = SortMode(vs.get("sort_mode", self.sort_mode.value))
+        except ValueError:
+            pass
+        self.show_subagents = bool(vs.get("show_subagents", self.show_subagents))
+        self.show_archived = bool(vs.get("show_archived", self.show_archived))
+        self.show_groups = bool(vs.get("show_groups", self.show_groups))
+        view = vs.get("view", "rows")
+        if view in self._view_modes and view != "rows":
+            self._pending_view_restore = view
 
     def action_cycle_view(self) -> None:
         idx = self._view_modes.index(self._current_view)
@@ -4490,11 +4530,16 @@ class ClaudeMonitor(App):
         # mode == "rows" → just stay on the default screen (no modal to push)
 
     def action_restart(self) -> None:
+        self._save_view_state()
         subprocess.run(
             ["git", "pull", "--ff-only"],
             cwd=_REPO_DIR, capture_output=True, timeout=15,
         )
         self.exit(return_code=RESTART_EXIT_CODE)
+
+    async def action_quit(self) -> None:
+        self._save_view_state()
+        self.exit()
 
     def _sync_system_theme(self, sys_dark: bool) -> None:
         """Always follow macOS appearance."""

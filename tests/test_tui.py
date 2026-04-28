@@ -737,6 +737,36 @@ class TestHideAndMultiSelect:
             await pilot.pause()
             assert pilot.app._hidden >= {"arch-1", "arch-2"}
 
+    async def test_shift_up_shrinks_selection(self, archived_sessions):
+        async with await self._app(archived_sessions) as pilot:
+            table = pilot.app.query_one("#session-table", DataTable)
+            table.move_cursor(row=0)
+            await pilot.pause()
+            await pilot.press("shift+down", "shift+down")
+            await pilot.pause()
+            n_before = len(pilot.app._selection)
+            await pilot.press("shift+up")
+            await pilot.pause()
+            assert len(pilot.app._selection) == n_before - 1
+            assert pilot.app._selection_anchor is not None
+
+    async def test_selection_survives_refresh(self, archived_sessions):
+        async with await self._app(archived_sessions) as pilot:
+            table = pilot.app.query_one("#session-table", DataTable)
+            pilot.app._extending_cursor = True
+            table.move_cursor(row=1)  # anchor NOT at row 0
+            pilot.app._extending_cursor = False
+            await pilot.pause()
+            await pilot.press("shift+down")
+            await pilot.pause()
+            sel_before = set(pilot.app._selection)
+            anchor_before = pilot.app._selection_anchor
+            pilot.app.refresh_sessions()
+            await pilot.pause()
+            await pilot.pause()
+            assert pilot.app._selection == sel_before
+            assert pilot.app._selection_anchor == anchor_before
+
     async def test_hide_preserves_cursor_at_survivor(self, archived_sessions):
         async with await self._app(archived_sessions) as pilot:
             table = pilot.app.query_one("#session-table", DataTable)
