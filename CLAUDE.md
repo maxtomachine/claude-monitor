@@ -66,6 +66,10 @@ Single file: `claude_monitor.py`. Key sections:
 | `n` | Send `/rename` to selected session |
 | `P` | Broadcast `/proactive` to all sessions in cursor's group |
 | `Enter` | Session context menu |
+| `double-click` | Jump to session's terminal (single-click highlights only) |
+| `Shift+Up/Down` | Extend multi-row selection |
+| `Shift+Click` | Extend selection to clicked row |
+| `Delete` / `Backspace` | Hide archived/closed row(s) — press twice to confirm (history mode only) |
 
 ## Statusline integration
 
