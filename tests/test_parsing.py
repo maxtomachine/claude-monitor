@@ -2,6 +2,7 @@
 
 import json
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 from claude_monitor import (
@@ -14,6 +15,9 @@ from claude_monitor import (
     read_hook_state,
     read_session_memory_title,
     _resolve_match_candidates,
+    _pid_is_claude,
+    _is_session_alive,
+    count_background_activity,
 )
 from tests.helpers import make_session, make_transcript_jsonl
 
@@ -203,6 +207,140 @@ class TestHookState:
             # (won't actually test cache here since mtime changes; just verify no crash)
             f.write_text(json.dumps({"state": "thinking"}))
             assert read_hook_state("s1")["state"] in ("idle", "thinking")
+
+
+class TestSessionLiveness:
+    def _ps_result(self, comm: str):
+        m = type("R", (), {"stdout": comm, "returncode": 0})()
+        return m
+
+    def test_pid_is_claude_matches_cli(self):
+        with patch("claude_monitor.subprocess.run", return_value=self._ps_result("claude")):
+            assert _pid_is_claude(12345) is True
+
+    def test_pid_is_claude_rejects_recycled(self):
+        with patch("claude_monitor.subprocess.run", return_value=self._ps_result("mdworker_shared")):
+            assert _pid_is_claude(12345) is False
+
+    def test_pid_is_claude_rejects_helpers(self):
+        for comm in ("Claude Helper", "claude_crashpad_handler", "Claude.app", "claude-monitor"):
+            with patch("claude_monitor.subprocess.run", return_value=self._ps_result(comm)):
+                assert _pid_is_claude(12345) is False, comm
+
+    def test_pid_is_claude_dead_pid(self):
+        with patch("claude_monitor.subprocess.run", return_value=self._ps_result("")):
+            assert _pid_is_claude(99999) is False
+
+    def test_alive_rejects_recycled_hook_pid(self):
+        """Hook state has a PID, the PID is alive, but it's not a claude process
+        — session must NOT be reported alive (ghost-row bug)."""
+        with patch("claude_monitor._pid_map", {}), \
+             patch("claude_monitor._refresh_pid_map"), \
+             patch("claude_monitor._recently_resumed", {}), \
+             patch("claude_monitor.read_hook_state", return_value={"pid": 62235}), \
+             patch("claude_monitor._pid_is_claude", return_value=False):
+            assert _is_session_alive("ghost-sid") is False
+
+    def test_alive_accepts_genuine_hook_pid(self):
+        with patch("claude_monitor._pid_map", {}), \
+             patch("claude_monitor._refresh_pid_map"), \
+             patch("claude_monitor._recently_resumed", {}), \
+             patch("claude_monitor.read_hook_state", return_value={"pid": 6990}), \
+             patch("claude_monitor._pid_is_claude", return_value=True):
+            assert _is_session_alive("real-sid") is True
+
+
+class TestBackgroundActivity:
+    def _layout(self, tmp_path, fresh: dict[str, list[str]], stale: dict[str, list[str]] | None = None):
+        """Create <tmp>/sid.jsonl plus subagents/workflows dirs with files."""
+        transcript = tmp_path / "sid.jsonl"
+        transcript.touch()
+        base = tmp_path / "sid"
+        for sub, names in (fresh or {}).items():
+            d = base / sub
+            d.mkdir(parents=True, exist_ok=True)
+            for n in names:
+                (d / n).write_text("{}")
+        import os as _os
+        for sub, names in (stale or {}).items():
+            d = base / sub
+            d.mkdir(parents=True, exist_ok=True)
+            for n in names:
+                f = d / n
+                f.write_text("{}")
+                old = time.time() - 600
+                _os.utime(f, (old, old))
+        return str(transcript)
+
+    def test_no_dirs_returns_zero(self, tmp_path):
+        transcript = tmp_path / "sid.jsonl"
+        transcript.touch()
+        assert count_background_activity(str(transcript)) == 0
+
+    def test_counts_fresh_subagents_and_workflows(self, tmp_path):
+        t = self._layout(tmp_path, {"subagents": ["a.jsonl", "b.jsonl"], "workflows": ["w.jsonl"]})
+        assert count_background_activity(t) == 3
+
+    def test_ignores_stale_files(self, tmp_path):
+        t = self._layout(tmp_path,
+                         fresh={"subagents": ["a.jsonl"]},
+                         stale={"subagents": ["old.jsonl"], "workflows": ["old2.jsonl"]})
+        assert count_background_activity(t) == 1
+
+    def test_ignores_non_jsonl(self, tmp_path):
+        t = self._layout(tmp_path, {"subagents": ["a.jsonl", "note.txt"]})
+        assert count_background_activity(t) == 1
+
+    def test_status_idle_becomes_background(self, tmp_path):
+        t = self._layout(tmp_path, {"subagents": ["a.jsonl"]})
+        with patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor.read_hook_state",
+                   return_value={"state": "idle", "state_entered_at": ""}):
+            assert determine_status("sid", 0, "", t) == "background"
+
+    def test_status_idle_stays_idle_without_activity(self, tmp_path):
+        transcript = tmp_path / "sid.jsonl"
+        transcript.touch()
+        with patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor.read_hook_state",
+                   return_value={"state": "idle", "state_entered_at": ""}):
+            assert determine_status("sid", 0, "", str(transcript)) == "waiting"
+
+    def test_status_working_unchanged_by_activity(self, tmp_path):
+        t = self._layout(tmp_path, {"subagents": ["a.jsonl"]})
+        with patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor.read_hook_state", return_value={"state": "thinking"}):
+            assert determine_status("sid", 0, "", t) == "working"
+
+
+class TestTranscriptCustomTitle:
+    def _hook_mod(self):
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / "hooks"))
+        import session_tracker
+        return session_tracker
+
+    def test_reads_latest_custom_title(self, tmp_path):
+        st = self._hook_mod()
+        t = tmp_path / "x.jsonl"
+        t.write_text(
+            '{"type":"user","message":{"content":"hi"}}\n'
+            '{"type":"custom-title","customTitle":"Old Name"}\n'
+            '{"type":"assistant","message":{"content":[]}}\n'
+            '{"type":"custom-title","customTitle":"New Name"}\n'
+            '{"type":"user","message":{"content":"more"}}\n'
+        )
+        assert st.read_transcript_custom_title(str(t)) == "New Name"
+
+    def test_missing_file(self):
+        st = self._hook_mod()
+        assert st.read_transcript_custom_title("/nonexistent/x.jsonl") == ""
+
+    def test_no_custom_title_lines(self, tmp_path):
+        st = self._hook_mod()
+        t = tmp_path / "x.jsonl"
+        t.write_text('{"type":"user","message":{"content":"hi"}}\n')
+        assert st.read_transcript_custom_title(str(t)) == ""
 
 
 class TestSessionMemoryTitle:
