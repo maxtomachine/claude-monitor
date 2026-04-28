@@ -66,6 +66,10 @@ Single file: `claude_monitor.py`. Key sections:
 | `n` | Send `/rename` to selected session |
 | `P` | Broadcast `/proactive` to all sessions in cursor's group |
 | `Enter` | Session context menu |
+| `double-click` | Jump to session's terminal (single-click highlights only) |
+| `Shift+Up/Down` | Extend multi-row selection |
+| `Shift+Click` | Extend selection to clicked row |
+| `Delete` / `Backspace` | Hide archived/closed row(s) — press twice to confirm (history mode only) |
 
 ## Statusline integration
 
@@ -89,6 +93,8 @@ This project layers multiple technologies in unusual ways: bash statusline scrip
 3. **The blast radius is invisible.** Editing the context bar section can break the quota bar section 100 lines away because they share the same responsive variable. Editing a JXA window-raise script can break tab switching because z-order changes between reads.
 
 **Before editing any section**, read the full surrounding context to understand what else depends on the same variables, ordering, or state. After making changes, visually verify ALL parts of the statusline or TUI — not just the part you changed.
+
+4. **Any action that calls `refresh_sessions()` must preserve cursor position.** The refresh path restores the cursor by `_selected_key` (the sid under the cursor when refresh was scheduled). If your action removes/filters/re-sorts rows such that the cursor's sid is no longer in the new table, the cursor silently resets to row 0. Before calling `refresh_sessions()`, move the cursor to a row that will survive the refresh — or set `_selected_key` to a survivor's sid directly.
 
 ## Key conventions
 

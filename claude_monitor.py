@@ -18,7 +18,11 @@ from pathlib import Path
 def _escape_markup(text: str) -> str:
     """Escape all [ for Textual markup (rich.markup.escape misses some)."""
     return text.replace("[", "\\[")
+from textual import events
 from textual.app import App, ComposeResult
+from textual.coordinate import Coordinate
+from textual.message import Message
+from textual.widgets.data_table import RowKey
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
@@ -81,6 +85,21 @@ HOOK_STATE_DIR = Path.home() / ".claude" / "session-states"
 TASKS_DIR = Path.home() / ".claude" / "tasks"
 SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 PREFS_PATH = Path.home() / ".claude" / "monitor-prefs.json"
+HIDDEN_PATH = Path.home() / ".claude" / "monitor-hidden.json"
+
+
+def load_hidden_sessions() -> set[str]:
+    try:
+        return set(json.loads(HIDDEN_PATH.read_text()))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return set()
+
+
+def save_hidden_sessions(hidden: set[str]) -> None:
+    try:
+        HIDDEN_PATH.write_text(json.dumps(sorted(hidden)))
+    except OSError:
+        pass
 DOING_MAX_WIDTH = 40
 RESTART_EXIT_CODE = 99
 _update_available: str = ""  # Commit summary when remote is ahead
@@ -194,11 +213,12 @@ class SortMode(Enum):
 
 
 STATUS_PRIORITY = {
-    "working": 0, "debriefing": 1, "needs_approval": 2,
-    "waiting": 3, "idle": 4, "closed": 5, "archived": 6,
+    "working": 0, "background": 1, "debriefing": 2, "needs_approval": 3,
+    "waiting": 4, "idle": 5, "closed": 6, "archived": 7,
 }
 STATUS_DISPLAY = {
     "working": ("● WORKING", "green"),
+    "background": ("◐ BUSY", "cyan"),
     "debriefing": ("⏳ DEBRIEFING", "magenta"),
     "needs_approval": ("◉ APPROVE", "yellow"),
     "waiting": ("○ WAITING", "dark_orange"),
@@ -237,6 +257,7 @@ class Session:
     last_assistant_text: str = ""
     status_name: str = ""
     project_path: str = ""  # Original launch directory (for resume)
+    background_count: int = 0
 
 
 # ── Preferences ───────────────────────────────────────────────────────────────
@@ -452,6 +473,35 @@ def count_compactions(parent_path: str) -> int:
 
 def find_subagent_paths(parent_path: str) -> list[Path]:
     return _scan_subagent_dir(parent_path)[1]
+
+
+_BACKGROUND_WINDOW_S = 15.0
+
+
+def count_background_activity(transcript_path: str) -> int:
+    """How many subagent/workflow transcripts under this session were written
+    to in the last _BACKGROUND_WINDOW_S seconds — i.e., spawned work that is
+    still running while the main loop sits idle."""
+    p = Path(transcript_path)
+    base = p.parent / p.stem
+    now = time.time()
+    n = 0
+    for sub in ("subagents", "workflows"):
+        d = base / sub
+        if not d.is_dir():
+            continue
+        try:
+            for f in d.iterdir():
+                if f.suffix != ".jsonl":
+                    continue
+                try:
+                    if now - f.stat().st_mtime < _BACKGROUND_WINDOW_S:
+                        n += 1
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return n
 
 
 @dataclass
@@ -820,7 +870,8 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
             or session_id[:8]
         )
 
-    status = determine_status(session_id, data["last_assistant_time"], display_title)
+    status = determine_status(session_id, data["last_assistant_time"], display_title, path)
+    bg_count = count_background_activity(path) if status == "background" else 0
 
     # Context %: how much context is USED (burnt).
     # Statusline cache stores remaining %, so we flip it.
@@ -873,6 +924,7 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
         last_assistant_text=data["last_assistant_text"],
         status_name=status_name,
         project_path=idx.get("projectPath", ""),
+        background_count=bg_count,
     )
 
 
@@ -912,6 +964,21 @@ _recently_resumed: dict[str, float] = {}  # sid -> timestamp (set by resume_sess
 _RESUME_GRACE = 60  # seconds to treat a resumed session as alive without a PID
 
 
+def _pid_is_claude(pid: int) -> bool:
+    """True iff PID is alive AND is a claude CLI process — guards against
+    recycled PIDs where an old session's PID now belongs to e.g. mdworker."""
+    try:
+        comm = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "comm="],
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip().lower()
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return ("claude" in comm and "monitor" not in comm
+            and "helper" not in comm and "crashpad" not in comm
+            and ".app" not in comm)
+
+
 def _is_session_alive(session_id: str, display_title: str = "") -> bool:
     """Check if the Claude process for this session is still running.
 
@@ -936,9 +1003,9 @@ def _is_session_alive(session_id: str, display_title: str = "") -> bool:
     hook = read_hook_state(session_id)
     if hook and hook.get("pid"):
         try:
-            os.kill(int(hook["pid"]), 0)
-            return True
-        except (OSError, ValueError):
+            if _pid_is_claude(int(hook["pid"])):
+                return True
+        except ValueError:
             pass
 
     # Last resort: check if we just resumed this session
@@ -1099,10 +1166,15 @@ def read_hook_state(session_id: str) -> dict | None:
 
 
 def determine_status(session_id: str, last_assistant_time: float,
-                     display_title: str = "") -> str:
+                     display_title: str = "", transcript_path: str = "") -> str:
     alive = _is_session_alive(session_id)
     if not alive:
         return "closed"
+
+    def _idle_or_background(base: str) -> str:
+        if transcript_path and count_background_activity(transcript_path) > 0:
+            return "background"
+        return base
 
     # Tier 1: hook state files (real-time, event-driven)
     hook = read_hook_state(session_id)
@@ -1120,10 +1192,10 @@ def determine_status(session_id: str, last_assistant_time: float,
             if entered:
                 try:
                     elapsed = time.time() - parse_timestamp(entered)
-                    return "idle" if elapsed > 300 else "waiting"
+                    return _idle_or_background("idle" if elapsed > 300 else "waiting")
                 except (ValueError, TypeError):
                     pass
-            return "waiting"
+            return _idle_or_background("waiting")
 
     # Tier 2: signal files (legacy)
     if SIGNALS_DIR.exists():
@@ -1143,8 +1215,8 @@ def determine_status(session_id: str, last_assistant_time: float,
         if elapsed < 30:
             return "working"
         elif elapsed < 300:
-            return "waiting"
-    return "idle"
+            return _idle_or_background("waiting")
+    return _idle_or_background("idle")
 
 
 # ── Formatting ────────────────────────────────────────────────────────────────
@@ -1355,6 +1427,10 @@ def generate_activity(s: Session) -> str:
     Waiting → gerund:     "Editing claude_monitor.py"
     Idle → past tense:    "Edited claude_monitor.py"
     """
+    if s.status == "background":
+        n = s.background_count
+        return f"{n} agent{'s' if n != 1 else ''} running"
+
     # Tier 1: hook state (real-time tool + target)
     hook = read_hook_state(s.session_id)
     gerund = ""
@@ -2103,6 +2179,7 @@ KANBAN_COLUMNS = [
     ("idle",           "◌ Idle",     "grey70"),
     ("waiting",        "○ Waiting",  "dark_orange"),
     ("needs_approval", "◉ Approval", "yellow"),
+    ("background",     "◐ Busy",     "cyan"),
     ("working",        "● Working",  "green"),
 ]
 
@@ -3302,6 +3379,40 @@ class StatsBar(Horizontal):
         self.query_one("#stats-sort", Label).update(f" [magenta]sort: {sort_mode.label}[/]")
 
 
+class SessionTable(DataTable):
+    """DataTable that owns mouse clicks: single-click highlights only,
+    double-click posts RowDoubleClicked. Keyboard Enter still fires the
+    stock RowSelected (→ context menu)."""
+
+    class RowDoubleClicked(Message):
+        def __init__(self, row_key: RowKey) -> None:
+            self.row_key = row_key
+            super().__init__()
+
+    class RowShiftClicked(Message):
+        def __init__(self, row_index: int) -> None:
+            self.row_index = row_index
+            super().__init__()
+
+    def on_click(self, event: events.Click) -> None:
+        meta = event.style.meta
+        row = meta.get("row")
+        if row is None or row < 0:
+            return  # header / out-of-bounds — let default handling run
+        event.prevent_default()
+        event.stop()
+        if event.shift:
+            self.post_message(self.RowShiftClicked(row))
+            return
+        self.cursor_coordinate = Coordinate(row, meta.get("column", 0) or 0)
+        if event.chain == 2:
+            try:
+                key = self.ordered_rows[row].key
+            except IndexError:
+                return
+            self.post_message(self.RowDoubleClicked(key))
+
+
 class ClaudeMonitor(App):
     TITLE = "Claude Monitor"
     ENABLE_COMMAND_PALETTE = False
@@ -3347,6 +3458,10 @@ class ClaudeMonitor(App):
         Binding("pagedown", "next_group", "PgDn", show=False, priority=True),
         Binding("home", "table_home", "Home", show=False, priority=True),
         Binding("end", "table_end", "End", show=False, priority=True),
+        Binding("backspace", "hide_selected", "Hide", show=False),
+        Binding("delete", "hide_selected", "Hide", show=False),
+        Binding("shift+up", "extend_selection(-1)", "Select↑", show=False, priority=True),
+        Binding("shift+down", "extend_selection(1)", "Select↓", show=False, priority=True),
     ]
 
     sort_mode: reactive[SortMode] = reactive(SortMode.ALPHA)
@@ -3368,6 +3483,12 @@ class ClaudeMonitor(App):
     _prev_statuses: dict[str, str] = {}  # sid -> previous status (for transition logging)
     _spin_idx: int = 0
     _last_cursor_row: int = 0
+    _hidden: set[str] = set()
+    _selection: set[str] = set()
+    _selection_anchor: str | None = None
+    _delete_armed_for: frozenset[str] | None = None
+    _last_rendered: dict[str, list[str]] = {}
+    _extending_cursor: bool = False
 
     def notify(self, message, *, timeout: float | None = 5, **kwargs):
         """Override to log every toast notification."""
@@ -3378,7 +3499,7 @@ class ClaudeMonitor(App):
         yield Header()
         yield StatsBar()
         yield Static("", id="update-banner")
-        yield DataTable(id="session-table", cursor_type="row")
+        yield SessionTable(id="session-table", cursor_type="row")
         yield Static(
             "",
             id="detail-panel"
@@ -3395,6 +3516,9 @@ class ClaudeMonitor(App):
         self.register_theme(GRUVBOX_LIGHT)
         self._visible_cols = get_visible_columns()
         self._col_order = get_column_order()
+        self._hidden = load_hidden_sessions()
+        self._selection = set()
+        self._load_view_state()
         self.theme = "gruvbox-dark" if _system_is_dark() else "gruvbox-light"
         t0 = _perf("on_mount: load_prefs (cols+theme)", t0)
         self._rebuild_table_columns()
@@ -3550,6 +3674,9 @@ class ClaudeMonitor(App):
             if not self.show_archived:
                 sessions = [s for s in sessions if s.status != "closed"]
 
+            if self._hidden:
+                sessions = [s for s in sessions if s.session_id not in self._hidden]
+
             # Auto-close terminal tabs for debriefed sessions
             cleaned = _poll_debrief_done_signals(sessions)
 
@@ -3649,7 +3776,12 @@ class ClaudeMonitor(App):
         saved_scroll_x = table.scroll_x
         saved_scroll_y = table.scroll_y
 
+        # Everything between clear() and cursor-restore can fire spurious
+        # RowHighlighted events (e.g. for row 0 after re-add). Hold the guard
+        # until those queued messages have drained.
+        self._extending_cursor = True
         table.clear()
+        self._last_rendered = {}
         n_cols = len(self._visible_cols)
         last_group = None
         row_map: list[Session | None] = []
@@ -3677,7 +3809,9 @@ class ClaudeMonitor(App):
                     last_group = gk
                 # Indent first cell so member rows nest under the ▸ header
                 cells = ["  " + cells[0], *cells[1:]]
-            table.add_row(*cells, key=s.session_id)
+            self._last_rendered[s.session_id] = cells
+            display = self._with_selection_style(s.session_id, cells)
+            table.add_row(*display, key=s.session_id)
             row_map.append(s)
         self._row_map = row_map
         self._group_header_rows = group_header_rows
@@ -3689,6 +3823,7 @@ class ClaudeMonitor(App):
                     break
         elif saved_row_idx is not None:
             table.move_cursor(row=min(saved_row_idx, len(row_map) - 1))
+        self.call_after_refresh(self._release_cursor_guard)
 
         # Force session column to 50% of terminal width — must be set after
         # rows are added because DataTable auto-sizes columns to content.
@@ -3703,6 +3838,10 @@ class ClaudeMonitor(App):
 
         table.scroll_to(saved_scroll_x, saved_scroll_y, animate=False)
         self.query_one(StatsBar).update_stats(self.sessions, self.sort_mode)
+
+        if self._pending_view_restore:
+            mode, self._pending_view_restore = self._pending_view_restore, None
+            self._open_view(mode)
 
     def _make_menu_handler(self, s: Session):
         """Build the SessionMenu dismiss callback for a session."""
@@ -3765,13 +3904,24 @@ class ClaudeMonitor(App):
         return handle_action
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Enter key pressed on a row — open context menu."""
+        """Enter key on a row — open context menu.
+        (Mouse clicks no longer reach here; SessionTable.on_click owns them.)"""
         if not (event.row_key and event.row_key.value):
             return
         s = next((s for s in self._flat_rows if s.session_id == event.row_key.value), None)
         if not s:
             return
         self.push_screen(SessionMenu(s), self._make_menu_handler(s))
+
+    def on_session_table_row_double_clicked(
+        self, event: "SessionTable.RowDoubleClicked"
+    ) -> None:
+        if not event.row_key or not event.row_key.value:
+            return
+        s = next((s for s in self._flat_rows if s.session_id == event.row_key.value), None)
+        if not s:
+            return
+        self._make_menu_handler(s)("jump")
 
     def _start_dismiss(self, session: Session) -> None:
         sid = session.session_id
@@ -3910,6 +4060,17 @@ class ClaudeMonitor(App):
         self.call_from_thread(self.refresh_sessions)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        # Cursor moves clear multi-selection unless landing inside it (extend),
+        # and always disarm a pending delete-confirm if the target shifted.
+        new_sid = event.row_key.value if (event.row_key and event.row_key.value) else None
+        if not self._extending_cursor:
+            if self._selection and new_sid not in self._selection:
+                self._set_selection(set())
+                self._selection_anchor = None
+            if self._delete_armed_for is not None:
+                want = self._selection or ({new_sid} if new_sid else set())
+                if not want or not self._delete_armed_for.issuperset(want):
+                    self._delete_armed_for = None
         if not (event.row_key and event.row_key.value):
             return
         key = event.row_key.value
@@ -4014,7 +4175,154 @@ class ClaudeMonitor(App):
         self.refresh_sessions()
         self.notify(f"Subagents {'shown' if self.show_subagents else 'hidden'}", timeout=3)
 
+    # ── Multi-select & hide (history mode) ────────────────────────────────
+
+    def _cursor_session(self) -> "Session | None":
+        table = self.query_one("#session-table", DataTable)
+        cr = table.cursor_row
+        if cr is None or not (0 <= cr < len(self._row_map)):
+            return None
+        return self._row_map[cr]
+
+    def _row_index_of(self, sid: str) -> int | None:
+        for i, s in enumerate(self._row_map):
+            if s and s.session_id == sid:
+                return i
+        return None
+
+    _SELECTION_BG = "on rgb(58,58,80)"
+
+    def _release_cursor_guard(self) -> None:
+        self._extending_cursor = False
+
+    def _with_selection_style(self, sid: str, cells: list[str]) -> list[str]:
+        if sid not in self._selection:
+            return cells
+        return [f"[{self._SELECTION_BG}]{c}[/]" for c in cells]
+
+    def _set_selection(self, sids: set[str]) -> None:
+        if sids == self._selection:
+            return
+        old = self._selection
+        self._selection = sids
+        self._delete_armed_for = None
+        table = self.query_one("#session-table", DataTable)
+        cols = self._visible_cols
+        for sid in old ^ sids:
+            base = self._last_rendered.get(sid)
+            if not base:
+                continue
+            display = self._with_selection_style(sid, base)
+            for col, val in zip(cols, display):
+                try:
+                    table.update_cell(sid, col, val)
+                except Exception:
+                    pass
+
+    def action_extend_selection(self, delta: int) -> None:
+        table = self.query_one("#session-table", DataTable)
+        cur = self._cursor_session()
+        if cur is None:
+            return
+        if not self._selection or self._selection_anchor is None:
+            self._selection_anchor = cur.session_id
+        # Move cursor by delta, skipping non-session rows (group headers/spacers)
+        cr = table.cursor_row or 0
+        n = len(self._row_map)
+        nr = cr
+        while True:
+            nr += delta
+            if not (0 <= nr < n):
+                nr = max(0, min(n - 1, nr))
+                break
+            if self._row_map[nr] is not None:
+                break
+        # Selection = all session rows between anchor and cursor (inclusive).
+        # Set BEFORE moving the cursor so the RowHighlighted handler sees the
+        # new row already inside the selection and leaves it alone.
+        ai = self._row_index_of(self._selection_anchor)
+        if ai is None:
+            ai = nr
+        lo, hi = sorted((ai, nr))
+        sids = {s.session_id for s in self._row_map[lo:hi + 1] if s}
+        self._set_selection(sids)
+        table.move_cursor(row=nr)
+
+    def action_hide_selected(self) -> None:
+        if not self.show_archived:
+            self.notify("Hide only works in history mode (press h)", timeout=3)
+            return
+        target: set[str] = set(self._selection)
+        if not target:
+            cur = self._cursor_session()
+            if cur:
+                target = {cur.session_id}
+        # Restrict to archived/closed — never hide a live session by accident
+        eligible = {
+            s.session_id for s in self._flat_rows
+            if s.session_id in target and s.status in ("archived", "closed")
+        }
+        if not eligible:
+            self.notify("Nothing hideable under cursor (archived/closed only)",
+                        severity="warning", timeout=3)
+            return
+        if self._delete_armed_for == frozenset(eligible):
+            self._hidden |= eligible
+            save_hidden_sessions(self._hidden)
+            n = len(eligible)
+            self.notify(f"Hidden {n} session{'s' if n != 1 else ''}", timeout=3)
+            self._selection = set()
+            self._selection_anchor = None
+            self._delete_armed_for = None
+            # Land the cursor on the nearest surviving row so refresh restores
+            # by that key instead of the just-hidden one (which would reset to 0).
+            table = self.query_one("#session-table", DataTable)
+            cr = table.cursor_row or 0
+            survivor = None
+            for i in range(cr, len(self._row_map)):
+                s = self._row_map[i]
+                if s and s.session_id not in self._hidden:
+                    survivor = i
+                    break
+            if survivor is None:
+                for i in range(cr - 1, -1, -1):
+                    s = self._row_map[i]
+                    if s and s.session_id not in self._hidden:
+                        survivor = i
+                        break
+            if survivor is not None:
+                self._extending_cursor = True
+                try:
+                    table.move_cursor(row=survivor)
+                finally:
+                    self._extending_cursor = False
+            self.refresh_sessions()
+        else:
+            self._delete_armed_for = frozenset(eligible)
+            n = len(eligible)
+            what = "this session" if n == 1 else f"{n} sessions"
+            self.notify(f"Press delete again to hide {what}",
+                        severity="warning", timeout=4)
+
+    def on_session_table_row_shift_clicked(
+        self, event: "SessionTable.RowShiftClicked"
+    ) -> None:
+        table = self.query_one("#session-table", DataTable)
+        if self._selection_anchor is None:
+            cur = self._cursor_session()
+            self._selection_anchor = cur.session_id if cur else None
+        ai = self._row_index_of(self._selection_anchor) if self._selection_anchor else None
+        if ai is None:
+            ai = table.cursor_row or 0
+        lo, hi = sorted((ai, event.row_index))
+        sids = {s.session_id for s in self._row_map[lo:hi + 1] if s}
+        self._set_selection(sids)
+        table.move_cursor(row=event.row_index)
+
     def action_toggle_archived(self) -> None:
+        self._selection = set()
+        self._selection_anchor = None
+        self._delete_armed_for = None
         self.show_archived = not self.show_archived
         self.refresh_sessions()
         self.notify(f"All sessions {'shown' if self.show_archived else 'recent only'}", timeout=3)
@@ -4160,6 +4468,37 @@ class ClaudeMonitor(App):
 
     _view_modes = ["rows", "kanban", "timeline"]
     _current_view = "rows"
+    _pending_view_restore: str | None = None
+
+    def _save_view_state(self) -> None:
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            return
+        prefs = load_prefs()
+        prefs["view_state"] = {
+            "sort_mode": self.sort_mode.value,
+            "show_subagents": self.show_subagents,
+            "show_archived": self.show_archived,
+            "show_groups": self.show_groups,
+            "view": self._current_view,
+        }
+        save_prefs(prefs)
+
+    def _load_view_state(self) -> None:
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            return
+        vs = load_prefs().get("view_state") or {}
+        if not vs:
+            return
+        try:
+            self.sort_mode = SortMode(vs.get("sort_mode", self.sort_mode.value))
+        except ValueError:
+            pass
+        self.show_subagents = bool(vs.get("show_subagents", self.show_subagents))
+        self.show_archived = bool(vs.get("show_archived", self.show_archived))
+        self.show_groups = bool(vs.get("show_groups", self.show_groups))
+        view = vs.get("view", "rows")
+        if view in self._view_modes and view != "rows":
+            self._pending_view_restore = view
 
     def action_cycle_view(self) -> None:
         idx = self._view_modes.index(self._current_view)
@@ -4191,11 +4530,16 @@ class ClaudeMonitor(App):
         # mode == "rows" → just stay on the default screen (no modal to push)
 
     def action_restart(self) -> None:
+        self._save_view_state()
         subprocess.run(
             ["git", "pull", "--ff-only"],
             cwd=_REPO_DIR, capture_output=True, timeout=15,
         )
         self.exit(return_code=RESTART_EXIT_CODE)
+
+    async def action_quit(self) -> None:
+        self._save_view_state()
+        self.exit()
 
     def _sync_system_theme(self, sys_dark: bool) -> None:
         """Always follow macOS appearance."""

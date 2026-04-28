@@ -143,6 +143,40 @@ class TestSessionMenu:
                 await pilot.pause()
                 assert len(pilot.app.screen_stack) > 1
 
+    async def test_single_click_highlights_only(self, sample_sessions):
+        with _mock_sessions(sample_sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                # click row index 1 (offset y=2: y=0 header, y=1 row0, y=2 row1)
+                await pilot.click("#session-table", offset=(2, 2), times=1)
+                await pilot.pause()
+                assert table.cursor_row == 1
+                assert len(pilot.app.screen_stack) == 1  # no menu
+
+    async def test_double_click_jumps(self, sample_sessions):
+        with _mock_sessions(sample_sessions), \
+             patch("claude_monitor.focus_terminal_session", return_value=True) as mock_jump:
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.click("#session-table", offset=(2, 2), times=2)
+                await pilot.pause()
+                assert mock_jump.called
+                assert len(pilot.app.screen_stack) == 1  # no menu
+
+    async def test_double_click_on_highlighted_row_jumps(self, sample_sessions):
+        """Regression: dbl-click on the already-selected row must not open
+        the menu on the first click."""
+        with _mock_sessions(sample_sessions), \
+             patch("claude_monitor.focus_terminal_session", return_value=True) as mock_jump:
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                # row 0 is highlighted on mount
+                await pilot.click("#session-table", offset=(2, 1), times=2)
+                await pilot.pause()
+                assert mock_jump.called
+                assert len(pilot.app.screen_stack) == 1
+
     async def test_menu_shows_options(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
@@ -595,3 +629,168 @@ class TestTimeline:
                 await pilot.press("v")
                 await pilot.pause()
                 assert not isinstance(pilot.app.screen, (KanbanView, TimelineView))
+
+
+@pytest.fixture
+def archived_sessions():
+    return [
+        make_session(session_id="arch-1", title="Old A", status="archived"),
+        make_session(session_id="arch-2", title="Old B", status="archived"),
+        make_session(session_id="arch-3", title="Old C", status="closed"),
+        make_session(session_id="live-1", title="Zlive", status="working"),
+    ]
+
+
+class TestHideAndMultiSelect:
+    async def _app(self, sessions):
+        """Mount app in history mode with hidden-set persistence mocked."""
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def _ctx():
+            saved = []
+            with _mock_sessions(sessions), \
+                 patch("claude_monitor.load_hidden_sessions", return_value=set()), \
+                 patch("claude_monitor.save_hidden_sessions",
+                       side_effect=lambda h: saved.append(set(h))):
+                async with ClaudeMonitor().run_test() as pilot:
+                    pilot.app.show_archived = True
+                    await pilot.pause()
+                    pilot._saved = saved  # type: ignore
+                    yield pilot
+        return _ctx()
+
+    async def test_delete_requires_history_mode(self, archived_sessions):
+        with _mock_sessions(archived_sessions), \
+             patch("claude_monitor.load_hidden_sessions", return_value=set()):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                # show_archived defaults False
+                await pilot.press("backspace")
+                await pilot.pause()
+                assert pilot.app._delete_armed_for is None
+
+    async def test_delete_arms_then_hides(self, archived_sessions):
+        async with await self._app(archived_sessions) as pilot:
+            table = pilot.app.query_one("#session-table", DataTable)
+            table.move_cursor(row=0)  # arch-1
+            await pilot.pause()
+            await pilot.press("backspace")
+            await pilot.pause()
+            assert pilot.app._delete_armed_for == frozenset({"arch-1"})
+            assert "arch-1" not in pilot.app._hidden
+            await pilot.press("backspace")
+            await pilot.pause()
+            assert "arch-1" in pilot.app._hidden
+            assert pilot._saved[-1] == {"arch-1"}
+
+    async def test_delete_refuses_live_session(self, archived_sessions):
+        async with await self._app(archived_sessions) as pilot:
+            table = pilot.app.query_one("#session-table", DataTable)
+            # find live-1's row
+            for i, s in enumerate(pilot.app._row_map):
+                if s and s.session_id == "live-1":
+                    table.move_cursor(row=i)
+                    break
+            await pilot.pause()
+            await pilot.press("backspace")
+            await pilot.pause()
+            assert pilot.app._delete_armed_for is None
+            assert "live-1" not in pilot.app._hidden
+
+    async def test_shift_down_extends_selection(self, archived_sessions):
+        async with await self._app(archived_sessions) as pilot:
+            table = pilot.app.query_one("#session-table", DataTable)
+            table.move_cursor(row=0)
+            await pilot.pause()
+            await pilot.press("shift+down")
+            await pilot.pause()
+            assert len(pilot.app._selection) == 2
+            await pilot.press("shift+down")
+            await pilot.pause()
+            assert len(pilot.app._selection) == 3
+
+    async def test_plain_arrow_clears_selection(self, archived_sessions):
+        async with await self._app(archived_sessions) as pilot:
+            table = pilot.app.query_one("#session-table", DataTable)
+            table.move_cursor(row=0)
+            await pilot.pause()
+            await pilot.press("shift+down")
+            await pilot.pause()
+            assert pilot.app._selection
+            await pilot.press("down")
+            await pilot.pause()
+            assert pilot.app._selection == set()
+
+    async def test_batch_hide_via_selection(self, archived_sessions):
+        async with await self._app(archived_sessions) as pilot:
+            table = pilot.app.query_one("#session-table", DataTable)
+            table.move_cursor(row=0)
+            await pilot.pause()
+            await pilot.press("shift+down", "shift+down")  # select 3 rows
+            await pilot.pause()
+            await pilot.press("backspace")  # arm
+            await pilot.pause()
+            armed = pilot.app._delete_armed_for
+            assert armed is not None and len(armed) >= 2
+            await pilot.press("backspace")  # confirm
+            await pilot.pause()
+            assert pilot.app._hidden >= {"arch-1", "arch-2"}
+
+    async def test_shift_up_shrinks_selection(self, archived_sessions):
+        async with await self._app(archived_sessions) as pilot:
+            table = pilot.app.query_one("#session-table", DataTable)
+            table.move_cursor(row=0)
+            await pilot.pause()
+            await pilot.press("shift+down", "shift+down")
+            await pilot.pause()
+            n_before = len(pilot.app._selection)
+            await pilot.press("shift+up")
+            await pilot.pause()
+            assert len(pilot.app._selection) == n_before - 1
+            assert pilot.app._selection_anchor is not None
+
+    async def test_selection_survives_refresh(self, archived_sessions):
+        async with await self._app(archived_sessions) as pilot:
+            table = pilot.app.query_one("#session-table", DataTable)
+            pilot.app._extending_cursor = True
+            table.move_cursor(row=1)  # anchor NOT at row 0
+            pilot.app._extending_cursor = False
+            await pilot.pause()
+            await pilot.press("shift+down")
+            await pilot.pause()
+            sel_before = set(pilot.app._selection)
+            anchor_before = pilot.app._selection_anchor
+            pilot.app.refresh_sessions()
+            await pilot.pause()
+            await pilot.pause()
+            assert pilot.app._selection == sel_before
+            assert pilot.app._selection_anchor == anchor_before
+
+    async def test_hide_preserves_cursor_at_survivor(self, archived_sessions):
+        async with await self._app(archived_sessions) as pilot:
+            table = pilot.app.query_one("#session-table", DataTable)
+            # cursor on row 1 (arch-2)
+            pilot.app._extending_cursor = True
+            table.move_cursor(row=1)
+            pilot.app._extending_cursor = False
+            await pilot.pause()
+            await pilot.press("backspace", "backspace")
+            await pilot.pause()
+            assert "arch-2" in pilot.app._hidden
+            # arch-2 gone; cursor should land on next survivor (arch-3), not row 0
+            cur = pilot.app._row_map[table.cursor_row]
+            assert cur is not None
+            assert cur.session_id != "arch-1"  # not reset to top
+
+    async def test_cursor_move_disarms_delete(self, archived_sessions):
+        async with await self._app(archived_sessions) as pilot:
+            table = pilot.app.query_one("#session-table", DataTable)
+            table.move_cursor(row=0)
+            await pilot.pause()
+            await pilot.press("backspace")
+            await pilot.pause()
+            assert pilot.app._delete_armed_for is not None
+            await pilot.press("down")
+            await pilot.pause()
+            assert pilot.app._delete_armed_for is None
