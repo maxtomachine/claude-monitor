@@ -2,6 +2,7 @@
 
 import json
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 from claude_monitor import (
@@ -310,6 +311,36 @@ class TestBackgroundActivity:
         with patch("claude_monitor._is_session_alive", return_value=True), \
              patch("claude_monitor.read_hook_state", return_value={"state": "thinking"}):
             assert determine_status("sid", 0, "", t) == "working"
+
+
+class TestTranscriptCustomTitle:
+    def _hook_mod(self):
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / "hooks"))
+        import session_tracker
+        return session_tracker
+
+    def test_reads_latest_custom_title(self, tmp_path):
+        st = self._hook_mod()
+        t = tmp_path / "x.jsonl"
+        t.write_text(
+            '{"type":"user","message":{"content":"hi"}}\n'
+            '{"type":"custom-title","customTitle":"Old Name"}\n'
+            '{"type":"assistant","message":{"content":[]}}\n'
+            '{"type":"custom-title","customTitle":"New Name"}\n'
+            '{"type":"user","message":{"content":"more"}}\n'
+        )
+        assert st.read_transcript_custom_title(str(t)) == "New Name"
+
+    def test_missing_file(self):
+        st = self._hook_mod()
+        assert st.read_transcript_custom_title("/nonexistent/x.jsonl") == ""
+
+    def test_no_custom_title_lines(self, tmp_path):
+        st = self._hook_mod()
+        t = tmp_path / "x.jsonl"
+        t.write_text('{"type":"user","message":{"content":"hi"}}\n')
+        assert st.read_transcript_custom_title(str(t)) == ""
 
 
 class TestSessionMemoryTitle:

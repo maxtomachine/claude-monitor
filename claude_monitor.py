@@ -3715,6 +3715,16 @@ class ClaudeMonitor(App):
             else:
                 self._group_counts = {}
 
+            # Disambiguate visible title collisions so two sessions never look
+            # like one phantom duplicate row.
+            title_counts: dict[str, int] = {}
+            for s in flat:
+                if s.title:
+                    title_counts[s.title] = title_counts.get(s.title, 0) + 1
+            for s in flat:
+                if s.title and title_counts.get(s.title, 0) > 1:
+                    s.title = f"{s.title} ·{s.session_id[:8]}"
+
             # Pre-render rows in background thread (Rich markup generation)
             visible_cols = self._visible_cols
             rendered = [(s, render_row(s, visible_cols)) for s in flat]

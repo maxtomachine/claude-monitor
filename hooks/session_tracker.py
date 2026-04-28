@@ -112,6 +112,36 @@ def _atomic_write(path: Path, text: str) -> None:
         raise
 
 
+def read_transcript_custom_title(transcript_path: str | None) -> str:
+    """Latest /rename title from the transcript itself — the same source the
+    monitor TUI uses, so hook + monitor + window title can never diverge."""
+    if not transcript_path:
+        return ""
+    p = Path(transcript_path)
+    if not p.exists():
+        return ""
+    title = ""
+    try:
+        with p.open("rb") as f:
+            try:
+                f.seek(-65536, 2)
+            except OSError:
+                f.seek(0)
+            for raw in f.read().splitlines():
+                line = raw.decode("utf-8", "ignore")
+                if '"custom-title"' not in line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                    if msg.get("type") == "custom-title":
+                        title = msg.get("customTitle", "") or title
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return ""
+    return title
+
+
 def read_session_memory_title(transcript_path: str | None, session_id: str | None = None) -> str:
     """Read session title from session-memory/summary.md next to the transcript."""
     candidates = []
@@ -340,11 +370,18 @@ def write_state(
         title_source = "statusline"
         title_updated_at = datetime.now().isoformat()
 
+    transcript_title = ""
     if event == "stop":
         resolved_transcript = transcript_path or find_transcript_path(session_id)
 
+        transcript_title = read_transcript_custom_title(resolved_transcript)
+        if transcript_title and transcript_title != existing_title:
+            title = transcript_title
+            title_source = "transcript"
+            title_updated_at = datetime.now().isoformat()
+
         sm_title = read_session_memory_title(resolved_transcript, session_id)
-        if sm_title and sm_title != existing_title:
+        if sm_title and not transcript_title and sm_title != existing_title:
             title = sm_title
             title_source = "session-memory"
             title_updated_at = datetime.now().isoformat()
@@ -371,9 +408,11 @@ def write_state(
     else:
         state_entered_at = existing_state_entered_at
 
-    # Terminal title: prefer the statusline session name (matches Claude Code UI),
-    # then stored title, then cwd basename.
-    display_name = statusline_name or title or (Path(cwd).name if cwd else "") or "Claude"
+    # Terminal title: transcript custom-title (canonical, what /rename writes
+    # and what monitor reads) > statusline file > stored title > cwd.
+    # The statusline file lags by one render after /rename, so it must not win.
+    display_name = (transcript_title or statusline_name or title
+                    or (Path(cwd).name if cwd else "") or "Claude")
 
     data = {
         "session_id": session_id,
