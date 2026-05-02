@@ -291,6 +291,17 @@ class TestBackgroundActivity:
         t = self._layout(tmp_path, {"subagents": ["a.jsonl", "note.txt"]})
         assert count_background_activity(t) == 1
 
+    def test_finds_nested_workflow_agents(self, tmp_path):
+        """Workflow agents live at subagents/workflows/wf_<id>/agent-*.jsonl"""
+        transcript = tmp_path / "sid.jsonl"
+        transcript.touch()
+        d = tmp_path / "sid" / "subagents" / "workflows" / "wf_abc"
+        d.mkdir(parents=True)
+        (d / "agent-1.jsonl").write_text("{}")
+        (d / "agent-2.jsonl").write_text("{}")
+        (d / "agent-1.meta.json").write_text("{}")
+        assert count_background_activity(str(transcript)) == 2
+
     def test_status_idle_becomes_background(self, tmp_path):
         t = self._layout(tmp_path, {"subagents": ["a.jsonl"]})
         with patch("claude_monitor._is_session_alive", return_value=True), \

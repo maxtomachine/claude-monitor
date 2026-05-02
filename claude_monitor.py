@@ -481,7 +481,8 @@ _BACKGROUND_WINDOW_S = 15.0
 def count_background_activity(transcript_path: str) -> int:
     """How many subagent/workflow transcripts under this session were written
     to in the last _BACKGROUND_WINDOW_S seconds — i.e., spawned work that is
-    still running while the main loop sits idle."""
+    still running while the main loop sits idle. Workflow agents nest as
+    subagents/workflows/wf_<id>/agent-*.jsonl, so this must recurse."""
     p = Path(transcript_path)
     base = p.parent / p.stem
     now = time.time()
@@ -491,9 +492,7 @@ def count_background_activity(transcript_path: str) -> int:
         if not d.is_dir():
             continue
         try:
-            for f in d.iterdir():
-                if f.suffix != ".jsonl":
-                    continue
+            for f in d.rglob("*.jsonl"):
                 try:
                     if now - f.stat().st_mtime < _BACKGROUND_WINDOW_S:
                         n += 1
