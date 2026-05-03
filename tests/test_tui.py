@@ -80,6 +80,34 @@ class TestAppMounts:
                 assert panel is not None
 
 
+class TestSessionColumnElastic:
+    async def _session_w(self, sessions, term_w):
+        with _mock_sessions(sessions):
+            async with ClaudeMonitor().run_test(size=(term_w, 30)) as pilot:
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                col = table.columns["session"]
+                others = sum(
+                    c.get_render_width(table)
+                    for k, c in table.columns.items()
+                    if getattr(k, "value", k) != "session"
+                )
+                return col.width, others, table.cell_padding
+
+    async def test_session_absorbs_slack(self, sample_sessions):
+        w, others, pad = await self._session_w(sample_sessions, 160)
+        assert w == max(20, 160 - others - 2 * pad)
+        assert w > 160 // 3  # not the old 1/3 cap
+
+    async def test_session_shrinks_last_on_narrow(self, sample_sessions):
+        wide, others_w, _ = await self._session_w(sample_sessions, 160)
+        narrow, others_n, _ = await self._session_w(sample_sessions, 110)
+        # Other columns are content-sized so unchanged; session gives the full 50
+        assert others_w == others_n
+        assert wide - narrow == 50
+        assert narrow >= 20
+
+
 class TestKeyBindings:
     async def test_sort_cycles(self, sample_sessions):
         with _mock_sessions(sample_sessions):

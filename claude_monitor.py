@@ -3639,6 +3639,34 @@ class ClaudeMonitor(App):
                 width = max(20, self.size.width // 3)
             table.add_column(info.get("label", col_key), key=col_key, width=width)
 
+    def _fit_session_column(self, table: DataTable | None = None) -> None:
+        """Give the session column whatever width remains after the other
+        (auto-sized) columns — it's the elastic column, so trailing slack
+        collapses before titles truncate."""
+        if "session" not in self._visible_cols:
+            return
+        if table is None:
+            table = self.query_one("#session-table", DataTable)
+        try:
+            col = table.columns["session"]
+        except KeyError:
+            return
+        others = sum(
+            c.get_render_width(table)
+            for k, c in table.columns.items()
+            if getattr(k, "value", k) != "session"
+        )
+        pad = 2 * table.cell_padding
+        col.width = max(20, self.size.width - others - pad)
+        col.auto_width = False
+        col.content_width = 0
+
+    def on_resize(self) -> None:
+        try:
+            self._fit_session_column()
+        except Exception:
+            pass
+
     def _filter_sessions(self, sessions: list[Session]) -> list[Session]:
         if not self._filter:
             return sessions
@@ -3843,16 +3871,8 @@ class ClaudeMonitor(App):
             table.move_cursor(row=min(saved_row_idx, len(row_map) - 1))
         self.call_after_refresh(self._release_cursor_guard)
 
-        # Force session column to 50% of terminal width — must be set after
-        # rows are added because DataTable auto-sizes columns to content.
-        if "session" in self._visible_cols:
-            try:
-                col = table.columns["session"]
-                col.width = max(20, self.size.width // 3)
-                col.auto_width = False
-                col.content_width = 0
-            except KeyError:
-                pass
+        self._fit_session_column(table)
+        self.call_after_refresh(self._fit_session_column)
 
         table.scroll_to(saved_scroll_x, saved_scroll_y, animate=False)
         self.query_one(StatsBar).update_stats(self.sessions, self.sort_mode)
