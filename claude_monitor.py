@@ -18,7 +18,11 @@ from pathlib import Path
 def _escape_markup(text: str) -> str:
     """Escape all [ for Textual markup (rich.markup.escape misses some)."""
     return text.replace("[", "\\[")
+from textual import events
 from textual.app import App, ComposeResult
+from textual.coordinate import Coordinate
+from textual.message import Message
+from textual.widgets.data_table import RowKey
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
@@ -3360,6 +3364,32 @@ class StatsBar(Horizontal):
         self.query_one("#stats-sort", Label).update(f" [magenta]sort: {sort_mode.label}[/]")
 
 
+class SessionTable(DataTable):
+    """DataTable that owns mouse clicks: single-click highlights only,
+    double-click posts RowDoubleClicked. Keyboard Enter still fires the
+    stock RowSelected (→ context menu)."""
+
+    class RowDoubleClicked(Message):
+        def __init__(self, row_key: RowKey) -> None:
+            self.row_key = row_key
+            super().__init__()
+
+    def on_click(self, event: events.Click) -> None:
+        meta = event.style.meta
+        row = meta.get("row")
+        if row is None or row < 0:
+            return  # header / out-of-bounds — let default handling run
+        event.prevent_default()
+        event.stop()
+        self.cursor_coordinate = Coordinate(row, meta.get("column", 0) or 0)
+        if event.chain == 2:
+            try:
+                key = self.ordered_rows[row].key
+            except IndexError:
+                return
+            self.post_message(self.RowDoubleClicked(key))
+
+
 class ClaudeMonitor(App):
     TITLE = "Claude Monitor"
     ENABLE_COMMAND_PALETTE = False
@@ -3436,7 +3466,7 @@ class ClaudeMonitor(App):
         yield Header()
         yield StatsBar()
         yield Static("", id="update-banner")
-        yield DataTable(id="session-table", cursor_type="row")
+        yield SessionTable(id="session-table", cursor_type="row")
         yield Static(
             "",
             id="detail-panel"
@@ -3823,13 +3853,24 @@ class ClaudeMonitor(App):
         return handle_action
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Enter key pressed on a row — open context menu."""
+        """Enter key on a row — open context menu.
+        (Mouse clicks no longer reach here; SessionTable.on_click owns them.)"""
         if not (event.row_key and event.row_key.value):
             return
         s = next((s for s in self._flat_rows if s.session_id == event.row_key.value), None)
         if not s:
             return
         self.push_screen(SessionMenu(s), self._make_menu_handler(s))
+
+    def on_session_table_row_double_clicked(
+        self, event: "SessionTable.RowDoubleClicked"
+    ) -> None:
+        if not event.row_key or not event.row_key.value:
+            return
+        s = next((s for s in self._flat_rows if s.session_id == event.row_key.value), None)
+        if not s:
+            return
+        self._make_menu_handler(s)("jump")
 
     def _start_dismiss(self, session: Session) -> None:
         sid = session.session_id
