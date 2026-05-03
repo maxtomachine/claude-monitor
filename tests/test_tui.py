@@ -631,6 +631,22 @@ class TestTimeline:
                 assert not isinstance(pilot.app.screen, (KanbanView, TimelineView))
 
 
+class TestTitleDisambiguation:
+    async def test_duplicate_titles_get_sid_suffix(self):
+        dups = [
+            make_session(session_id="abc12345-x", title="Shared Name", status="idle"),
+            make_session(session_id="def67890-y", title="Shared Name", status="working"),
+            make_session(session_id="zzz99999-z", title="Unique", status="idle"),
+        ]
+        with _mock_sessions(dups):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                titles = [s.title for s in pilot.app._flat_rows]
+                assert "Shared Name ·abc12345" in titles
+                assert "Shared Name ·def67890" in titles
+                assert "Unique" in titles
+
+
 @pytest.fixture
 def archived_sessions():
     return [

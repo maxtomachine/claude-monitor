@@ -481,7 +481,8 @@ _BACKGROUND_WINDOW_S = 15.0
 def count_background_activity(transcript_path: str) -> int:
     """How many subagent/workflow transcripts under this session were written
     to in the last _BACKGROUND_WINDOW_S seconds — i.e., spawned work that is
-    still running while the main loop sits idle."""
+    still running while the main loop sits idle. Workflow agents nest as
+    subagents/workflows/wf_<id>/agent-*.jsonl, so this must recurse."""
     p = Path(transcript_path)
     base = p.parent / p.stem
     now = time.time()
@@ -491,9 +492,7 @@ def count_background_activity(transcript_path: str) -> int:
         if not d.is_dir():
             continue
         try:
-            for f in d.iterdir():
-                if f.suffix != ".jsonl":
-                    continue
+            for f in d.rglob("*.jsonl"):
                 try:
                     if now - f.stat().st_mtime < _BACKGROUND_WINDOW_S:
                         n += 1
@@ -3714,6 +3713,16 @@ class ClaudeMonitor(App):
                 self._group_counts = {k: len(groups[k]) for k in ordered_keys}
             else:
                 self._group_counts = {}
+
+            # Disambiguate visible title collisions so two sessions never look
+            # like one phantom duplicate row.
+            title_counts: dict[str, int] = {}
+            for s in flat:
+                if s.title:
+                    title_counts[s.title] = title_counts.get(s.title, 0) + 1
+            for s in flat:
+                if s.title and title_counts.get(s.title, 0) > 1:
+                    s.title = f"{s.title} ·{s.session_id[:8]}"
 
             # Pre-render rows in background thread (Rich markup generation)
             visible_cols = self._visible_cols
