@@ -37,5 +37,13 @@ exec osascript -l JavaScript -e '(() => {
             if (item) { menu.menuItems.byName(item).click(); return "ok"; }
         } catch(e) {}
     }
-    return "not_found";
+    // No monitor window anywhere — launch one
+    try {
+        const ghostty = Application("Ghostty");
+        const w = ghostty.newWindow({
+            withConfiguration: {command: "'"$HOME"'/.local/bin/claude-monitor"}
+        });
+        ghostty.activateWindow(w);
+        return "launched";
+    } catch(e) { return "not_found:" + e.message; }
 })()'
