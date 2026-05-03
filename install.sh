@@ -66,8 +66,8 @@ fi
 
 HOOKS_DIR="$CLAUDE_DIR/hooks"
 mkdir -p "$HOOKS_DIR"
-cp "$REPO_DIR/hooks/session_tracker.py" "$HOOKS_DIR/session_tracker.py"
-echo "Installed hook → $HOOKS_DIR/session_tracker.py"
+ln -sf "$REPO_DIR/hooks/session_tracker.py" "$HOOKS_DIR/session_tracker.py"
+echo "Linked hook → $HOOKS_DIR/session_tracker.py"
 
 # Add hooks config if not already present
 if [ -f "$SETTINGS" ] && ! grep -q '"SessionStart"' "$SETTINGS"; then

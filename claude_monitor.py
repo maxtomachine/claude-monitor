@@ -1171,8 +1171,17 @@ def determine_status(session_id: str, last_assistant_time: float,
         return "closed"
 
     def _idle_or_background(base: str) -> str:
-        if transcript_path and count_background_activity(transcript_path) > 0:
-            return "background"
+        if transcript_path:
+            # Hook says idle, but if the main transcript itself is being
+            # appended to, the model is streaming — slash commands and a few
+            # other paths can miss UserPromptSubmit so the hook never flips.
+            try:
+                if time.time() - os.stat(transcript_path).st_mtime < 5:
+                    return "working"
+            except OSError:
+                pass
+            if count_background_activity(transcript_path) > 0:
+                return "background"
         return base
 
     # Tier 1: hook state files (real-time, event-driven)
