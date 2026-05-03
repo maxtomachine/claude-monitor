@@ -14,6 +14,8 @@ from claude_monitor import (
     read_hook_state,
     read_session_memory_title,
     _resolve_match_candidates,
+    _pid_is_claude,
+    _is_session_alive,
 )
 from tests.helpers import make_session, make_transcript_jsonl
 
@@ -203,6 +205,47 @@ class TestHookState:
             # (won't actually test cache here since mtime changes; just verify no crash)
             f.write_text(json.dumps({"state": "thinking"}))
             assert read_hook_state("s1")["state"] in ("idle", "thinking")
+
+
+class TestSessionLiveness:
+    def _ps_result(self, comm: str):
+        m = type("R", (), {"stdout": comm, "returncode": 0})()
+        return m
+
+    def test_pid_is_claude_matches_cli(self):
+        with patch("claude_monitor.subprocess.run", return_value=self._ps_result("claude")):
+            assert _pid_is_claude(12345) is True
+
+    def test_pid_is_claude_rejects_recycled(self):
+        with patch("claude_monitor.subprocess.run", return_value=self._ps_result("mdworker_shared")):
+            assert _pid_is_claude(12345) is False
+
+    def test_pid_is_claude_rejects_helpers(self):
+        for comm in ("Claude Helper", "claude_crashpad_handler", "Claude.app", "claude-monitor"):
+            with patch("claude_monitor.subprocess.run", return_value=self._ps_result(comm)):
+                assert _pid_is_claude(12345) is False, comm
+
+    def test_pid_is_claude_dead_pid(self):
+        with patch("claude_monitor.subprocess.run", return_value=self._ps_result("")):
+            assert _pid_is_claude(99999) is False
+
+    def test_alive_rejects_recycled_hook_pid(self):
+        """Hook state has a PID, the PID is alive, but it's not a claude process
+        — session must NOT be reported alive (ghost-row bug)."""
+        with patch("claude_monitor._pid_map", {}), \
+             patch("claude_monitor._refresh_pid_map"), \
+             patch("claude_monitor._recently_resumed", {}), \
+             patch("claude_monitor.read_hook_state", return_value={"pid": 62235}), \
+             patch("claude_monitor._pid_is_claude", return_value=False):
+            assert _is_session_alive("ghost-sid") is False
+
+    def test_alive_accepts_genuine_hook_pid(self):
+        with patch("claude_monitor._pid_map", {}), \
+             patch("claude_monitor._refresh_pid_map"), \
+             patch("claude_monitor._recently_resumed", {}), \
+             patch("claude_monitor.read_hook_state", return_value={"pid": 6990}), \
+             patch("claude_monitor._pid_is_claude", return_value=True):
+            assert _is_session_alive("real-sid") is True
 
 
 class TestSessionMemoryTitle:
