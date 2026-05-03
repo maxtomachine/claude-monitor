@@ -743,6 +743,12 @@ def parse_sessions(include_archived: bool = False,
             continue
         if pdata.get("kind") != "interactive":
             continue
+        # Skip sessions still booting — PID file lands before name/transcript,
+        # which would surface as an unactionable "Claude" / WORKING / 0% row.
+        # They appear correctly on the next 2s refresh once the transcript exists.
+        started_ms = pdata.get("startedAt", 0)
+        if not pdata.get("name") and started_ms and (time.time() - started_ms / 1000.0) < 5:
+            continue
         # Build title from best available source
         hook = read_hook_state(sid)
         sl_name = _read_session_cache("name", sid)
