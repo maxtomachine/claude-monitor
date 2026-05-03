@@ -16,6 +16,7 @@ from claude_monitor import (
     _resolve_match_candidates,
     _pid_is_claude,
     _is_session_alive,
+    count_background_activity,
 )
 from tests.helpers import make_session, make_transcript_jsonl
 
@@ -246,6 +247,69 @@ class TestSessionLiveness:
              patch("claude_monitor.read_hook_state", return_value={"pid": 6990}), \
              patch("claude_monitor._pid_is_claude", return_value=True):
             assert _is_session_alive("real-sid") is True
+
+
+class TestBackgroundActivity:
+    def _layout(self, tmp_path, fresh: dict[str, list[str]], stale: dict[str, list[str]] | None = None):
+        """Create <tmp>/sid.jsonl plus subagents/workflows dirs with files."""
+        transcript = tmp_path / "sid.jsonl"
+        transcript.touch()
+        base = tmp_path / "sid"
+        for sub, names in (fresh or {}).items():
+            d = base / sub
+            d.mkdir(parents=True, exist_ok=True)
+            for n in names:
+                (d / n).write_text("{}")
+        import os as _os
+        for sub, names in (stale or {}).items():
+            d = base / sub
+            d.mkdir(parents=True, exist_ok=True)
+            for n in names:
+                f = d / n
+                f.write_text("{}")
+                old = time.time() - 600
+                _os.utime(f, (old, old))
+        return str(transcript)
+
+    def test_no_dirs_returns_zero(self, tmp_path):
+        transcript = tmp_path / "sid.jsonl"
+        transcript.touch()
+        assert count_background_activity(str(transcript)) == 0
+
+    def test_counts_fresh_subagents_and_workflows(self, tmp_path):
+        t = self._layout(tmp_path, {"subagents": ["a.jsonl", "b.jsonl"], "workflows": ["w.jsonl"]})
+        assert count_background_activity(t) == 3
+
+    def test_ignores_stale_files(self, tmp_path):
+        t = self._layout(tmp_path,
+                         fresh={"subagents": ["a.jsonl"]},
+                         stale={"subagents": ["old.jsonl"], "workflows": ["old2.jsonl"]})
+        assert count_background_activity(t) == 1
+
+    def test_ignores_non_jsonl(self, tmp_path):
+        t = self._layout(tmp_path, {"subagents": ["a.jsonl", "note.txt"]})
+        assert count_background_activity(t) == 1
+
+    def test_status_idle_becomes_background(self, tmp_path):
+        t = self._layout(tmp_path, {"subagents": ["a.jsonl"]})
+        with patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor.read_hook_state",
+                   return_value={"state": "idle", "state_entered_at": ""}):
+            assert determine_status("sid", 0, "", t) == "background"
+
+    def test_status_idle_stays_idle_without_activity(self, tmp_path):
+        transcript = tmp_path / "sid.jsonl"
+        transcript.touch()
+        with patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor.read_hook_state",
+                   return_value={"state": "idle", "state_entered_at": ""}):
+            assert determine_status("sid", 0, "", str(transcript)) == "waiting"
+
+    def test_status_working_unchanged_by_activity(self, tmp_path):
+        t = self._layout(tmp_path, {"subagents": ["a.jsonl"]})
+        with patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor.read_hook_state", return_value={"state": "thinking"}):
+            assert determine_status("sid", 0, "", t) == "working"
 
 
 class TestSessionMemoryTitle:

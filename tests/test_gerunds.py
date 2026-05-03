@@ -159,6 +159,15 @@ class TestGenerateActivity:
         s = make_session(status="working", last_tool="", last_assistant_text="")
         assert generate_activity(s) == ""
 
+    def test_background_shows_agent_count(self):
+        s = make_session(status="background", background_count=3,
+                         last_tool="", last_assistant_text="")
+        assert generate_activity(s) == "3 agents running"
+
+    def test_background_singular(self):
+        s = make_session(status="background", background_count=1)
+        assert generate_activity(s) == "1 agent running"
+
     def test_fallback_to_text(self):
         s = make_session(status="working", last_tool="",
                          last_assistant_text="Let me check the logs.")
