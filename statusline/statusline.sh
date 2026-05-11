@@ -309,14 +309,21 @@ fi
 
 # ──────────────────────────────────────────────────────────────────────
 # SECTION: Monitor data sharing (per-session cache files)
-# Writes ground-truth data to /tmp/ for claude-monitor TUI.
+# Writes ground-truth data for claude-monitor TUI.
+# Persistent dir survives reboot so monitor doesn't fall back to a token-count
+# estimate (which can't know the model's real window) for sessions not yet
+# focused since boot. /tmp copy kept for backward compat.
 # ──────────────────────────────────────────────────────────────────────
+_cachedir="$HOME/.claude/statusline-cache"
+mkdir -p "$_cachedir" 2>/dev/null
 if [ -n "$_sid" ]; then
-  [ -n "$remaining" ] && printf '%s' "$remaining" > "/tmp/claude-ctx-${_sid}"
-  [ -n "$remote_url" ] && printf '%s' "$remote_url" > "/tmp/claude-url-${_sid}"
-  [ -n "$session_name" ] && printf '%s' "$session_name" > "/tmp/claude-name-${_sid}"
-  [ -n "$cost_raw" ] && [ "$cost_raw" != "0" ] && printf '%s' "$cost_raw" > "/tmp/claude-cost-${_sid}"
-  [ "$is_fast" = true ] && printf '%s' "$extra_cost" > "/tmp/claude-fast-${_sid}"
+  for _dir in "$_cachedir" /tmp; do
+    [ -n "$remaining" ] && printf '%s' "$remaining" > "${_dir}/claude-ctx-${_sid}"
+    [ -n "$remote_url" ] && printf '%s' "$remote_url" > "${_dir}/claude-url-${_sid}"
+    [ -n "$session_name" ] && printf '%s' "$session_name" > "${_dir}/claude-name-${_sid}"
+    [ -n "$cost_raw" ] && [ "$cost_raw" != "0" ] && printf '%s' "$cost_raw" > "${_dir}/claude-cost-${_sid}"
+    [ "$is_fast" = true ] && printf '%s' "$extra_cost" > "${_dir}/claude-fast-${_sid}"
+  done
 fi
 
 echo "$(date '+%H:%M:%S') OK ctx=${remaining:-?} quota=${quota_used:-?} tokens=${tokens}" >> "$SL_LOG"

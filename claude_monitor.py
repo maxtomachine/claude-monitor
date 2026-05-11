@@ -120,11 +120,21 @@ MODEL_CONTEXT_WINDOW = {
 }
 
 
-def model_context_window(model_id: str) -> int:
+def model_context_window(model_id: str, observed_tokens: int = 0) -> int:
     for k, w in MODEL_CONTEXT_WINDOW.items():
         if k in model_id:
+            return max(w, _infer_window(observed_tokens))
+    return _infer_window(observed_tokens)
+
+
+def _infer_window(observed_tokens: int) -> int:
+    # A prompt cannot exceed its window — so observed token count is a hard
+    # lower bound. Snap up to the next standard size when the assumed window
+    # is already exceeded (handles model IDs not in the map).
+    for w in (200_000, 500_000, 1_000_000, 2_000_000):
+        if observed_tokens < int(w * 0.95):
             return w
-    return 200_000
+    return 2_000_000
 
 # ── Gerund generation ─────────────────────────────────────────────────────────
 
@@ -819,12 +829,21 @@ def parse_sessions(include_archived: bool = False,
     return sessions
 
 
+_STATUSLINE_CACHE_DIR = Path.home() / ".claude" / "statusline-cache"
+
+
 def _read_session_cache(kind: str, session_id: str) -> str:
-    """Read /tmp/claude-{kind}-{session_id}, return stripped string or empty."""
-    try:
-        return Path(f"/tmp/claude-{kind}-{session_id}").read_text().strip()
-    except OSError:
-        return ""
+    """Read claude-{kind}-{session_id} from the persistent cache (survives
+    reboot), falling back to /tmp for sessions whose statusline predates the
+    persistent dir. Returns stripped string or empty."""
+    for base in (_STATUSLINE_CACHE_DIR, Path("/tmp")):
+        try:
+            v = (base / f"claude-{kind}-{session_id}").read_text().strip()
+            if v:
+                return v
+        except OSError:
+            continue
+    return ""
 
 
 def read_session_memory_title(transcript_path: str) -> str:
@@ -905,7 +924,7 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
         if last_input == 0:
             context_pct = 0  # Nothing used yet
         else:
-            window = model_context_window(data["model_id"])
+            window = model_context_window(data["model_id"], observed_tokens=last_input)
             context_pct = min(100, int((last_input / window) * 100))
 
     # Prefer ground-truth cost from statusline cache, fall back to estimation

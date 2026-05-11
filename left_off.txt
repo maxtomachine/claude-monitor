@@ -1,0 +1,31 @@
+claude-monitor — left off 2026-05-11 (session: tools-monitor / 7a5651f1)
+
+SHIPPED TO MAIN (PRs #6-#11, all merged):
+- #6  Recycled-PID ghost sessions (mdworker case) — _pid_is_claude check
+- #7  ◐ BUSY status when subagents/workflows running (rglob into nested dirs)
+- #8  Double-click row → jump; single-click highlights only (SessionTable subclass)
+- #9  Delete-Delete hide in history mode + Shift+arrow/click multi-select
+      + cursor-survivor on hide + view-state persistence across Shift+R
+- #10 Hook reads transcript custom-title (canonical) so window/row/state never desync
+      + duplicate row titles get ·sid8 suffix
+- #11 Booting-session ghost suppressed (skip <5s no-name in orphan-PID pass)
+      + transcript-mtime → WORKING override (slash commands miss UserPromptSubmit)
+      + install.sh symlinks hook (was cp → 5wk stale)
+      + jumpback launches Ghostty window if no monitor found
+      + launcher calls .venv/bin/python directly (offline + no-PATH safe)
+      + session column elastic (absorbs slack, shrinks last)
+      + ctx-% estimate uses MODEL_CONTEXT_WINDOW + ~N% marker
+
+ALSO:
+- /catchmeup script fixed (PID-ancestry detection — was misidentifying current session)
+- ~/.claude/hooks/session_tracker.py relinked to repo (was stale copy from Mar 29)
+
+KNOWN FOLLOW-UPS (not blocking):
+- ctx-% deeper fix: read remaining_percentage from transcript usage block instead of
+  token-count estimate (the estimate is now per-model-window but still ignores
+  compaction/snips; ~prefix marks it)
+- _refresh_pid_map:958 still uses raw os.kill not _pid_is_claude (perf concern,
+  not currently causing ghosts)
+- The 15 minimal {pid,tty,sid} state files from Apr 9 are dead-PID cruft, harmless
+
+main is at 1da0a31. 224 tests passing. All local feature branches pruned.
