@@ -1237,7 +1237,11 @@ def determine_status(session_id: str, last_assistant_time: float,
         if hook_state == "approval":
             return "needs_approval"
         if hook_state == "exited":
-            return "closed"
+            # A subagent's SessionEnd fires with the parent's session_id and
+            # writes "exited" to the parent's state file even though the parent
+            # is still running. We already know `alive` is True here, so the
+            # exited signal is stale — fall through to activity-based status.
+            return _idle_or_background("waiting")
         if hook_state == "idle":
             # Decay waiting → idle after 5 minutes of inactivity
             entered = hook.get("state_entered_at", "")
