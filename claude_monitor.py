@@ -112,6 +112,20 @@ MODEL_PRICING = {
     "claude-haiku-4-5": (0.80, 4.0),
 }
 
+MODEL_CONTEXT_WINDOW = {
+    "claude-opus-4-6": 1_000_000,
+    "claude-sonnet-4-6": 1_000_000,
+    "claude-sonnet-4-5": 200_000,
+    "claude-haiku-4-5": 200_000,
+}
+
+
+def model_context_window(model_id: str) -> int:
+    for k, w in MODEL_CONTEXT_WINDOW.items():
+        if k in model_id:
+            return w
+    return 200_000
+
 # ── Gerund generation ─────────────────────────────────────────────────────────
 
 MCP_SERVICE_NAMES = {
@@ -891,7 +905,8 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
         if last_input == 0:
             context_pct = 0  # Nothing used yet
         else:
-            context_pct = min(100, int((last_input / 200000) * 100))
+            window = model_context_window(data["model_id"])
+            context_pct = min(100, int((last_input / window) * 100))
 
     # Prefer ground-truth cost from statusline cache, fall back to estimation
     cached_cost = _read_session_cache("cost", session_id)
