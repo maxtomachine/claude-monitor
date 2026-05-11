@@ -101,7 +101,7 @@ LAUNCHER="$HOME/.local/bin/claude-monitor"
 mkdir -p "$(dirname "$LAUNCHER")"
 cat > "$LAUNCHER" << EOF
 #!/usr/bin/env bash
-cd "$REPO_DIR" && uv run python claude_monitor.py "\$@"
+exec "$REPO_DIR/.venv/bin/python" "$REPO_DIR/claude_monitor.py" "\$@"
 EOF
 chmod +x "$LAUNCHER"
 echo "Created launcher → $LAUNCHER"
