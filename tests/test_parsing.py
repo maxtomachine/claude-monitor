@@ -302,8 +302,14 @@ class TestBackgroundActivity:
         (d / "agent-1.meta.json").write_text("{}")
         assert count_background_activity(str(transcript)) == 2
 
+    def _backdate(self, p):
+        old = time.time() - 600
+        import os as _os
+        _os.utime(p, (old, old))
+
     def test_status_idle_becomes_background(self, tmp_path):
         t = self._layout(tmp_path, {"subagents": ["a.jsonl"]})
+        self._backdate(t)
         with patch("claude_monitor._is_session_alive", return_value=True), \
              patch("claude_monitor.read_hook_state",
                    return_value={"state": "idle", "state_entered_at": ""}):
@@ -312,10 +318,19 @@ class TestBackgroundActivity:
     def test_status_idle_stays_idle_without_activity(self, tmp_path):
         transcript = tmp_path / "sid.jsonl"
         transcript.touch()
+        self._backdate(transcript)
         with patch("claude_monitor._is_session_alive", return_value=True), \
              patch("claude_monitor.read_hook_state",
                    return_value={"state": "idle", "state_entered_at": ""}):
             assert determine_status("sid", 0, "", str(transcript)) == "waiting"
+
+    def test_status_idle_but_transcript_fresh_becomes_working(self, tmp_path):
+        transcript = tmp_path / "sid.jsonl"
+        transcript.touch()  # mtime = now
+        with patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor.read_hook_state",
+                   return_value={"state": "idle", "state_entered_at": ""}):
+            assert determine_status("sid", 0, "", str(transcript)) == "working"
 
     def test_status_working_unchanged_by_activity(self, tmp_path):
         t = self._layout(tmp_path, {"subagents": ["a.jsonl"]})

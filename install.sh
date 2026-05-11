@@ -66,8 +66,8 @@ fi
 
 HOOKS_DIR="$CLAUDE_DIR/hooks"
 mkdir -p "$HOOKS_DIR"
-cp "$REPO_DIR/hooks/session_tracker.py" "$HOOKS_DIR/session_tracker.py"
-echo "Installed hook → $HOOKS_DIR/session_tracker.py"
+ln -sf "$REPO_DIR/hooks/session_tracker.py" "$HOOKS_DIR/session_tracker.py"
+echo "Linked hook → $HOOKS_DIR/session_tracker.py"
 
 # Add hooks config if not already present
 if [ -f "$SETTINGS" ] && ! grep -q '"SessionStart"' "$SETTINGS"; then
@@ -101,7 +101,7 @@ LAUNCHER="$HOME/.local/bin/claude-monitor"
 mkdir -p "$(dirname "$LAUNCHER")"
 cat > "$LAUNCHER" << EOF
 #!/usr/bin/env bash
-cd "$REPO_DIR" && uv run python claude_monitor.py "\$@"
+exec "$REPO_DIR/.venv/bin/python" "$REPO_DIR/claude_monitor.py" "\$@"
 EOF
 chmod +x "$LAUNCHER"
 echo "Created launcher → $LAUNCHER"

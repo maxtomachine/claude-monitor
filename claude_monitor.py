@@ -112,6 +112,20 @@ MODEL_PRICING = {
     "claude-haiku-4-5": (0.80, 4.0),
 }
 
+MODEL_CONTEXT_WINDOW = {
+    "claude-opus-4-6": 1_000_000,
+    "claude-sonnet-4-6": 1_000_000,
+    "claude-sonnet-4-5": 200_000,
+    "claude-haiku-4-5": 200_000,
+}
+
+
+def model_context_window(model_id: str) -> int:
+    for k, w in MODEL_CONTEXT_WINDOW.items():
+        if k in model_id:
+            return w
+    return 200_000
+
 # ── Gerund generation ─────────────────────────────────────────────────────────
 
 MCP_SERVICE_NAMES = {
@@ -258,6 +272,7 @@ class Session:
     status_name: str = ""
     project_path: str = ""  # Original launch directory (for resume)
     background_count: int = 0
+    context_is_estimate: bool = False
 
 
 # ── Preferences ───────────────────────────────────────────────────────────────
@@ -743,6 +758,12 @@ def parse_sessions(include_archived: bool = False,
             continue
         if pdata.get("kind") != "interactive":
             continue
+        # Skip sessions still booting — PID file lands before name/transcript,
+        # which would surface as an unactionable "Claude" / WORKING / 0% row.
+        # They appear correctly on the next 2s refresh once the transcript exists.
+        started_ms = pdata.get("startedAt", 0)
+        if not pdata.get("name") and started_ms and (time.time() - started_ms / 1000.0) < 5:
+            continue
         # Build title from best available source
         hook = read_hook_state(sid)
         sl_name = _read_session_cache("name", sid)
@@ -874,15 +895,18 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
 
     # Context %: how much context is USED (burnt).
     # Statusline cache stores remaining %, so we flip it.
+    context_is_estimate = False
     try:
-        remaining = int(_read_session_cache("ctx", session_id))
+        remaining = int(float(_read_session_cache("ctx", session_id)))
         context_pct = max(0, min(100, 100 - remaining))
-    except ValueError:
+    except (ValueError, TypeError):
+        context_is_estimate = True
         last_input = data["last_input_tokens"]
         if last_input == 0:
             context_pct = 0  # Nothing used yet
         else:
-            context_pct = min(100, int((last_input / 200000) * 100))
+            window = model_context_window(data["model_id"])
+            context_pct = min(100, int((last_input / window) * 100))
 
     # Prefer ground-truth cost from statusline cache, fall back to estimation
     cached_cost = _read_session_cache("cost", session_id)
@@ -912,6 +936,7 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
         model=format_model(data["model_id"]), model_id=data["model_id"],
         cost=cost, tokens_in=data["tokens_in"], tokens_out=data["tokens_out"],
         context_pct=context_pct,
+        context_is_estimate=context_is_estimate,
         message_count=data["message_count"] or idx.get("messageCount", 0),
         last_activity=mtime, created=data["created"],
         cwd=data["cwd"], transcript_path=path,
@@ -1171,8 +1196,17 @@ def determine_status(session_id: str, last_assistant_time: float,
         return "closed"
 
     def _idle_or_background(base: str) -> str:
-        if transcript_path and count_background_activity(transcript_path) > 0:
-            return "background"
+        if transcript_path:
+            # Hook says idle, but if the main transcript itself is being
+            # appended to, the model is streaming — slash commands and a few
+            # other paths can miss UserPromptSubmit so the hook never flips.
+            try:
+                if time.time() - os.stat(transcript_path).st_mtime < 5:
+                    return "working"
+            except OSError:
+                pass
+            if count_background_activity(transcript_path) > 0:
+                return "background"
         return base
 
     # Tier 1: hook state files (real-time, event-driven)
@@ -1265,7 +1299,7 @@ def format_duration(created: float, last_activity: float) -> str:
     return f"{int(dur / 86400)}d"
 
 
-def format_context_bar(pct: int, width: int = 10) -> str:
+def format_context_bar(pct: int, width: int = 10, is_estimate: bool = False) -> str:
     """Render context usage bar. pct = % of context USED (higher = worse)."""
     filled = round(pct / 100 * width)
     empty = width - filled
@@ -1277,7 +1311,8 @@ def format_context_bar(pct: int, width: int = 10) -> str:
         color = "yellow"
     else:
         color = "red"
-    return f"[{color}]{'█' * filled}[/][dim]{'░' * empty}[/] {pct}%"
+    label = f"~{pct}%" if is_estimate else f"{pct}%"
+    return f"[{color}]{'█' * filled}[/][dim]{'░' * empty}[/] {label}"
 
 
 def format_compactions(count: int) -> str:
@@ -1529,7 +1564,8 @@ def render_row(s: Session, visible_cols: list[str], spin_idx: int = 0) -> list[s
         elif col == "model":
             cells.append(s.model)
         elif col == "context":
-            cells.append("" if s.is_subagent else format_context_bar(s.context_pct))
+            cells.append("" if s.is_subagent else format_context_bar(
+                s.context_pct, is_estimate=s.context_is_estimate))
         elif col == "compact":
             cells.append("" if s.is_subagent else format_compactions(s.compact_count))
         elif col == "tokens":
@@ -3630,6 +3666,34 @@ class ClaudeMonitor(App):
                 width = max(20, self.size.width // 3)
             table.add_column(info.get("label", col_key), key=col_key, width=width)
 
+    def _fit_session_column(self, table: DataTable | None = None) -> None:
+        """Give the session column whatever width remains after the other
+        (auto-sized) columns — it's the elastic column, so trailing slack
+        collapses before titles truncate."""
+        if "session" not in self._visible_cols:
+            return
+        if table is None:
+            table = self.query_one("#session-table", DataTable)
+        try:
+            col = table.columns["session"]
+        except KeyError:
+            return
+        others = sum(
+            c.get_render_width(table)
+            for k, c in table.columns.items()
+            if getattr(k, "value", k) != "session"
+        )
+        pad = 2 * table.cell_padding
+        col.width = max(20, self.size.width - others - pad)
+        col.auto_width = False
+        col.content_width = 0
+
+    def on_resize(self) -> None:
+        try:
+            self._fit_session_column()
+        except Exception:
+            pass
+
     def _filter_sessions(self, sessions: list[Session]) -> list[Session]:
         if not self._filter:
             return sessions
@@ -3834,16 +3898,8 @@ class ClaudeMonitor(App):
             table.move_cursor(row=min(saved_row_idx, len(row_map) - 1))
         self.call_after_refresh(self._release_cursor_guard)
 
-        # Force session column to 50% of terminal width — must be set after
-        # rows are added because DataTable auto-sizes columns to content.
-        if "session" in self._visible_cols:
-            try:
-                col = table.columns["session"]
-                col.width = max(20, self.size.width // 3)
-                col.auto_width = False
-                col.content_width = 0
-            except KeyError:
-                pass
+        self._fit_session_column(table)
+        self.call_after_refresh(self._fit_session_column)
 
         table.scroll_to(saved_scroll_x, saved_scroll_y, animate=False)
         self.query_one(StatsBar).update_stats(self.sessions, self.sort_mode)
