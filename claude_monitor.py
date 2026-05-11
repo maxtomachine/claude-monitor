@@ -258,6 +258,7 @@ class Session:
     status_name: str = ""
     project_path: str = ""  # Original launch directory (for resume)
     background_count: int = 0
+    context_is_estimate: bool = False
 
 
 # ── Preferences ───────────────────────────────────────────────────────────────
@@ -880,10 +881,12 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
 
     # Context %: how much context is USED (burnt).
     # Statusline cache stores remaining %, so we flip it.
+    context_is_estimate = False
     try:
-        remaining = int(_read_session_cache("ctx", session_id))
+        remaining = int(float(_read_session_cache("ctx", session_id)))
         context_pct = max(0, min(100, 100 - remaining))
-    except ValueError:
+    except (ValueError, TypeError):
+        context_is_estimate = True
         last_input = data["last_input_tokens"]
         if last_input == 0:
             context_pct = 0  # Nothing used yet
@@ -918,6 +921,7 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
         model=format_model(data["model_id"]), model_id=data["model_id"],
         cost=cost, tokens_in=data["tokens_in"], tokens_out=data["tokens_out"],
         context_pct=context_pct,
+        context_is_estimate=context_is_estimate,
         message_count=data["message_count"] or idx.get("messageCount", 0),
         last_activity=mtime, created=data["created"],
         cwd=data["cwd"], transcript_path=path,
@@ -1280,7 +1284,7 @@ def format_duration(created: float, last_activity: float) -> str:
     return f"{int(dur / 86400)}d"
 
 
-def format_context_bar(pct: int, width: int = 10) -> str:
+def format_context_bar(pct: int, width: int = 10, is_estimate: bool = False) -> str:
     """Render context usage bar. pct = % of context USED (higher = worse)."""
     filled = round(pct / 100 * width)
     empty = width - filled
@@ -1292,7 +1296,8 @@ def format_context_bar(pct: int, width: int = 10) -> str:
         color = "yellow"
     else:
         color = "red"
-    return f"[{color}]{'█' * filled}[/][dim]{'░' * empty}[/] {pct}%"
+    label = f"~{pct}%" if is_estimate else f"{pct}%"
+    return f"[{color}]{'█' * filled}[/][dim]{'░' * empty}[/] {label}"
 
 
 def format_compactions(count: int) -> str:
@@ -1544,7 +1549,8 @@ def render_row(s: Session, visible_cols: list[str], spin_idx: int = 0) -> list[s
         elif col == "model":
             cells.append(s.model)
         elif col == "context":
-            cells.append("" if s.is_subagent else format_context_bar(s.context_pct))
+            cells.append("" if s.is_subagent else format_context_bar(
+                s.context_pct, is_estimate=s.context_is_estimate))
         elif col == "compact":
             cells.append("" if s.is_subagent else format_compactions(s.compact_count))
         elif col == "tokens":
