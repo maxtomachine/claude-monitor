@@ -704,15 +704,16 @@ class TestHideAndMultiSelect:
                     yield pilot
         return _ctx()
 
-    async def test_delete_requires_history_mode(self, archived_sessions):
+    async def test_delete_works_outside_history_mode(self, archived_sessions):
         with _mock_sessions(archived_sessions), \
-             patch("claude_monitor.load_hidden_sessions", return_value=set()):
+             patch("claude_monitor.load_hidden_sessions", return_value=set()), \
+             patch("claude_monitor.save_hidden_sessions"):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                # show_archived defaults False
+                # show_archived defaults False; cursor on archived row 0
                 await pilot.press("backspace")
                 await pilot.pause()
-                assert pilot.app._delete_armed_for is None
+                assert pilot.app._delete_armed_for is not None
 
     async def test_delete_arms_then_hides(self, archived_sessions):
         async with await self._app(archived_sessions) as pilot:

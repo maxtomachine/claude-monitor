@@ -1323,7 +1323,11 @@ def format_duration(created: float, last_activity: float) -> str:
 
 
 def format_context_bar(pct: int, width: int = 10, is_estimate: bool = False) -> str:
-    """Render context usage bar. pct = % of context USED (higher = worse)."""
+    """Render context usage bar. pct = % of context USED (higher = worse).
+    Estimates render dim with '?' — the token-count guess can be off by 5×
+    when the model's window isn't known, so a number would mislead."""
+    if is_estimate:
+        return f"[dim]{'░' * width}   ?[/]"
     filled = round(pct / 100 * width)
     empty = width - filled
     if pct < 25:
@@ -1334,8 +1338,7 @@ def format_context_bar(pct: int, width: int = 10, is_estimate: bool = False) -> 
         color = "yellow"
     else:
         color = "red"
-    label = f"~{pct}%" if is_estimate else f"{pct}%"
-    return f"[{color}]{'█' * filled}[/][dim]{'░' * empty}[/] {label}"
+    return f"[{color}]{'█' * filled}[/][dim]{'░' * empty}[/] {pct}%"
 
 
 def format_compactions(count: int) -> str:
@@ -4337,9 +4340,6 @@ class ClaudeMonitor(App):
         table.move_cursor(row=nr)
 
     def action_hide_selected(self) -> None:
-        if not self.show_archived:
-            self.notify("Hide only works in history mode (press h)", timeout=3)
-            return
         target: set[str] = set(self._selection)
         if not target:
             cur = self._cursor_session()
