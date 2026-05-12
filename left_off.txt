@@ -28,4 +28,19 @@ KNOWN FOLLOW-UPS (not blocking):
   not currently causing ghosts)
 - The 15 minimal {pid,tty,sid} state files from Apr 9 are dead-PID cruft, harmless
 
-main is at 1da0a31. 224 tests passing. All local feature branches pruned.
+POST-#11 DIRECT TO MAIN (2026-05-11/12):
+- 4c052aa  Statusline cache persists to ~/.claude/statusline-cache/ (survives reboot)
+- 7854434  Hook 'exited' ignored when alive=True (subagent SessionEnd pollutes parent)
+- bd6e48b  Delete works outside history mode on closed/archived; unknown ctx → '?' not ~N%
+
+main is at bd6e48b. 224 tests passing. All local feature branches pruned.
+
+OPEN HOOK-SIDE FOLLOW-UP: session_tracker.py mark_exited() should guard against
+subagent SessionEnd writing to parent state (parallel to the pre_tool_use guard
+at :513-519). Monitor-side guard at determine_status:1239 catches it now, but
+the state file itself is still wrong until the parent's next hook event.
+
+DEAD SYMLINK: ~/.claude/statusline.sh -> ~/claude-monitor/... (no Projects/).
+Harmless — settings.json points directly at the repo path. Re-run install.sh
+or `ln -sf ~/Projects/claude-monitor/statusline/statusline.sh ~/.claude/statusline.sh`
+to clean it up.
