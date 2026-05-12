@@ -1800,9 +1800,14 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
                 let bare = title.replace(/^[^\\w]*\\s*/, "").replace(/\\s*·[0-9a-f]{{8}}$/, "").trim();
                 return bare === cand;
             }}
+            let nameAmbiguous = false;
             for (let i = 1; i < candidates.length; i++) {{
-                const m = allTitles.find(t => t && nameMatch(t, candidates[i]));
-                if (m) {{ nameWindow = m; nameCand = candidates[i]; break; }}
+                const ms = allTitles.filter(t => t && nameMatch(t, candidates[i]));
+                if (ms.length > 0) {{
+                    nameWindow = ms[0]; nameCand = candidates[i];
+                    nameAmbiguous = ms.length > 1;
+                    break;
+                }}
             }}
 
             // Phase 2: resolve conflicts between sid marker and name match
@@ -1810,12 +1815,17 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
                 // Both point to the same window — ideal case
                 targetName = sidWindow; matchedCand = sid8;
             }} else if (sidWindow && nameWindow && sidWindow !== nameWindow) {{
-                // ·sid8 marker is on a DIFFERENT window than the name
-                // match — the marker is stale (old tab from a resume,
-                // or Claude's auto-summary clobbered the marker on the
-                // active tab). Prefer the name match.
-                targetName = nameWindow;
-                matchedCand = nameCand + "+sid_stale";
+                // They diverge. If multiple windows share the name (e.g.,
+                // after /branch + same /rename), the name match is the
+                // ambiguous signal — trust the unique sid8. Otherwise the
+                // sid marker is the stale one (old tab from a resume, or
+                // Claude's auto-summary clobbered the marker).
+                if (nameAmbiguous) {{
+                    targetName = sidWindow; matchedCand = sid8 + "+name_ambiguous";
+                }} else {{
+                    targetName = nameWindow;
+                    matchedCand = nameCand + "+sid_stale";
+                }}
             }} else if (sidWindow) {{
                 targetName = sidWindow; matchedCand = sid8;
             }} else if (nameWindow) {{
