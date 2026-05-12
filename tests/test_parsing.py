@@ -246,8 +246,21 @@ class TestSessionLiveness:
              patch("claude_monitor._refresh_pid_map"), \
              patch("claude_monitor._recently_resumed", {}), \
              patch("claude_monitor.read_hook_state", return_value={"pid": 6990}), \
-             patch("claude_monitor._pid_is_claude", return_value=True):
+             patch("claude_monitor._pid_is_claude", return_value=True), \
+             patch("claude_monitor.SESSIONS_DIR", Path("/nonexistent")):
             assert _is_session_alive("real-sid") is True
+
+    def test_alive_rejects_hook_pid_that_moved_to_another_session(self, tmp_path):
+        """After /branch, the PID stays alive but serves a different sid."""
+        (tmp_path / "4538.json").write_text('{"sessionId": "new-sid", "pid": 4538}')
+        with patch("claude_monitor._pid_map", {}), \
+             patch("claude_monitor._refresh_pid_map"), \
+             patch("claude_monitor._recently_resumed", {}), \
+             patch("claude_monitor.read_hook_state", return_value={"pid": 4538}), \
+             patch("claude_monitor._pid_is_claude", return_value=True), \
+             patch("claude_monitor.SESSIONS_DIR", tmp_path):
+            assert _is_session_alive("old-sid") is False
+            assert _is_session_alive("new-sid") is True
 
 
 class TestBackgroundActivity:

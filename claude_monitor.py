@@ -1046,7 +1046,18 @@ def _is_session_alive(session_id: str, display_title: str = "") -> bool:
     hook = read_hook_state(session_id)
     if hook and hook.get("pid"):
         try:
-            if _pid_is_claude(int(hook["pid"])):
+            pid = int(hook["pid"])
+            if _pid_is_claude(pid):
+                # The PID is a live claude — but after /branch the SAME PID
+                # serves a different session. Cross-check the canonical
+                # PID→sessionId map; if the PID has moved on, this sid is dead.
+                pid_file = SESSIONS_DIR / f"{pid}.json"
+                try:
+                    pdata = json.loads(pid_file.read_text())
+                    if pdata.get("sessionId") and pdata["sessionId"] != session_id:
+                        return False
+                except (OSError, json.JSONDecodeError):
+                    pass
                 return True
         except ValueError:
             pass
