@@ -1098,6 +1098,114 @@ def _check_for_updates() -> None:
         pass
 
 
+@dataclass
+class Discrepancy:
+    kind: str
+    sid: str
+    details: dict
+
+
+def _read_pid_file(pid: int) -> dict:
+    try:
+        return json.loads((SESSIONS_DIR / f"{pid}.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _pids_claiming_sid(sid: str) -> list[int]:
+    out: list[int] = []
+    if not SESSIONS_DIR.is_dir():
+        return out
+    for f in SESSIONS_DIR.iterdir():
+        if f.suffix != ".json":
+            continue
+        try:
+            d = json.loads(f.read_text())
+            if d.get("sessionId") == sid:
+                out.append(int(d.get("pid", f.stem)))
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+    return out
+
+
+def _read_transcript_title(sid: str) -> str:
+    for p in CLAUDE_DIR.glob(f"*/{sid}.jsonl"):
+        title = ""
+        try:
+            with p.open("rb") as fh:
+                try:
+                    fh.seek(-65536, 2)
+                except OSError:
+                    fh.seek(0)
+                for raw in fh.read().splitlines():
+                    line = raw.decode("utf-8", "ignore")
+                    if '"custom-title"' not in line:
+                        continue
+                    try:
+                        m = json.loads(line)
+                        if m.get("type") == "custom-title":
+                            title = m.get("customTitle", "") or title
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            continue
+        return title
+    return ""
+
+
+def reconcile_sources(sid: str) -> list[Discrepancy]:
+    """Cross-check the five identity sources for one session and return any
+    disagreements. The point is to surface desyncs as data, not to wait for
+    them to manifest as a UI ghost."""
+    out: list[Discrepancy] = []
+    hook = read_hook_state(sid) or {}
+    claiming = _pids_claiming_sid(sid)
+
+    # multi_pid_same_sid — two terminals both think they host this conversation
+    live = [p for p in claiming if _pid_is_claude(p)]
+    if len(live) > 1:
+        out.append(Discrepancy("multi_pid_same_sid", sid, {"pids": live}))
+
+    # pid_mismatch — hook says PID X but X now serves a different sid
+    hpid = hook.get("pid")
+    if hpid:
+        try:
+            hpid = int(hpid)
+            pdata = _read_pid_file(hpid)
+            psid = pdata.get("sessionId")
+            if psid and psid != sid and _pid_is_claude(hpid):
+                out.append(Discrepancy("pid_mismatch", sid,
+                                       {"hook_pid": hpid, "pid_now_serves": psid}))
+        except (ValueError, TypeError):
+            pass
+
+    # liveness_mismatch — hook recorded "exited" but the same PID still serves this sid
+    if hook.get("state") == "exited" and hpid and _pid_is_claude(int(hpid)):
+        pdata = _read_pid_file(int(hpid))
+        if pdata.get("sessionId") == sid:
+            out.append(Discrepancy("liveness_mismatch", sid,
+                                   {"hook_state": "exited", "pid": hpid}))
+
+    # name_mismatch — transcript / statusline-cache / hook title disagree
+    t_title = _read_transcript_title(sid)
+    cache_name = _read_session_cache("name", sid)
+    h_title = hook.get("title") or ""
+    names = {n for n in (t_title, cache_name, h_title) if n}
+    if len(names) > 1:
+        out.append(Discrepancy("name_mismatch", sid,
+                               {"transcript": t_title, "cache": cache_name,
+                                "hook": h_title}))
+
+    # orphan_state — hook-state file exists, no PID file claims it, hook PID dead
+    if hook and not claiming:
+        dead = (not hpid) or (not _pid_is_claude(int(hpid)) if str(hpid).isdigit() else True)
+        if dead:
+            out.append(Discrepancy("orphan_state", sid,
+                                   {"hook_pid": hpid, "state": hook.get("state")}))
+
+    return out
+
+
 def _reconcile_sessions() -> None:
     """Periodic sweep: heal stale hook states, refresh names from /tmp, and
     re-stamp terminal titles with ·sid8 markers. PID files are the authority
@@ -1165,7 +1273,41 @@ def _reconcile_sessions() -> None:
                 stamped += 1
             except OSError:
                 pass
-    mlog("reconcile", "sweep", healed=healed, stamped=stamped)
+    # Detect cross-source identity desyncs and log them; heal orphan_state.
+    seen_sids = set(_pid_map) | {p.stem for p in HOOK_STATE_DIR.glob("*.json")}
+    discrepancies = 0
+    pruned = 0
+    now = time.time()
+    for sid in seen_sids:
+        for d in reconcile_sources(sid):
+            discrepancies += 1
+            mlog("reconcile", d.kind, sid=sid, **d.details)
+            if d.kind == "orphan_state":
+                sf = HOOK_STATE_DIR / f"{sid}.json"
+                try:
+                    if sf.exists() and (now - sf.stat().st_mtime) > 3600:
+                        sf.unlink()
+                        _hook_state_cache.pop(sid, None)
+                        pruned += 1
+                except OSError:
+                    pass
+    mlog("reconcile", "sweep", healed=healed, stamped=stamped,
+         discrepancies=discrepancies, orphans_pruned=pruned)
+
+
+def run_reconcile_report() -> int:
+    """CLI entry: print all source discrepancies and exit with count."""
+    _refresh_pid_map()
+    seen_sids = set(_pid_map) | {p.stem for p in HOOK_STATE_DIR.glob("*.json")}
+    total = 0
+    for sid in sorted(seen_sids):
+        ds = reconcile_sources(sid)
+        for d in ds:
+            total += 1
+            detail = " ".join(f"{k}={v}" for k, v in d.details.items())
+            print(f"{d.kind:20} {sid[:8]}  {detail}")
+    print(f"\n{total} discrepancies across {len(seen_sids)} sessions")
+    return total
 
 
 def _heal_hook_state(session_id: str) -> None:
@@ -4756,6 +4898,8 @@ def main():
         from monitor_log import tail_log
         cat_filter = sys.argv[2] if len(sys.argv) > 2 else None
         tail_log(category=cat_filter)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--reconcile":
+        sys.exit(min(run_reconcile_report(), 1))
     else:
         app = ClaudeMonitor()
         app.run()
