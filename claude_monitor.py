@@ -1206,10 +1206,20 @@ def reconcile_sources(sid: str) -> list[Discrepancy]:
     return out
 
 
+_last_reconcile_at = 0.0
+_last_discrepancy_keys: set[str] = set()
+_RECONCILE_MIN_INTERVAL = 60.0
+
+
 def _reconcile_sessions() -> None:
     """Periodic sweep: heal stale hook states, refresh names from /tmp, and
     re-stamp terminal titles with ·sid8 markers. PID files are the authority
     for what's running — everything else is healed to match."""
+    global _last_reconcile_at, _last_discrepancy_keys
+    now = time.time()
+    if now - _last_reconcile_at < _RECONCILE_MIN_INTERVAL:
+        return
+    _last_reconcile_at = now
     _refresh_pid_map()
     healed = stamped = 0
     for sid, pid in _pid_map.items():
@@ -1274,14 +1284,19 @@ def _reconcile_sessions() -> None:
             except OSError:
                 pass
     # Detect cross-source identity desyncs and log them; heal orphan_state.
-    seen_sids = set(_pid_map) | {p.stem for p in HOOK_STATE_DIR.glob("*.json")}
+    # Only check sessions that are actually live or recently were — not every
+    # hook-state file ever written.
+    seen_sids = set(_pid_map)
     discrepancies = 0
     pruned = 0
-    now = time.time()
+    new_keys: set[str] = set()
     for sid in seen_sids:
         for d in reconcile_sources(sid):
             discrepancies += 1
-            mlog("reconcile", d.kind, sid=sid, **d.details)
+            key = f"{sid}:{d.kind}:{sorted(d.details.items())}"
+            new_keys.add(key)
+            if key not in _last_discrepancy_keys:
+                mlog("reconcile", d.kind, sid=sid, **d.details)
             if d.kind == "orphan_state":
                 sf = HOOK_STATE_DIR / f"{sid}.json"
                 try:
@@ -1291,8 +1306,15 @@ def _reconcile_sessions() -> None:
                         pruned += 1
                 except OSError:
                     pass
-    mlog("reconcile", "sweep", healed=healed, stamped=stamped,
-         discrepancies=discrepancies, orphans_pruned=pruned)
+    resolved = _last_discrepancy_keys - new_keys
+    for key in resolved:
+        sid, kind = key.split(":", 2)[:2]
+        mlog("reconcile", "resolved", sid=sid, kind=kind)
+    _last_discrepancy_keys = new_keys
+    if discrepancies or pruned or resolved:
+        mlog("reconcile", "sweep", healed=healed, stamped=stamped,
+             discrepancies=discrepancies, orphans_pruned=pruned,
+             resolved=len(resolved))
 
 
 def run_reconcile_report() -> int:
