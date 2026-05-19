@@ -4100,19 +4100,25 @@ class ClaudeMonitor(App):
         self._row_map = row_map
         self._group_header_rows = group_header_rows
 
+        # scroll=False: we restore the user's scroll position explicitly below.
+        # Default scroll=True would yank the viewport to the cursor row on
+        # every refresh, fighting the scroll_to() and bouncing the user up.
         if saved_row_idx is None and selected_key:
             for idx, s in enumerate(row_map):
                 if s and s.session_id == selected_key:
-                    table.move_cursor(row=idx)
+                    table.move_cursor(row=idx, scroll=False)
                     break
         elif saved_row_idx is not None:
-            table.move_cursor(row=min(saved_row_idx, len(row_map) - 1))
+            table.move_cursor(row=min(saved_row_idx, len(row_map) - 1), scroll=False)
         self.call_after_refresh(self._release_cursor_guard)
 
         self._fit_session_column(table)
         self.call_after_refresh(self._fit_session_column)
 
         table.scroll_to(saved_scroll_x, saved_scroll_y, animate=False)
+        self.call_after_refresh(
+            lambda: table.scroll_to(saved_scroll_x, saved_scroll_y, animate=False)
+        )
         self.query_one(StatsBar).update_stats(self.sessions, self.sort_mode)
 
         if self._pending_view_restore:

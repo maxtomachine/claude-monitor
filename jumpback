@@ -8,7 +8,32 @@
 
 exec osascript -l JavaScript -e '(() => {
     const se = Application("System Events");
-    for (const appName of ["Ghostty", "iTerm2", "Terminal"]) {
+
+    // Ghostty: walk windows AND tabs via its scripting API. The monitor may be
+    // a background tab — window.name() only shows the FRONT tab title.
+    try {
+        const ghostty = Application("Ghostty");
+        for (const w of ghostty.windows()) {
+            for (const tab of w.tabs()) {
+                if ((tab.name() || "").includes("·MONITOR")) {
+                    tab.selectTab();
+                    ghostty.activateWindow(w);
+                    delay(0.05);
+                    try {
+                        const proc = se.processes.byName("Ghostty");
+                        proc.frontmost = true;
+                        const aw = proc.windows.byName(w.name());
+                        aw.actions["AXRaise"].perform();
+                        try { aw.attributes["AXMain"].value = true; } catch(e) {}
+                    } catch(e) {}
+                    return "ok:tab";
+                }
+            }
+        }
+    } catch(e) {}
+
+    // iTerm2/Terminal fallback: window-title scan (no tab API needed there)
+    for (const appName of ["iTerm2", "Terminal"]) {
         let app, titles;
         try {
             app = Application(appName);
@@ -16,28 +41,23 @@ exec osascript -l JavaScript -e '(() => {
         } catch(e) { continue; }
         const match = titles.find(t => t && t.includes("·MONITOR"));
         if (!match) continue;
-
         app.activate();
         delay(0.1);
         const proc = se.processes.byName(appName);
-
-        // Same-space fast path
         try {
             const w = proc.windows.byName(match);
             w.actions["AXRaise"].perform();
             try { w.attributes["AXMain"].value = true; } catch(e) {}
-            return "ok";
+            return "ok:window";
         } catch(e) {}
-
-        // Cross-space: Window menu click
         try {
             const menu = proc.menuBars[0].menuBarItems.byName("Window").menus[0];
-            const items = menu.menuItems.name();
-            const item = items.find(n => n && n.includes("·MONITOR"));
-            if (item) { menu.menuItems.byName(item).click(); return "ok"; }
+            const item = menu.menuItems.name().find(n => n && n.includes("·MONITOR"));
+            if (item) { menu.menuItems.byName(item).click(); return "ok:menu"; }
         } catch(e) {}
     }
-    // No monitor window anywhere — launch one
+
+    // No monitor anywhere — launch one
     try {
         const ghostty = Application("Ghostty");
         const w = ghostty.newWindow({
