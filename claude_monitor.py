@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code session monitor — btop-style TUI."""
 
+import http.server
 import json
 import os
 import re
@@ -83,6 +84,8 @@ CLAUDE_DIR = Path.home() / ".claude" / "projects"
 SIGNALS_DIR = Path.home() / ".claude" / "session-signals"
 HOOK_STATE_DIR = Path.home() / ".claude" / "session-states"
 TASKS_DIR = Path.home() / ".claude" / "tasks"
+# Local HTTP listener for click-to-jump links (http://localhost:48624/jump/<sid8>)
+JUMP_HTTP_PORT = 48624
 SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 PREFS_PATH = Path.home() / ".claude" / "monitor-prefs.json"
 HIDDEN_PATH = Path.home() / ".claude" / "monitor-hidden.json"
@@ -3787,6 +3790,8 @@ class ClaudeMonitor(App):
         self.set_interval(3, self.refresh_sessions)
         self.set_interval(0.132, self._tick_spinner)
         self.set_interval(0.2, self._check_jump_request)
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            self._start_jump_server()
         self.set_interval(30, self._periodic_reconcile)
         self.set_interval(600, self._check_updates)
         self.set_interval(600, self._audit_stats)  # Every 10 minutes
@@ -3810,6 +3815,56 @@ class ClaudeMonitor(App):
         _perf("on_mount: launch_count save_prefs + notify", t0)
 
     _JUMP_REQUEST = Path("/tmp/claude-jump-request")
+
+    def _start_jump_server(self) -> None:
+        """Serve http://localhost:48624/jump/<sid8-or-name> so cross-session
+        mentions in any Claude's output can be cmd+clicked. Ghostty's URL
+        detector matches http://, the browser opens the URL, the handler drops
+        the target into the request file (picked up by the 200ms poller), and
+        the raised terminal window covers the browser a beat later. Bound to
+        127.0.0.1 only. Silently skipped if the port is already taken (another
+        monitor instance owns it)."""
+        request_path = self._JUMP_REQUEST
+
+        class _JumpHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):  # noqa: N802 - silence stderr
+                pass
+
+            def do_GET(self):  # noqa: N802
+                from urllib.parse import unquote
+                if not self.path.startswith("/jump/"):
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                target = unquote(self.path[len("/jump/"):]).strip("/").strip()
+                # sid8, full uuid, or a session title — same charset the
+                # request-file path accepts. Reject anything suspicious.
+                if not target or len(target) > 80 or any(c in target for c in "\n\r\0/"):
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                try:
+                    request_path.write_text(target)
+                except OSError:
+                    pass
+                mlog("jump", "http_request", target=target)
+                body = (b"<!doctype html><title>jumping</title>"
+                        b"<body style='font-family:monospace;background:#282828;"
+                        b"color:#b2ebbb;padding:2em'>jumping\xe2\x80\xa6"
+                        b"<script>setTimeout(()=>window.close(),400)</script>")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        try:
+            srv = http.server.ThreadingHTTPServer(("127.0.0.1", JUMP_HTTP_PORT), _JumpHandler)
+        except OSError:
+            mlog("jump", "http_port_busy", port=JUMP_HTTP_PORT)
+            return
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        mlog("jump", "http_listening", port=JUMP_HTTP_PORT)
 
     def _check_jump_request(self) -> None:
         """Poll for a jump request dropped by claude-jump (e.g. from the
