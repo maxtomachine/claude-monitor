@@ -292,6 +292,7 @@ class Session:
     remote_url: str = ""
     slug: str = ""
     is_subagent: bool = False
+    is_scheduled: bool = False  # entrypoint != 'cli' (sdk-cli, headless, etc.)
     parent_id: str = ""
     subagents: list["Session"] = field(default_factory=list)
     compact_count: int = 0
@@ -379,6 +380,7 @@ def scan_full_file(path: str, stale_ok: bool = False) -> dict:
         "model_id": "", "created": 0.0, "last_assistant_time": 0.0,
         "cwd": "", "last_tool": "", "last_tool_input": {},
         "last_assistant_text": "", "message_count": 0,
+        "entrypoint": "",
     }
 
     try:
@@ -386,6 +388,15 @@ def scan_full_file(path: str, stale_ok: bool = False) -> dict:
             for line in f:
                 if not line.strip():
                     continue
+
+                if not result["entrypoint"] and '"entrypoint"' in line:
+                    try:
+                        msg = json.loads(line)
+                        ep = msg.get("entrypoint", "")
+                        if ep:
+                            result["entrypoint"] = ep
+                    except json.JSONDecodeError:
+                        pass
 
                 # Fast string checks before JSON parse
                 if '"custom-title"' in line:
@@ -1034,6 +1045,7 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
         status_name=status_name,
         project_path=idx.get("projectPath", ""),
         background_count=bg_count,
+        is_scheduled=(data.get("entrypoint") not in ("", "cli")),
     )
 
 
@@ -3780,6 +3792,7 @@ class ClaudeMonitor(App):
     sort_mode: reactive[SortMode] = reactive(SortMode.ALPHA)
     show_subagents: reactive[bool] = reactive(False)
     show_archived: reactive[bool] = reactive(False)
+    show_scheduled: reactive[bool] = reactive(False)
     show_groups: reactive[bool] = reactive(True)
     debug_logging: reactive[bool] = reactive(True)  # ON by default
     sessions: list[Session] = []
@@ -4096,6 +4109,23 @@ class ClaudeMonitor(App):
             )
 
             # Hide closed sessions unless "All" is toggled
+            if not self.show_scheduled:
+                # Scheduled runs (sdk-cli, headless): keep only the most-recent
+                # per (cwd, title) so daily scouts don't flood history. The
+                # latest still shows so you can read the most recent run.
+                latest: dict[tuple[str, str], Session] = {}
+                kept = []
+                for s in sessions:
+                    if not s.is_scheduled:
+                        kept.append(s)
+                        continue
+                    key = (s.cwd, s.title)
+                    cur = latest.get(key)
+                    if cur is None or s.last_activity > cur.last_activity:
+                        latest[key] = s
+                kept.extend(latest.values())
+                sessions = kept
+
             if not self.show_archived:
                 sessions = [s for s in sessions
                             if s.status != "closed" or s.session_id in self._pinned]
@@ -4245,6 +4275,8 @@ class ClaudeMonitor(App):
                     last_group = gk
                 # Indent first cell so member rows nest under the ▸ header
                 cells = ["  " + cells[0], *cells[1:]]
+            if s.is_scheduled:
+                cells = ["[dim]↻[/] " + cells[0].lstrip(), *cells[1:]]
             if s.session_id in self._pinned:
                 cells = ["[cyan]⊙[/] " + cells[0].lstrip(), *cells[1:]]
             self._last_rendered[s.session_id] = cells
