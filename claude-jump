@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# claude-jump <sid8|full-sid|session-name>
+#
+# Raise the Ghostty window/tab hosting the given Claude session. Matches the
+# ·sid8 marker that the session_tracker hook stamps into terminal titles.
+# Designed to be invoked from an OSC 8 hyperlink via the ClaudeJump Shortcut:
+#   shortcuts://run-shortcut?name=ClaudeJump&input=text&text=<sid8>
+#
+# Exit codes: 0 = jumped, 1 = not found, 2 = no argument
+
+target="$1"
+[ -z "$target" ] && exit 2
+# Full UUID → sid8
+case "$target" in
+  *-*-*-*-*) target="${target:0:8}" ;;
+esac
+
+exec osascript -l JavaScript -e '(() => {
+    const target = "'"$target"'";
+    const se = Application("System Events");
+
+    // Ghostty: walk windows AND tabs (window.name() is only the front tab).
+    try {
+        const ghostty = Application("Ghostty");
+        for (const w of ghostty.windows()) {
+            for (const tab of w.tabs()) {
+                const n = tab.name() || "";
+                if (n.includes("·" + target) || (target.length > 8 && n.includes(target))) {
+                    tab.selectTab();
+                    ghostty.activateWindow(w);
+                    delay(0.05);
+                    try {
+                        const proc = se.processes.byName("Ghostty");
+                        proc.frontmost = true;
+                        const aw = proc.windows.byName(w.name());
+                        aw.actions["AXRaise"].perform();
+                        try { aw.attributes["AXMain"].value = true; } catch(e) {}
+                    } catch(e) {}
+                    return "ok:" + n;
+                }
+            }
+        }
+        // Second pass: bare-name match (no sid marker in title)
+        for (const w of ghostty.windows()) {
+            for (const tab of w.tabs()) {
+                const n = tab.name() || "";
+                const bare = n.replace(/^[^\w]*\s*/, "").replace(/\s*·[0-9a-f]{8}$/, "").trim();
+                if (bare === target) {
+                    tab.selectTab();
+                    ghostty.activateWindow(w);
+                    return "ok:name:" + n;
+                }
+            }
+        }
+    } catch(e) {}
+    return "not_found";
+})()'
