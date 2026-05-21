@@ -3786,6 +3786,7 @@ class ClaudeMonitor(App):
         t0 = _perf("on_mount: first refresh_sessions (schedule)", t0)
         self.set_interval(3, self.refresh_sessions)
         self.set_interval(0.132, self._tick_spinner)
+        self.set_interval(0.2, self._check_jump_request)
         self.set_interval(30, self._periodic_reconcile)
         self.set_interval(600, self._check_updates)
         self.set_interval(600, self._audit_stats)  # Every 10 minutes
@@ -3807,6 +3808,35 @@ class ClaudeMonitor(App):
                 title="jumpback", timeout=6,
             )
         _perf("on_mount: launch_count save_prefs + notify", t0)
+
+    _JUMP_REQUEST = Path("/tmp/claude-jump-request")
+
+    def _check_jump_request(self) -> None:
+        """Poll for a jump request dropped by claude-jump (e.g. from the
+        ClaudeJump Shortcut, whose sandbox can't send Apple Events itself).
+        Runs every 200ms; the file-exists check is the only cost."""
+        try:
+            if not self._JUMP_REQUEST.exists():
+                return
+            target = self._JUMP_REQUEST.read_text().strip()
+            self._JUMP_REQUEST.unlink()
+        except OSError:
+            return
+        if not target:
+            return
+        mlog("jump", "request_file", target=target)
+        # Match by sid8 prefix first, then by exact title.
+        s = next((x for x in self.sessions
+                  if x.session_id.startswith(target)), None)
+        if s is None:
+            s = next((x for x in self.sessions if x.title == target), None)
+        if s is None:
+            mlog("jump", "request_no_match", target=target)
+            self.notify(f"Jump: no session matching {target[:20]}", timeout=3)
+            return
+        self.run_worker(
+            lambda s=s: focus_terminal_session(s), thread=True,
+        )
 
     def _periodic_reconcile(self) -> None:
         """Run the reconciliation sweep in a background thread every 30s."""

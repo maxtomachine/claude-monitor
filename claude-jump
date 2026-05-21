@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # claude-jump <sid8|full-sid|session-name>
 #
-# Raise the Ghostty window/tab hosting the given Claude session. Matches the
-# ·sid8 marker that the session_tracker hook stamps into terminal titles.
-# Designed to be invoked from an OSC 8 hyperlink via the ClaudeJump Shortcut:
-#   shortcuts://run-shortcut?name=ClaudeJump&input=text&text=<sid8>
+# Raise the Ghostty window/tab hosting the given Claude session.
 #
-# Exit codes: 0 = jumped, 1 = not found, 2 = no argument
+# Two paths:
+#   1. If claude-monitor is running, drop the target into a request file —
+#      the monitor watches for it and performs the jump with its own
+#      (already TCC-authorized) JXA. This is the path used by the ClaudeJump
+#      macOS Shortcut: the Shortcuts sandbox cannot send Apple Events to
+#      Ghostty (windows() returns empty, no prompt is offered), so the jump
+#      must be delegated to a process in the user's login session.
+#   2. Otherwise, do the JXA directly (works from any normal shell).
+#
+# Exit codes: 0 = jumped/delegated, 1 = not found, 2 = no argument
 
+printf '%s argc=%d argv=%s\n' "$(date '+%H:%M:%S')" "$#" "$*" >> /tmp/claude-jump.log
 target="$1"
 [ -z "$target" ] && exit 2
 # Full UUID → sid8
@@ -15,11 +22,17 @@ case "$target" in
   *-*-*-*-*) target="${target:0:8}" ;;
 esac
 
-exec osascript -l JavaScript -e '(() => {
+# Path 1: delegate to a running monitor (sandbox-safe, no Apple Events here)
+if pgrep -qf 'claude_monitor\.py'; then
+  printf '%s' "$target" > /tmp/claude-jump-request
+  printf '%s delegated=%s\n' "$(date '+%H:%M:%S')" "$target" >> /tmp/claude-jump.log
+  exit 0
+fi
+
+# Path 2: direct JXA (normal shell, no monitor running)
+result=$(osascript -l JavaScript -e '(() => {
     const target = "'"$target"'";
     const se = Application("System Events");
-
-    // Ghostty: walk windows AND tabs (window.name() is only the front tab).
     try {
         const ghostty = Application("Ghostty");
         for (const w of ghostty.windows()) {
@@ -40,7 +53,6 @@ exec osascript -l JavaScript -e '(() => {
                 }
             }
         }
-        // Second pass: bare-name match (no sid marker in title)
         for (const w of ghostty.windows()) {
             for (const tab of w.tabs()) {
                 const n = tab.name() || "";
@@ -52,6 +64,8 @@ exec osascript -l JavaScript -e '(() => {
                 }
             }
         }
-    } catch(e) {}
+    } catch(e) { return "err:" + (e.errorNumber || "") + ":" + e.message; }
     return "not_found";
-})()'
+})()' 2>&1)
+printf '%s result=%s\n' "$(date '+%H:%M:%S')" "$result" >> /tmp/claude-jump.log
+case "$result" in ok*) exit 0 ;; *) exit 1 ;; esac
