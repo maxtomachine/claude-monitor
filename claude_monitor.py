@@ -89,20 +89,37 @@ JUMP_HTTP_PORT = 48624
 SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 PREFS_PATH = Path.home() / ".claude" / "monitor-prefs.json"
 HIDDEN_PATH = Path.home() / ".claude" / "monitor-hidden.json"
+PINNED_PATH = Path.home() / ".claude" / "monitor-pinned.json"
 
 
-def load_hidden_sessions() -> set[str]:
+def _load_sid_set(path: Path) -> set[str]:
     try:
-        return set(json.loads(HIDDEN_PATH.read_text()))
+        return set(json.loads(path.read_text()))
     except (OSError, json.JSONDecodeError, ValueError):
         return set()
 
 
-def save_hidden_sessions(hidden: set[str]) -> None:
+def _save_sid_set(path: Path, sids: set[str]) -> None:
     try:
-        HIDDEN_PATH.write_text(json.dumps(sorted(hidden)))
+        path.write_text(json.dumps(sorted(sids)))
     except OSError:
         pass
+
+
+def load_hidden_sessions() -> set[str]:
+    return _load_sid_set(HIDDEN_PATH)
+
+
+def save_hidden_sessions(hidden: set[str]) -> None:
+    _save_sid_set(HIDDEN_PATH, hidden)
+
+
+def load_pinned_sessions() -> set[str]:
+    return _load_sid_set(PINNED_PATH)
+
+
+def save_pinned_sessions(pinned: set[str]) -> None:
+    _save_sid_set(PINNED_PATH, pinned)
 DOING_MAX_WIDTH = 40
 RESTART_EXIT_CODE = 99
 _update_available: str = ""  # Commit summary when remote is ahead
@@ -3753,6 +3770,7 @@ class ClaudeMonitor(App):
         Binding("pagedown", "next_group", "PgDn", show=False, priority=True),
         Binding("home", "table_home", "Home", show=False, priority=True),
         Binding("end", "table_end", "End", show=False, priority=True),
+        Binding("p", "toggle_pin", "Pin", show=False),
         Binding("backspace", "hide_selected", "Hide", show=False),
         Binding("delete", "hide_selected", "Hide", show=False),
         Binding("shift+up", "extend_selection(-1)", "Select↑", show=False, priority=True),
@@ -3779,6 +3797,7 @@ class ClaudeMonitor(App):
     _spin_idx: int = 0
     _last_cursor_row: int = 0
     _hidden: set[str] = set()
+    _pinned: set[str] = set()
     _selection: set[str] = set()
     _selection_anchor: str | None = None
     _delete_armed_for: frozenset[str] | None = None
@@ -3812,6 +3831,7 @@ class ClaudeMonitor(App):
         self._visible_cols = get_visible_columns()
         self._col_order = get_column_order()
         self._hidden = load_hidden_sessions()
+        self._pinned = load_pinned_sessions()
         self._selection = set()
         self._load_view_state()
         self.theme = "gruvbox-dark" if _system_is_dark() else "gruvbox-light"
@@ -4077,7 +4097,8 @@ class ClaudeMonitor(App):
 
             # Hide closed sessions unless "All" is toggled
             if not self.show_archived:
-                sessions = [s for s in sessions if s.status != "closed"]
+                sessions = [s for s in sessions
+                            if s.status != "closed" or s.session_id in self._pinned]
 
             if self._hidden:
                 sessions = [s for s in sessions if s.session_id not in self._hidden]
@@ -4224,6 +4245,8 @@ class ClaudeMonitor(App):
                     last_group = gk
                 # Indent first cell so member rows nest under the ▸ header
                 cells = ["  " + cells[0], *cells[1:]]
+            if s.session_id in self._pinned:
+                cells = ["[cyan]⊙[/] " + cells[0].lstrip(), *cells[1:]]
             self._last_rendered[s.session_id] = cells
             display = self._with_selection_style(s.session_id, cells)
             table.add_row(*display, key=s.session_id)
@@ -4660,6 +4683,23 @@ class ClaudeMonitor(App):
         sids = {s.session_id for s in self._row_map[lo:hi + 1] if s}
         self._set_selection(sids)
         table.move_cursor(row=nr)
+
+    def action_toggle_pin(self) -> None:
+        cur = self._cursor_session()
+        if cur is None:
+            return
+        sid = cur.session_id
+        if sid in self._pinned:
+            self._pinned.discard(sid)
+            self.notify(f"Unpinned {cur.title}", timeout=2)
+        else:
+            self._pinned.add(sid)
+            self._hidden.discard(sid)
+            self.notify(f"Pinned {cur.title} — stays visible when closed", timeout=3)
+        save_pinned_sessions(self._pinned)
+        if sid not in self._pinned and sid in self._hidden:
+            save_hidden_sessions(self._hidden)
+        self.refresh_sessions()
 
     def action_hide_selected(self) -> None:
         target: set[str] = set(self._selection)
