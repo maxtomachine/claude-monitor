@@ -28,6 +28,20 @@ KNOWN FOLLOW-UPS (not blocking):
   not currently causing ghosts)
 - The 15 minimal {pid,tty,sid} state files from Apr 9 are dead-PID cruft, harmless
 
+CLICK-TO-JUMP (2026-05-21, all on main):
+- claude-jump CLI + /tmp/claude-jump-request file + monitor 200ms poller
+- http://localhost:48624/jump/<sid8> listener in monitor (Chrome flashes, then
+  the raised window covers it) — THE clickable path; shortcuts:// is not
+  clickable in terminal output, Shortcuts sandbox can't send Apple Events
+- ClaudeJump macOS Shortcut exists (manual GUI creation, Santa blocks the rest)
+  but is no longer in the critical path — useful for Spotlight/hotkey only
+- Global ~/.claude/CLAUDE.md convention: mention a live session → append its
+  jump URL. Verified cross-window.
+- FOLLOW-UP: migrate all /tmp/claude-* signal files to mode-700 ~/.claude/run/
+  in one pass (security review flags the fixed-path-in-/tmp pattern)
+- FOLLOW-UP: Ghostty notification clicks can't focus the originating window
+  across Spaces — unimplemented upstream (ghostty#9145), not fixable here
+
 POST-#11 DIRECT TO MAIN (2026-05-11/12):
 - 4c052aa  Statusline cache persists to ~/.claude/statusline-cache/ (survives reboot)
 - 7854434  Hook 'exited' ignored when alive=True (subagent SessionEnd pollutes parent)
