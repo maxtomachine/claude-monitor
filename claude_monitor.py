@@ -11,7 +11,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -819,6 +819,52 @@ def parse_sessions(include_archived: bool = False,
         )
         sessions.append(session)
         n_orphans += 1
+
+    # Third pass: split shared-tree sessions into one row per PID. A transcript
+    # is a parentUuid tree, not a linear log — two `--resume`s of one sid sit
+    # on divergent branches in the SAME file. Monitor's transcript-derived row
+    # represents the whole tree, not either branch, so when N>1 PIDs claim a
+    # sid we replace that row with N PID-derived siblings whose title/status
+    # come from each sessions/{pid}.json (the only per-branch source we have).
+    sid_pids: dict[str, list[dict]] = {}
+    if SESSIONS_DIR.is_dir():
+        for path in SESSIONS_DIR.iterdir():
+            if path.suffix != ".json":
+                continue
+            try:
+                pdata = json.loads(path.read_text())
+                pid = int(pdata.get("pid", 0))
+                sid = pdata.get("sessionId", "")
+                if not (pid and sid):
+                    continue
+                os.kill(pid, 0)
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            if pdata.get("kind") != "interactive":
+                continue
+            sid_pids.setdefault(sid, []).append(pdata)
+
+    by_sid = {s.session_id: s for s in sessions}
+    for sid, pids in sid_pids.items():
+        if len(pids) < 2 or sid not in by_sid:
+            continue
+        base = by_sid[sid]
+        sessions.remove(base)
+        for pdata in sorted(pids, key=lambda p: p.get("startedAt", 0)):
+            pid = pdata["pid"]
+            updated = pdata.get("updatedAt", 0) / 1000.0
+            pstatus = pdata.get("status", "")
+            sib = replace(
+                base,
+                session_id=f"{sid}@{pid}",
+                title=pdata.get("name") or base.title,
+                status=("working" if pstatus == "busy" else
+                        "waiting" if pstatus == "idle" else base.status),
+                last_activity=updated or base.last_activity,
+                context_is_estimate=True,
+                status_name=pdata.get("name") or base.status_name,
+            )
+            sessions.append(sib)
 
     if _PERF:
         print(f"[perf]   parse_sessions: rglob iter: {t_rglob*1000:.1f}ms", file=sys.stderr)
