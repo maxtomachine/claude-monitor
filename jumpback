@@ -57,7 +57,7 @@ exec osascript -l JavaScript -e '(() => {
         } catch(e) {}
     }
 
-    // No monitor anywhere — launch one
+    // No monitor window anywhere — launch one
     try {
         const ghostty = Application("Ghostty");
         const w = ghostty.newWindow({
