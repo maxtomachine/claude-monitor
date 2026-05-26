@@ -87,9 +87,15 @@ TASKS_DIR = Path.home() / ".claude" / "tasks"
 # Local HTTP listener for click-to-jump links (http://localhost:48624/jump/<sid8>)
 JUMP_HTTP_PORT = 48624
 SESSIONS_DIR = Path.home() / ".claude" / "sessions"
-PREFS_PATH = Path.home() / ".claude" / "monitor-prefs.json"
-HIDDEN_PATH = Path.home() / ".claude" / "monitor-hidden.json"
-PINNED_PATH = Path.home() / ".claude" / "monitor-pinned.json"
+# Monitor-OWNED writable state (pins, hidden, prefs; log + instance records derive
+# from the same home). Overridable via MONITOR_STATE_HOME so a staging instance
+# (monitor2) keeps its own pins/log without touching production. Real session data
+# (SESSIONS_DIR, HOOK_STATE_DIR, CLAUDE_DIR above) always reads from ~/.claude.
+_STATE_HOME = Path(os.environ.get("MONITOR_STATE_HOME") or (Path.home() / ".claude"))
+_STATE_HOME.mkdir(parents=True, exist_ok=True)
+PREFS_PATH = _STATE_HOME / "monitor-prefs.json"
+HIDDEN_PATH = _STATE_HOME / "monitor-hidden.json"
+PINNED_PATH = _STATE_HOME / "monitor-pinned.json"
 BELL_DECAY_S = 300
 
 
