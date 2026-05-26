@@ -1068,12 +1068,17 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
         try:
             ri = resolve_session(session_id, data, idx, path)
             _sid_val, _iid_val = ri.sid, ri.instance_id
-            if ri.title != display_title[:50] or ri.status != status:
+            # Compare TITLE only. Status is computed by determine_status, which
+            # reads wall-clock time + live transcript mtime; calling it twice in
+            # one build cycle (once for `status`, once inside resolve_session)
+            # races across the 5s/30s thresholds and yields benign working vs
+            # background/waiting flips. That is shadow-only noise: the cutover
+            # computes status once. Title is the deterministic signal worth logging.
+            if ri.title != display_title[:50]:
                 from monitor_log import log as _shadow_log
                 _shadow_log("shadow", "divergence", sid=session_id[:8],
                             cur_title=display_title[:50], new_title=ri.title,
                             new_title_source=ri.title_source,
-                            cur_status=status, new_status=ri.status,
                             origin=ri.origin, iid=ri.instance_id)
         except Exception as _shadow_err:
             try:
