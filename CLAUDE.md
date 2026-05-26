@@ -99,7 +99,7 @@ This project layers multiple technologies in unusual ways: bash statusline scrip
 ## Key conventions
 
 - **No direct pushes to main** — all changes go through PRs
-- **Python 3.14+** — uses modern syntax (union types, etc.)
+- **Python 3.12+** (venv is 3.12.13, `requires-python>=3.12`): modern syntax (union types, etc.) is fine; 3.14-only syntax is not
 - **Dependencies**: `textual` for TUI, `rich` for markup. Dev: `pytest`, `pytest-asyncio`
 - **Preferences** saved to `~/.claude/monitor-prefs.json` — columns and column order
 - **Statusline** at `statusline/statusline.sh` — symlinked to `~/.claude/statusline.sh` by installer
