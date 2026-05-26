@@ -305,6 +305,8 @@ class Session:
     project_path: str = ""  # Original launch directory (for resume)
     background_count: int = 0
     context_is_estimate: bool = False
+    sid: str = ""  # bare conversation id (for file lookups); session_id carries the row key
+    instance_id: str = ""  # durable per-instance surrogate "{sid}#{startedAt_ms}"
 
 
 # ── Preferences ───────────────────────────────────────────────────────────────
@@ -1550,6 +1552,157 @@ def determine_status(session_id: str, last_assistant_time: float,
         elif elapsed < 300:
             return _idle_or_background("waiting")
     return _idle_or_background("idle")
+
+
+# ── Session identity resolver (single chokepoint + self-audit) ──────────────────
+# A transcript is a parentUuid TREE, not a line, and sessionId is conversation-
+# grain (reused across every --resume), so identity must be RESOLVED, not read.
+# resolve_session() is the ONE place that turns the desynced sources (pid files,
+# hook state, transcript) into a single identity per running instance, keyed by a
+# durable surrogate instance_id = "{sid}#{startedAt_ms}". Every renderer goes
+# through it. audit_identities() asserts invariants each refresh and logs any
+# violation (with the raw snapshot) as a ready-made test fixture, so correctness
+# ratchets instead of being declared. Phase 1: files-only (pid files + hook +
+# transcript). Phase 2 adds the persisted per-instance record; Phase 3 adds
+# `claude agents --json` as liveness tier 0.
+
+INSTANCE_SEP = "#"
+
+
+def base_sid(key: str) -> str:
+    """Normalize any row key (bare sid, legacy 'sid@pid', new 'sid#startedms')
+    back to the bare conversation sid. Idempotent on a bare sid."""
+    return key.split(INSTANCE_SEP, 1)[0].split("@", 1)[0]
+
+
+@dataclass(frozen=True)
+class ResolvedIdentity:
+    key: str            # unique row key (carrier): instance_id live, sid/legacy dead
+    sid: str            # bare conversation id (for file lookups)
+    instance_id: str    # durable surrogate "{sid}#{startedAt_ms}"
+    pid: int | None
+    started_ms: int
+    title: str
+    title_source: str   # known provenance, never empty for a resolved row
+    status: str
+    alive: bool
+    cwd: str
+    origin: str         # live | backfilled | reconstructed
+    source: str         # pidfile | hook | transcript
+
+
+def _started_ms_for(sid: str, pid: int | None) -> int:
+    """Launch time in ms from the pid file (the stable half of the surrogate).
+    0 when unknown (dead session, recycled/absent pid file, or sid mismatch)."""
+    if pid is None:
+        return 0
+    try:
+        data = json.loads((SESSIONS_DIR / f"{pid}.json").read_text())
+        if data.get("sessionId") == sid:
+            return int(data.get("startedAt", 0))
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        pass
+    return 0
+
+
+def _resolve_title(session_id: str, data: dict, idx: dict, path: str,
+                   hook: dict | None) -> tuple[str, str]:
+    """Title + its provenance. Mirrors the precedence in build_session: live
+    sessions let a user /rename (transcript custom_title) win; an EXITED session
+    trusts its settled hook title over a transcript-tree straggler."""
+    hook_title = hook.get("title", "") if hook else ""
+    hook_exited = bool(hook) and hook.get("state") == "exited"
+    candidates: list[tuple[str, str]]
+    if hook_exited and hook_title:
+        candidates = [(hook_title, "hook"), (data["custom_title"], "custom_title")]
+    else:
+        candidates = [(data["custom_title"], "custom_title"), (hook_title, "hook")]
+    candidates += [
+        (idx.get("summary", ""), "summary"),
+        (read_session_memory_title(path), "memory"),
+        (idx.get("firstPrompt", "")[:60], "firstPrompt"),
+        (Path(data["cwd"]).name, "cwd"),
+        (session_id[:8], "sid"),
+    ]
+    for value, source in candidates:
+        if value:
+            return value, source
+    return session_id[:8], "sid"
+
+
+def resolve_session(session_id: str, data: dict, idx: dict,
+                    path: str) -> ResolvedIdentity:
+    """The one chokepoint. Given a sid and its transcript scan + index, resolve
+    the single identity (key, title, status, liveness, durable instance_id) from
+    all sources under one precedence. Reads cached maps (pid map, hook cache);
+    one small pid-file read for startedAt. Renderers must route through this."""
+    hook = read_hook_state(session_id)
+    alive = _is_session_alive(session_id)
+    pid = _pid_map.get(session_id)
+    started_ms = _started_ms_for(session_id, pid)
+    title, title_source = _resolve_title(session_id, data, idx, path, hook)
+    status = determine_status(session_id, data["last_assistant_time"], title, path)
+    instance_id = f"{session_id}{INSTANCE_SEP}{started_ms}"
+
+    if alive:
+        key = instance_id
+        origin = "live" if started_ms else "backfilled"
+    elif pid is not None:
+        key = f"{session_id}@{pid}"  # legacy reconstructed grain
+        origin = "reconstructed"
+    else:
+        key = session_id
+        origin = "reconstructed"
+    source = "hook" if hook else ("pidfile" if pid is not None else "transcript")
+
+    return ResolvedIdentity(
+        key=key, sid=session_id, instance_id=instance_id, pid=pid,
+        started_ms=started_ms, title=title, title_source=title_source,
+        status=status, alive=alive, cwd=data.get("cwd", ""),
+        origin=origin, source=source,
+    )
+
+
+def audit_identities(identities: list[ResolvedIdentity]) -> list[dict]:
+    """Self-audit the resolved set against the invariants. Returns the list of
+    violations and logs each (with snapshot) to monitor.log as a ready-made test
+    fixture. The invariant set only grows; correctness ratchets."""
+    violations: list[dict] = []
+
+    def flag(kind: str, **details):
+        violations.append({"kind": kind, **details})
+
+    seen_keys: dict[str, ResolvedIdentity] = {}
+    seen_iids: dict[str, str] = {}
+    for r in identities:
+        # 1. No two rows share a key.
+        if r.key in seen_keys:
+            flag("dup_key", key=r.key, sid=r.sid,
+                 other_sid=seen_keys[r.key].sid)
+        seen_keys[r.key] = r
+        # 2. Key normalizes to exactly this row's sid.
+        if base_sid(r.key) != r.sid:
+            flag("key_sid_mismatch", key=r.key, sid=r.sid,
+                 normalized=base_sid(r.key))
+        # 3. No two LIVE rows share an instance_id.
+        if r.alive:
+            if r.instance_id in seen_iids and seen_iids[r.instance_id] != r.key:
+                flag("dup_instance_id", instance_id=r.instance_id,
+                     key=r.key, other_key=seen_iids[r.instance_id])
+            seen_iids[r.instance_id] = r.key
+        # 4. Every live row has a known title source (never empty/guessed).
+        if r.alive and not r.title_source:
+            flag("title_source_unknown", key=r.key, sid=r.sid, title=r.title)
+
+    if violations:
+        try:
+            from monitor_log import log as mlog
+            for v in violations:
+                mlog("invariant", v["kind"], **{k: x for k, x in v.items()
+                                                if k != "kind"})
+        except Exception:
+            pass
+    return violations
 
 
 # ── Formatting ────────────────────────────────────────────────────────────────
