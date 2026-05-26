@@ -1058,6 +1058,31 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
 
     status_name = _read_session_cache("name", session_id)
 
+    # SHADOW MODE: run the resolver alongside the current logic (observe-only).
+    # Rendering still uses the old derivation; the resolver only logs where it
+    # WOULD diverge, and populates the new sid/instance_id carrier fields. This
+    # surfaces real-world identity bugs before the cutover and feeds the
+    # crystallization loop with zero risk to what is displayed.
+    _sid_val, _iid_val = session_id, ""
+    if not is_subagent:
+        try:
+            ri = resolve_session(session_id, data, idx, path)
+            _sid_val, _iid_val = ri.sid, ri.instance_id
+            if ri.title != display_title[:50] or ri.status != status:
+                from monitor_log import log as _shadow_log
+                _shadow_log("shadow", "divergence", sid=session_id[:8],
+                            cur_title=display_title[:50], new_title=ri.title,
+                            new_title_source=ri.title_source,
+                            cur_status=status, new_status=ri.status,
+                            origin=ri.origin, iid=ri.instance_id)
+        except Exception as _shadow_err:
+            try:
+                from monitor_log import log as _shadow_log
+                _shadow_log("shadow", "error", sid=session_id[:8],
+                            err=str(_shadow_err))
+            except Exception:
+                pass
+
     return Session(
         session_id=session_id, project=project,
         title=display_title[:50], status=status,
@@ -1078,6 +1103,7 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
         project_path=idx.get("projectPath", ""),
         background_count=bg_count,
         is_scheduled=(data.get("entrypoint") not in ("", "cli")),
+        sid=_sid_val, instance_id=_iid_val,
     )
 
 
@@ -4025,6 +4051,12 @@ class ClaudeMonitor(App):
 
     def on_mount(self) -> None:
         t0 = time.perf_counter()
+        try:
+            from monitor_log import log as _startup_log
+            _startup_log("startup", "launch", state_home=str(_STATE_HOME),
+                         staging=(os.environ.get("MONITOR_STATE_HOME") is not None))
+        except Exception:
+            pass
         self.register_theme(GRUVBOX_DARK)
         self.register_theme(GRUVBOX_LIGHT)
         self._visible_cols = get_visible_columns()
@@ -4446,6 +4478,26 @@ class ClaudeMonitor(App):
         """Main thread: apply computed results to UI."""
         self._sync_system_theme(sys_dark)
         self.sessions = sessions
+
+        # SHADOW: cross-row invariant audit on the real session set every refresh.
+        # Constructs the would-be resolved identities and checks for dup keys /
+        # instance-id collisions / key-sid mismatch, logging any violation as a
+        # self-describing fixture. Observe-only; never affects rendering.
+        try:
+            _ris = [
+                ResolvedIdentity(
+                    key=(s.instance_id if (s.status != "closed" and s.instance_id)
+                         else (s.sid or s.session_id)),
+                    sid=(s.sid or s.session_id), instance_id=s.instance_id,
+                    pid=None, started_ms=0, title=s.title, title_source="shadow",
+                    status=s.status, alive=(s.status != "closed"),
+                    cwd=s.cwd, origin="shadow", source="shadow",
+                )
+                for s in sessions if not s.is_subagent and (s.sid or s.session_id)
+            ]
+            audit_identities(_ris)
+        except Exception:
+            pass
 
         if cleaned:
             self.notify(
