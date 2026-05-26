@@ -980,15 +980,35 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
         display_title = "-".join(parts[:2]) if len(parts) >= 2 else session_id[:12]
     else:
         hook_title = hook.get("title", "") if hook else ""
-        display_title = (
-            data["custom_title"]
-            or hook_title
-            or idx.get("summary", "")
-            or read_session_memory_title(path)
-            or idx.get("firstPrompt", "")[:60]
-            or Path(data["cwd"]).name
-            or session_id[:8]
-        )
+        # A transcript is a parentUuid TREE, not a line. scan_full_file returns
+        # the LAST custom-title in the file, which for a long-lived sid that was
+        # resumed across projects can be a straggler from a divergent branch
+        # (e.g. a month-long "tools-frontier-curve" session whose final written
+        # leaf briefly carried "tools-monitor"). For an EXITED session the hook
+        # state captured the settled identity it carried during its working life,
+        # i.e. what the user actually saw and pinned, so trust that over the
+        # straggler. Live sessions keep custom_title first so /rename still wins.
+        hook_exited = bool(hook) and hook.get("state") == "exited"
+        if hook_exited and hook_title:
+            display_title = (
+                hook_title
+                or data["custom_title"]
+                or idx.get("summary", "")
+                or read_session_memory_title(path)
+                or idx.get("firstPrompt", "")[:60]
+                or Path(data["cwd"]).name
+                or session_id[:8]
+            )
+        else:
+            display_title = (
+                data["custom_title"]
+                or hook_title
+                or idx.get("summary", "")
+                or read_session_memory_title(path)
+                or idx.get("firstPrompt", "")[:60]
+                or Path(data["cwd"]).name
+                or session_id[:8]
+            )
 
     status = determine_status(session_id, data["last_assistant_time"], display_title, path)
     bg_count = count_background_activity(path) if status == "background" else 0
