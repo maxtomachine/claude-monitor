@@ -6,6 +6,8 @@ that UI interactions work correctly — no real terminal needed.
 
 from unittest.mock import patch
 
+import time
+
 import pytest
 
 from textual.widgets import DataTable, OptionList, Input, Static
@@ -839,3 +841,82 @@ class TestHideAndMultiSelect:
             await pilot.press("down")
             await pilot.pause()
             assert pilot.app._delete_armed_for is None
+
+
+class TestBell:
+    async def test_no_bell_on_startup(self):
+        sessions = [make_session(session_id="s1", title="t", status="waiting")]
+        with _mock_sessions(sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                assert pilot.app._bell == {}
+
+    async def test_rings_on_working_to_waiting(self):
+        s = make_session(session_id="s1", title="t", status="working")
+        with patch("claude_monitor.parse_sessions", side_effect=[[s], [s], [s]]):
+            original = ClaudeMonitor.show_groups._default
+            ClaudeMonitor.show_groups._default = False
+            try:
+                async with ClaudeMonitor().run_test() as pilot:
+                    await pilot.pause()
+                    assert pilot.app._bell == {}
+                    s.status = "waiting"
+                    pilot.app.refresh_sessions()
+                    await pilot.pause()
+                    assert "s1" in pilot.app._bell
+                    assert pilot.app._bell["s1"]["acked"] is False
+            finally:
+                ClaudeMonitor.show_groups._default = original
+
+    async def test_ack_clears_on_next_tick(self):
+        s = make_session(session_id="s1", title="t", status="working")
+        with patch("claude_monitor.parse_sessions", side_effect=[[s], [s], [s]]):
+            original = ClaudeMonitor.show_groups._default
+            ClaudeMonitor.show_groups._default = False
+            try:
+                async with ClaudeMonitor().run_test() as pilot:
+                    await pilot.pause()
+                    s.status = "waiting"
+                    pilot.app.refresh_sessions()
+                    await pilot.pause()
+                    assert "s1" in pilot.app._bell
+                    pilot.app._ack_bell("s1")
+                    pilot.app._tick_bell()
+                    assert "s1" not in pilot.app._bell
+            finally:
+                ClaudeMonitor.show_groups._default = original
+
+    async def test_working_again_silences(self):
+        s = make_session(session_id="s1", title="t", status="working")
+        with patch("claude_monitor.parse_sessions", side_effect=[[s], [s], [s], [s]]):
+            original = ClaudeMonitor.show_groups._default
+            ClaudeMonitor.show_groups._default = False
+            try:
+                async with ClaudeMonitor().run_test() as pilot:
+                    await pilot.pause()
+                    s.status = "waiting"
+                    pilot.app.refresh_sessions()
+                    await pilot.pause()
+                    assert "s1" in pilot.app._bell
+                    s.status = "working"
+                    pilot.app.refresh_sessions()
+                    await pilot.pause()
+                    assert "s1" not in pilot.app._bell
+            finally:
+                ClaudeMonitor.show_groups._default = original
+
+    async def test_compose_first_cell_precedence(self):
+        with _mock_sessions([]):
+            async with ClaudeMonitor().run_test() as pilot:
+                app = pilot.app
+                s = make_session(session_id="s1", title="t", is_scheduled=True)
+                app._pinned = {"s1"}
+                app._bell = {"s1": {"rang_at": time.time(), "acked": False}}
+                app._pulse_phase = True
+                assert "●" in app._compose_first_cell(s, "  base")
+                app._bell["s1"]["acked"] = True
+                assert "⊙" in app._compose_first_cell(s, "  base")
+                app._pinned = set()
+                assert "↻" in app._compose_first_cell(s, "  base")
+                s2 = make_session(session_id="s2", title="t2")
+                assert app._compose_first_cell(s2, "  base") == "  base"

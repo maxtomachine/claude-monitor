@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from claude_monitor import (
+    parse_sessions,
     parse_timestamp,
     scan_full_file,
     estimate_cost,
@@ -350,6 +351,44 @@ class TestBackgroundActivity:
         with patch("claude_monitor._is_session_alive", return_value=True), \
              patch("claude_monitor.read_hook_state", return_value={"state": "thinking"}):
             assert determine_status("sid", 0, "", t) == "working"
+
+
+class TestPinnedSurvivesHistoryOff:
+    """A pinned session must appear even when history mode is off, even if its
+    transcript is old and the process is dead. Regression: the three skip gates
+    in parse_sessions dropped pinned sessions before the render-time pin guard
+    could re-admit them."""
+
+    def _setup(self, tmp_path):
+        sid = "pinned00-dead-beef-cafe-000000000001"
+        proj = tmp_path / "-Users-test-proj"
+        proj.mkdir()
+        t = proj / f"{sid}.jsonl"
+        t.write_text(make_transcript_jsonl(tokens_out=500))
+        old = time.time() - 86400 * 2  # 2 days: archived but inside 7-day cutoff
+        import os as _os
+        _os.utime(t, (old, old))
+        return sid, t
+
+    def _run(self, tmp_path, pinned):
+        with patch("claude_monitor.CLAUDE_DIR", tmp_path), \
+             patch("claude_monitor._is_session_alive", return_value=False), \
+             patch("claude_monitor._gc_state_files"), \
+             patch("claude_monitor.load_index_metadata", return_value={}), \
+             patch("claude_monitor._refresh_pid_map"), \
+             patch("claude_monitor._pid_map", {}), \
+             patch("claude_monitor.read_hook_state", return_value={}):
+            return parse_sessions(include_archived=False, pinned=pinned)
+
+    def test_unpinned_old_dead_session_dropped(self, tmp_path):
+        sid, _ = self._setup(tmp_path)
+        ids = {s.session_id for s in self._run(tmp_path, pinned=set())}
+        assert sid not in ids
+
+    def test_pinned_old_dead_session_kept(self, tmp_path):
+        sid, _ = self._setup(tmp_path)
+        ids = {s.session_id for s in self._run(tmp_path, pinned={sid})}
+        assert sid in ids
 
 
 class TestTranscriptCustomTitle:

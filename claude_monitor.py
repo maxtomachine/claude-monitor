@@ -90,6 +90,7 @@ SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 PREFS_PATH = Path.home() / ".claude" / "monitor-prefs.json"
 HIDDEN_PATH = Path.home() / ".claude" / "monitor-hidden.json"
 PINNED_PATH = Path.home() / ".claude" / "monitor-pinned.json"
+BELL_DECAY_S = 300
 
 
 def _load_sid_set(path: Path) -> set[str]:
@@ -686,9 +687,11 @@ def _perf(label: str, t0: float) -> float:
 
 
 def parse_sessions(include_archived: bool = False,
-                   include_subagents: bool = False) -> list[Session]:
+                   include_subagents: bool = False,
+                   pinned: set[str] | None = None) -> list[Session]:
     t0 = time.perf_counter()
     sessions = []
+    pinned = pinned or set()
     now = time.time()
     active_cutoff = now - 86400
     archive_cutoff = now - 86400 * 7  # 7 days for archived
@@ -715,14 +718,15 @@ def parse_sessions(include_archived: bool = False,
 
         t_rglob += time.perf_counter() - tg
         session_id = jsonl_path.stem
+        is_pinned = session_id in pinned
 
         is_archived = mtime < active_cutoff
-        if is_archived and not include_archived:
+        if is_archived and not include_archived and not is_pinned:
             if not _is_session_alive(session_id):
                 tg = time.perf_counter()
                 continue
             is_archived = False
-        if mtime < archive_cutoff and not _is_session_alive(session_id):
+        if mtime < archive_cutoff and not _is_session_alive(session_id) and not is_pinned:
             tg = time.perf_counter()
             continue
         idx = meta.get(session_id, {})
@@ -761,7 +765,7 @@ def parse_sessions(include_archived: bool = False,
                     data = scan_full_file(str(jsonl_path))
                     session.tokens_out = data.get("tokens_out", 0)
                     session.tokens_in = data.get("tokens_in", 0)
-                if session.tokens_out <= 20:
+                if session.tokens_out <= 20 and not is_pinned:
                     n_alive_check += 1
                     if _is_session_alive(session_id) is not True:
                         tg = time.perf_counter()
@@ -3807,6 +3811,9 @@ class ClaudeMonitor(App):
     _dismissing_sessions: dict[str, str] = {}  # sid -> "debriefing" | "closing"
     _dismiss_failed: set[str] = set()  # sids where dismiss failed (can't reach terminal)
     _prev_statuses: dict[str, str] = {}  # sid -> previous status (for transition logging)
+    _bell: dict[str, dict] = {}  # sid -> {"rang_at": float, "acked": bool}
+    _pulse_phase: bool = False
+    _first_cell_base: dict[str, str] = {}
     _spin_idx: int = 0
     _last_cursor_row: int = 0
     _hidden: set[str] = set()
@@ -3868,6 +3875,7 @@ class ClaudeMonitor(App):
         t0 = _perf("on_mount: first refresh_sessions (schedule)", t0)
         self.set_interval(3, self.refresh_sessions)
         self.set_interval(0.132, self._tick_spinner)
+        self.set_interval(0.6, self._tick_bell)
         self.set_interval(0.2, self._check_jump_request)
         if "PYTEST_CURRENT_TEST" not in os.environ:
             self._start_jump_server()
@@ -3968,6 +3976,7 @@ class ClaudeMonitor(App):
             mlog("jump", "request_no_match", target=target)
             self.notify(f"Jump: no session matching {target[:20]}", timeout=3)
             return
+        self._ack_bell(s.session_id)
         self.run_worker(
             lambda s=s: focus_terminal_session(s), thread=True,
         )
@@ -4030,6 +4039,56 @@ class ClaudeMonitor(App):
                     table.update_cell(s.session_id, "status", cell)
                 except Exception:
                     pass
+
+    def _compose_first_cell(self, s: Session, base: str) -> str:
+        b = self._bell.get(s.session_id)
+        if b and not b["acked"] and time.time() - b["rang_at"] < BELL_DECAY_S:
+            glyph = "●" if self._pulse_phase else "○"
+            return f"[#fabd2f]{glyph}[/] " + base.lstrip()
+        if s.session_id in self._pinned:
+            return "[cyan]⊙[/] " + base.lstrip()
+        if s.is_scheduled:
+            return "[dim]↻[/] " + base.lstrip()
+        return base
+
+    def _ack_bell(self, sid: str) -> None:
+        b = self._bell.get(sid)
+        if b:
+            b["acked"] = True
+
+    def _tick_bell(self) -> None:
+        if not self._bell:
+            return
+        self._pulse_phase = not self._pulse_phase
+        now = time.time()
+        try:
+            table = self.query_one("#session-table", DataTable)
+        except Exception:
+            return
+        col0 = self._visible_cols[0] if self._visible_cols else None
+        if not col0:
+            return
+        for sid in list(self._bell):
+            b = self._bell[sid]
+            if now - b["rang_at"] >= BELL_DECAY_S:
+                b["acked"] = True
+            s = next((x for x in self._flat_rows if x.session_id == sid), None)
+            base = self._first_cell_base.get(sid)
+            if s is None or base is None:
+                if b["acked"]:
+                    self._bell.pop(sid, None)
+                continue
+            first = self._compose_first_cell(s, base)
+            cells = self._last_rendered.get(sid)
+            if cells:
+                cells[0] = first
+            display = self._with_selection_style(sid, [first])[0]
+            try:
+                table.update_cell(sid, col0, display)
+            except Exception:
+                pass
+            if b["acked"]:
+                self._bell.pop(sid, None)
 
     def _rebuild_table_columns(self) -> None:
         table = self.query_one("#session-table", DataTable)
@@ -4106,6 +4165,7 @@ class ClaudeMonitor(App):
             sessions = parse_sessions(
                 include_archived=self.show_archived,
                 include_subagents=self.show_subagents,
+                pinned=self._pinned,
             )
 
             # Hide closed sessions unless "All" is toggled
@@ -4116,7 +4176,7 @@ class ClaudeMonitor(App):
                 latest: dict[tuple[str, str], Session] = {}
                 kept = []
                 for s in sessions:
-                    if not s.is_scheduled:
+                    if not s.is_scheduled or s.session_id in self._pinned:
                         kept.append(s)
                         continue
                     key = (s.cwd, s.title)
@@ -4222,6 +4282,10 @@ class ClaudeMonitor(App):
             if prev and prev != s.status:
                 mlog("status", "transition", sid=s.session_id[:12],
                      title=s.title, prev=prev, new=s.status)
+                if s.status == "waiting":
+                    self._bell[s.session_id] = {"rang_at": time.time(), "acked": False}
+            if s.status != "waiting":
+                self._bell.pop(s.session_id, None)
             self._prev_statuses[s.session_id] = s.status
 
         table = self.query_one("#session-table", DataTable)
@@ -4248,6 +4312,7 @@ class ClaudeMonitor(App):
         self._extending_cursor = True
         table.clear()
         self._last_rendered = {}
+        self._first_cell_base = {}
         n_cols = len(self._visible_cols)
         last_group = None
         row_map: list[Session | None] = []
@@ -4275,10 +4340,8 @@ class ClaudeMonitor(App):
                     last_group = gk
                 # Indent first cell so member rows nest under the ▸ header
                 cells = ["  " + cells[0], *cells[1:]]
-            if s.is_scheduled:
-                cells = ["[dim]↻[/] " + cells[0].lstrip(), *cells[1:]]
-            if s.session_id in self._pinned:
-                cells = ["[cyan]⊙[/] " + cells[0].lstrip(), *cells[1:]]
+            self._first_cell_base[s.session_id] = cells[0]
+            cells = [self._compose_first_cell(s, cells[0]), *cells[1:]]
             self._last_rendered[s.session_id] = cells
             display = self._with_selection_style(s.session_id, cells)
             table.add_row(*display, key=s.session_id)
@@ -4317,6 +4380,7 @@ class ClaudeMonitor(App):
             mlog("menu", "action", action=action, sid=s.session_id[:12],
                  title=s.title, status=s.status)
             if action == "jump":
+                self._ack_bell(s.session_id)
                 ok = focus_terminal_session(s)
                 if not ok:
                     # If the session's process is alive, its window exists
