@@ -915,6 +915,8 @@ def parse_sessions(include_archived: bool = False,
         print(f"[perf]   parse_sessions: _is_session_alive checks: {n_alive_check}", file=sys.stderr)
         if n_orphans:
             print(f"[perf]   parse_sessions: PID-file orphans added: {n_orphans}", file=sys.stderr)
+
+    sessions = filter_ignored(sessions)
     return sessions
 
 
@@ -1610,6 +1612,28 @@ def base_sid(key: str) -> str:
     """Normalize any row key (bare sid, legacy 'sid@pid', new 'sid#startedms')
     back to the bare conversation sid. Idempotent on a bare sid."""
     return key.split(INSTANCE_SEP, 1)[0].split("@", 1)[0]
+
+
+IGNORE_MARKER = "&ignore"
+
+
+def filter_ignored(sessions: list[Session]) -> list[Session]:
+    """Drop sessions whose name contains "&ignore" (case-insensitive) from
+    monitoring entirely, along with their PID-siblings and subagents (keyed on
+    the conversation sid). An explicit opt-out: it beats pinning. Naming a
+    session with "&ignore" signals the monitor not to track it; remove the
+    marker to track it again."""
+    ignored_bases = {
+        base_sid(s.session_id) for s in sessions
+        if IGNORE_MARKER in (s.title or "").lower()
+    }
+    if not ignored_bases:
+        return sessions
+    return [
+        s for s in sessions
+        if base_sid(s.session_id) not in ignored_bases
+        and base_sid(s.parent_id) not in ignored_bases
+    ]
 
 
 @dataclass(frozen=True)
