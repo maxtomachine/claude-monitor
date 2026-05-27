@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from claude_monitor import (
     build_session,
+    filter_ignored,
     parse_sessions,
     parse_timestamp,
     scan_full_file,
@@ -390,6 +391,45 @@ class TestPinnedSurvivesHistoryOff:
         sid, _ = self._setup(tmp_path)
         ids = {s.session_id for s in self._run(tmp_path, pinned={sid})}
         assert sid in ids
+
+
+class TestFilterIgnored:
+    """Naming a session with "&ignore" drops it from monitoring entirely, plus
+    its PID-siblings and subagents. Explicit opt-out; beats pinning."""
+
+    def test_drops_named_ignore(self):
+        ss = [make_session(session_id="a", title="keep me"),
+              make_session(session_id="b", title="scratch &ignore")]
+        assert {s.session_id for s in filter_ignored(ss)} == {"a"}
+
+    def test_case_insensitive(self):
+        ss = [make_session(session_id="b", title="junk &IGNORE")]
+        assert filter_ignored(ss) == []
+
+    def test_marker_as_suffix(self):
+        ss = [make_session(session_id="a", title="myproj&ignore")]
+        assert filter_ignored(ss) == []
+
+    def test_keeps_all_when_no_marker(self):
+        ss = [make_session(session_id="a", title="one"),
+              make_session(session_id="b", title="two")]
+        assert len(filter_ignored(ss)) == 2
+
+    def test_drops_pid_sibling_of_ignored(self):
+        # Sibling row keyed sid@pid whose own title lost the marker still goes.
+        ss = [make_session(session_id="a", title="foo &ignore"),
+              make_session(session_id="a@1234", title="foo")]
+        assert filter_ignored(ss) == []
+
+    def test_drops_subagent_of_ignored(self):
+        ss = [make_session(session_id="a", title="foo&ignore"),
+              make_session(session_id="sub1", title="subtask", parent_id="a")]
+        assert filter_ignored(ss) == []
+
+    def test_keeps_unrelated_subagent(self):
+        ss = [make_session(session_id="a", title="foo&ignore"),
+              make_session(session_id="sub1", title="subtask", parent_id="z")]
+        assert {s.session_id for s in filter_ignored(ss)} == {"sub1"}
 
 
 class TestTitleResolutionTreeStraggler:
