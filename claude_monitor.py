@@ -5313,10 +5313,22 @@ class ClaudeMonitor(App):
 
     def action_restart(self) -> None:
         self._save_view_state()
-        subprocess.run(
-            ["git", "pull", "--ff-only"],
-            cwd=_REPO_DIR, capture_output=True, timeout=15,
-        )
+        # Best-effort pull to pick up code changes. Must never crash the app:
+        # the repo dir can be missing (e.g. a worktree was removed out from under
+        # a running instance), git may be off PATH, offline, or time out. Any of
+        # those should still let the restart proceed, not throw an unhandled
+        # FileNotFoundError/SubprocessError and take the whole TUI down.
+        try:
+            subprocess.run(
+                ["git", "pull", "--ff-only"],
+                cwd=_REPO_DIR, capture_output=True, timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            try:
+                from monitor_log import log as _restart_log
+                _restart_log("error", "restart_git_pull_failed", err=str(e))
+            except Exception:
+                pass
         self.exit(return_code=RESTART_EXIT_CODE)
 
     async def action_quit(self) -> None:

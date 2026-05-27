@@ -920,3 +920,22 @@ class TestBell:
                 assert "↻" in app._compose_first_cell(s, "  base")
                 s2 = make_session(session_id="s2", title="t2")
                 assert app._compose_first_cell(s2, "  base") == "  base"
+
+
+class TestRestartHardening:
+    async def test_restart_survives_git_pull_failure(self, sample_sessions):
+        """R (restart) must not crash the app if `git pull` fails: missing repo
+        dir (a worktree removed under a running instance), git off PATH, offline,
+        or timeout. It should swallow the error and still exit with the restart
+        code. Regression: a deleted worktree cwd raised an unhandled
+        FileNotFoundError and took the whole TUI down."""
+        from claude_monitor import RESTART_EXIT_CODE
+        with _mock_sessions(sample_sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                with patch.object(pilot.app, "_save_view_state"), \
+                     patch("claude_monitor.subprocess.run",
+                           side_effect=OSError(2, "No such file or directory")):
+                    pilot.app.action_restart()  # must not raise
+                    await pilot.pause()
+                assert pilot.app.return_code == RESTART_EXIT_CODE
