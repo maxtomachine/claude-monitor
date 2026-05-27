@@ -13,7 +13,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-LOG_PATH = Path.home() / ".claude" / "monitor.log"
+# Honors MONITOR_STATE_HOME so a staging instance logs separately from production.
+LOG_PATH = Path(os.environ.get("MONITOR_STATE_HOME") or (Path.home() / ".claude")) / "monitor.log"
 _LOCK_PATH = LOG_PATH.with_suffix(".log.lock")
 MAX_LOG_SIZE = 5 * 1024 * 1024  # 5 MB — rotate when exceeded
 KEEP_ROTATIONS = 2

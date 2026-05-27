@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from claude_monitor import (
+    build_session,
     parse_sessions,
     parse_timestamp,
     scan_full_file,
@@ -389,6 +390,46 @@ class TestPinnedSurvivesHistoryOff:
         sid, _ = self._setup(tmp_path)
         ids = {s.session_id for s in self._run(tmp_path, pinned={sid})}
         assert sid in ids
+
+
+class TestTitleResolutionTreeStraggler:
+    """A long-lived sid's transcript is a parentUuid tree; its last custom-title
+    line can be a straggler from a divergent branch (a month-long
+    tools-frontier-curve session whose final written leaf briefly carried
+    tools-monitor). For an EXITED session, the settled hook-state identity must
+    win over that straggler; for a LIVE session, custom_title must still win so
+    /rename works."""
+
+    def _transcript(self, tmp_path, last_title, top_title):
+        p = tmp_path / "t.jsonl"
+        p.write_text(make_transcript_jsonl(
+            messages=[{"type": "custom-title", "customTitle": last_title}],
+            custom_title=top_title,
+        ))
+        return p
+
+    def test_exited_session_prefers_hook_title_over_straggler(self, tmp_path):
+        p = self._transcript(tmp_path, last_title="tools-monitor",
+                             top_title="tools-frontier-curve")
+        hook = {"state": "exited", "title": "tools-frontier-curve",
+                "timestamp": "2026-05-25T12:27:01"}
+        with patch("claude_monitor.read_hook_state", return_value=hook), \
+             patch("claude_monitor._is_session_alive", return_value=False):
+            s = build_session(str(p), "9f17ea8e-0d55-418b-b5c6-97f47f27506e",
+                              "capability-frontier", {}, p.stat().st_mtime)
+        assert s is not None
+        assert s.title == "tools-frontier-curve"
+
+    def test_live_session_keeps_custom_title(self, tmp_path):
+        p = self._transcript(tmp_path, last_title="renamed-live",
+                             top_title="old-name")
+        hook = {"state": "idle", "title": "old-name",
+                "timestamp": "2026-05-26T09:00:00"}
+        with patch("claude_monitor.read_hook_state", return_value=hook), \
+             patch("claude_monitor._is_session_alive", return_value=True):
+            s = build_session(str(p), "live-sid", "proj", {}, p.stat().st_mtime)
+        assert s is not None
+        assert s.title == "renamed-live"
 
 
 class TestTranscriptCustomTitle:
