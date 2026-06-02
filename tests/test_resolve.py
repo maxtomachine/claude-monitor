@@ -152,3 +152,43 @@ class TestAuditIdentities:
     def test_dead_row_empty_title_source_not_flagged(self):
         ids = [_ident("a", "a", "a#0", alive=False, title_source="")]
         assert audit_identities(ids) == []
+
+    def test_two_pids_one_sid_distinct_instance_ids_clean(self):
+        """Fixture from the live invariant log (2026-06-02T01:53:59): two live
+        pids resumed the same conversation (37afe42d, EBC-NAB + a stale tab).
+        With per-pid startedAt each sibling gets its own instance_id and the
+        audit must be clean; sharing one instance_id was the dup_key bug."""
+        ids = [_ident("s@1", "s", "s#1780356669828"),
+               _ident("s@2", "s", "s#1780365093900")]
+        assert audit_identities(ids) == []
+
+
+class TestKeystrokeMistargetGuards:
+    """A stale tab can keep an old ·sid8 marker while a different live session
+    runs inside it (resume in a dead session's tab). Typing into a title-matched
+    window with duplicate markers renamed EBC-NAB to tools-monitor (observed
+    2026-06-02T01:05:22, 18ms send-to-pollution). Both JXA typing paths must
+    refuse ambiguous targets; raising may stay best-effort, typing may not."""
+
+    def test_auto_rename_jxa_has_multi_match_abort(self):
+        import inspect
+        from claude_monitor import _auto_rename_after_resume
+        src = inspect.getsource(_auto_rename_after_resume)
+        assert "abort_multi_match" in src
+        assert ".filter(" in src  # counts matches, not first-match
+
+    def test_raise_window_jxa_aborts_typing_on_duplicate_sid(self):
+        import inspect
+        from claude_monitor import _raise_window_by_content
+        src = inspect.getsource(_raise_window_by_content)
+        assert "abort_multi_sid" in src
+        # The guard must gate TYPING (thenText), not raising.
+        assert "thenText && sidMatches.length > 1" in src
+
+    def test_sibling_split_assigns_per_pid_instance_id(self):
+        """parse_sessions third pass: each sid@pid sibling derives instance_id
+        from its own pid file startedAt (the dup_key root cause)."""
+        import inspect
+        import claude_monitor
+        src = inspect.getsource(claude_monitor.parse_sessions)
+        assert "instance_id=f\"{sid}{INSTANCE_SEP}{pdata.get('startedAt', 0)}\"" in src

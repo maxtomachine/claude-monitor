@@ -903,6 +903,13 @@ def parse_sessions(include_archived: bool = False,
                 last_activity=updated or base.last_activity,
                 context_is_estimate=True,
                 status_name=pdata.get("name") or base.status_name,
+                # Each PID is its own instance: derive the durable surrogate from
+                # this pid's own startedAt, not the base's. replace() would
+                # otherwise copy one instance_id onto every sibling, tripping the
+                # dup_key invariant (caught live by the audit on a real
+                # double-resume of one conversation).
+                sid=sid,
+                instance_id=f"{sid}{INSTANCE_SEP}{pdata.get('startedAt', 0)}",
             )
             sessions.append(sib)
 
@@ -2269,7 +2276,16 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
 
             // Phase 1: find ·sid8 match and best name-based match
             const sid8 = candidates[0];
-            const sidWindow = allTitles.find(t => t && t.includes(sid8));
+            const sidMatches = allTitles.filter(t => t && t.includes(sid8));
+            // Typing guard: a stale tab can keep an old ·sid8 marker while a
+            // different live session runs inside it, so duplicate markers mean
+            // the true host is unknowable from titles. Raising the wrong window
+            // is recoverable; typing into it is not (a mistyped /rename
+            // permanently renames the other conversation). Abort typing.
+            if (thenText && sidMatches.length > 1) {{
+                return "abort_multi_sid:" + sid8 + ":" + sidMatches.length;
+            }}
+            const sidWindow = sidMatches[0] || null;
             let nameWindow = null;
             let nameCand = null;
             // Extract the session name from a title like "✳ name ·sid8"
@@ -2362,6 +2378,10 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
         )
         out = result.stdout.strip()
         mlog("jump", "jxa_result", result=out, sid=session.session_id[:12])
+        if out.startswith("abort_multi_sid:"):
+            mlog("DIVERGE", "send_multi_sid_marker",
+                 sid=session.session_id[:12], result=out)
+            return False
         if out.startswith("matched:"):
             matched_on = out.split(":", 2)[1] if ":" in out else ""
             if "+sid_stale" in matched_on:
@@ -2605,7 +2625,17 @@ def _auto_rename_after_resume(old_name: str, prior_sids: set[str]) -> None:
             let titles;
             try {{ titles = Application(appName).windows.name(); }}
             catch(e) {{ continue; }}
-            const target = titles.find(t => t && t.includes(marker));
+            // NEVER type into an ambiguous target. A stale tab can keep an old
+            // ·sid8 marker while a different live session runs inside it (a
+            // resume in a dead session's tab), so two windows wearing the same
+            // marker means we cannot know which one actually hosts the session.
+            // A mistyped /rename permanently pollutes the other conversation's
+            // stored name (observed: EBC-NAB renamed to tools-monitor).
+            const matches = titles.filter(t => t && t.includes(marker));
+            if (matches.length > 1) {{
+                return "abort_multi_match:" + marker + ":" + matches.length;
+            }}
+            const target = matches[0];
             if (!target) continue;
             Application(appName).activate();
             delay(0.1);
@@ -2646,6 +2676,9 @@ def _auto_rename_after_resume(old_name: str, prior_sids: set[str]) -> None:
              result=out)
         if out.startswith("abort_wrong_front:"):
             mlog("DIVERGE", "auto_rename_wrong_front", name=old_name,
+                 new_sid8=new_sid8, result=out)
+        if out.startswith("abort_multi_match:"):
+            mlog("DIVERGE", "auto_rename_multi_match", name=old_name,
                  new_sid8=new_sid8, result=out)
     except (subprocess.TimeoutExpired, OSError):
         mlog("resume", "auto_rename_error", name=old_name, new_sid8=new_sid8)
