@@ -64,12 +64,15 @@ Single file: `claude_monitor.py`. Key sections:
 | `R` | Restart monitor (picks up code changes) |
 | `j` | Cursor down |
 | `n` | Send `/rename` to selected session |
+| `p` | Pin/unpin session (pinned stays visible after close) |
 | `P` | Broadcast `/proactive` to all sessions in cursor's group |
 | `Enter` | Session context menu |
 | `double-click` | Jump to session's terminal (single-click highlights only) |
 | `Shift+Up/Down` | Extend multi-row selection |
 | `Shift+Click` | Extend selection to clicked row |
 | `Delete` / `Backspace` | Hide archived/closed row(s) — press twice to confirm (history mode only) |
+
+Naming a session with `&ignore` (case-insensitive, anywhere in the name) opts it out of monitoring entirely: dropped from every view along with its PID-siblings and subagents, beats pinning. Implemented in `filter_ignored()`; remove the marker to track again.
 
 ## Statusline integration
 
