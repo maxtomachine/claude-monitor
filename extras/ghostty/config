@@ -1,0 +1,57 @@
+# Font — Ghostty ships with nerd font support out of the box
+font-size = 18
+font-family = JetBrains Mono
+
+# Window
+window-padding-x = 12
+window-padding-y = 8
+window-decoration = true
+macos-titlebar-style = tabs
+window-width = 140
+window-height = 40
+
+# Theme — follow macOS system appearance (auto-switches on Appearance change)
+# Palette, background, cursor, selection, and bold-color all live in the theme files.
+theme = light:gruvbox-custom-light,dark:gruvbox-custom-dark
+
+# Floor the WCAG contrast ratio so apps that emit hardcoded 256/truecolor
+# (e.g. Claude Code's diff syntax-highlight context lines) stay readable on light bg.
+# 1 = off, 3 ≈ readable, 4.5 = WCAG AA. Tune to taste.
+minimum-contrast = 3
+
+# Cursor
+cursor-style = bar
+cursor-style-blink = true
+
+# Shell integration
+shell-integration = zsh
+
+# macOS specific
+macos-option-as-alt = true
+
+# Scrollback
+scrollback-limit = 10000000
+scroll-to-bottom = no-output
+
+# Jump between prompts (shell integration marks boundaries)
+keybind = super+up=jump_to_prompt:-1
+keybind = super+down=jump_to_prompt:1
+
+# Boldskim — bright yellow for bold text
+# bold-is-bright + palette 11 catches \e[1;33m (colored bold)
+# bold-color lives in each theme file so it tracks light/dark
+bold-is-bright = true
+
+# Quality of life
+confirm-close-surface = false
+
+# Links
+link-url = true
+
+# Window management
+window-save-state = always
+macos-window-shadow = true
+
+# Clipboard
+copy-on-select = false
+

@@ -171,6 +171,8 @@ The hooks also:
 | iTerm2 | Yes | Yes (Cmd+T) | Supported |
 | Terminal.app | Yes | Yes (do script) | Fallback |
 
+Want the exact Ghostty setup the screenshots use (JetBrains Mono, custom Gruvbox light/dark that follows macOS appearance, prompt-jump keybinds)? Copy [`extras/ghostty/`](extras/ghostty/) into `~/.config/ghostty/` and restart Ghostty.
+
 ### Jumpback (Ctrl+Shift+Space)
 
 Press `Ctrl+Shift+Space` from anywhere to raise the monitor window. Uses
