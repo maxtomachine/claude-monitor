@@ -111,6 +111,12 @@ echo "Created launcher → $LAUNCHER"
 ln -sf "$REPO_DIR/jumpback" "$HOME/.local/bin/jumpback"
 echo "Linked jumpback → ~/.local/bin/jumpback"
 
+# claude-jump: CLI to raise a session's window by sid8/title (used by Spotlight
+# Shortcuts and scripted jumps; the monitor's own click/double-click jumps work
+# without it).
+ln -sf "$REPO_DIR/claude-jump" "$HOME/.local/bin/claude-jump"
+echo "Linked claude-jump → ~/.local/bin/claude-jump"
+
 if command -v brew &>/dev/null; then
   if ! command -v skhd &>/dev/null; then
     echo "Installing skhd (global hotkey daemon)..."
