@@ -91,9 +91,18 @@ A Textual-based terminal app showing all active Claude sessions in a sortable, s
 | `z` | Show archived — include closed/old sessions with option to resume |
 | `t` | Dark/light theme toggle |
 | `n` | Send `/rename` to the selected session (patches unnamed sessions) |
+| `p` | Pin/unpin: pinned sessions stay visible even after they close |
+| `P` | Broadcast `/proactive` to all sessions in the cursor's group |
+| `double-click` | Jump straight to the session's terminal (single-click highlights) |
+| `Shift+Up/Down`, `Shift+Click` | Extend multi-row selection |
+| `Delete` | Hide selected closed/archived row(s); press twice to confirm |
 | `R` | Restart the monitor in-place (picks up code changes) |
 | `r` | Force refresh |
 | `q` | Quit |
+
+**Row markers**: `⊙` pinned · `↻` scheduled run (sdk/headless; collapsed to the latest per project by default) · a pulsing `●` means the session just flipped to waiting and wants your attention (clears when you jump to it, fades after 5 min).
+
+**Opting a session out**: name a session with `&ignore` anywhere in it (e.g. `/rename scratch&ignore`) and the monitor stops tracking it entirely: every view, subagents included, even if pinned. Remove the marker to track it again.
 
 **Session actions** (Enter on any session):
 - **Jump to terminal** — raises the right Ghostty/iTerm2/Terminal window, even across tabs (~200ms)
