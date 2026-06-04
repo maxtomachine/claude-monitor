@@ -1533,6 +1533,42 @@ def read_hook_state(session_id: str) -> dict | None:
         return None
 
 
+_THINKING_STALE_S = 180  # hook silence before we stop trusting "thinking"
+
+
+def _thinking_is_stale(session_id: str, hook: dict, transcript_path: str) -> bool:
+    """A hook 'thinking' state is an event-log entry, not a liveness signal:
+    if the turn's Stop event never fires (slash-command / subagent /
+    remote-bridge coverage gaps), the state freezes as thinking forever.
+    Call it stale only when EVERY fresher witness disagrees:
+      - the hook has been silent past _THINKING_STALE_S, AND
+      - the transcript is not being appended to, AND
+      - CC's own pid file does not say busy (it flips to idle itself).
+    A genuinely long tool call keeps the transcript or pid-file status fresh,
+    so real work is never demoted."""
+    try:
+        hook_age = time.time() - parse_timestamp(hook.get("timestamp", ""))
+    except (ValueError, TypeError):
+        return False
+    if hook_age < _THINKING_STALE_S:
+        return False
+    if transcript_path:
+        try:
+            if time.time() - os.stat(transcript_path).st_mtime < _THINKING_STALE_S:
+                return False
+        except OSError:
+            pass
+    pid = _pid_map.get(session_id) or hook.get("pid")
+    if pid:
+        try:
+            pdata = json.loads((SESSIONS_DIR / f"{pid}.json").read_text())
+            if pdata.get("sessionId") == session_id and pdata.get("status") == "busy":
+                return False
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+    return True
+
+
 def determine_status(session_id: str, last_assistant_time: float,
                      display_title: str = "", transcript_path: str = "") -> str:
     alive = _is_session_alive(session_id)
@@ -1558,7 +1594,25 @@ def determine_status(session_id: str, last_assistant_time: float,
     if hook:
         hook_state = hook.get("state", "")
         if hook_state == "thinking":
-            return "working"
+            if not _thinking_is_stale(session_id, hook, transcript_path):
+                return "working"
+            # Stale thinking: the hook froze mid-turn (Stop never fired, a
+            # known coverage gap for slash-command, subagent, and remote-bridge
+            # turns) while CC's own pid file says idle and the transcript has
+            # gone quiet. Trusting it unconditionally kept a closed remote
+            # session "working" for 4.5 hours (EBC-Shell, 2026-06-04). Treat
+            # like a settled idle: waiting, decaying to idle.
+            mlog("DIVERGE", "stale_thinking", sid=session_id[:12],
+                 hook_ts=hook.get("timestamp", ""),
+                 entered=hook.get("state_entered_at", ""))
+            entered = hook.get("state_entered_at", "")
+            if entered:
+                try:
+                    elapsed = time.time() - parse_timestamp(entered)
+                    return _idle_or_background("idle" if elapsed > 300 else "waiting")
+                except (ValueError, TypeError):
+                    pass
+            return _idle_or_background("waiting")
         if hook_state == "approval":
             return "needs_approval"
         if hook_state == "exited":
