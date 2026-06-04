@@ -150,6 +150,78 @@ class TestDetermineStatus:
         assert determine_status("test-id", 0) == "closed"
 
 
+class TestStaleThinking:
+    """Fixture from EBC-Shell (sid 11edc8e8, 2026-06-04): a remote-bridge
+    session's Stop hook never fired, freezing hook state at 'thinking' while
+    CC's own pid file said idle and the transcript was 3.5h quiet. The monitor
+    showed it working for 4.5 hours. 'thinking' must be corroborated; when
+    every fresher witness disagrees it decays like idle."""
+
+    def _hook(self, age_s, entered_age_s=None):
+        from datetime import datetime, timedelta
+        ts = (datetime.now() - timedelta(seconds=age_s)).isoformat()
+        entered = (datetime.now() - timedelta(
+            seconds=entered_age_s if entered_age_s is not None else age_s)).isoformat()
+        return {"state": "thinking", "timestamp": ts,
+                "state_entered_at": entered, "pid": 63697}
+
+    def _old_transcript(self, tmp_path):
+        import os as _os
+        p = tmp_path / "t.jsonl"
+        p.touch()
+        old = time.time() - 4 * 3600
+        _os.utime(p, (old, old))
+        return str(p)
+
+    def _pid_file(self, tmp_path, status):
+        (tmp_path / "63697.json").write_text(json.dumps(
+            {"pid": 63697, "sessionId": "sid", "status": status}))
+        return tmp_path
+
+    def test_fresh_thinking_is_working(self, tmp_path):
+        with patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor.read_hook_state", return_value=self._hook(5)):
+            assert determine_status("sid", 0, "", self._old_transcript(tmp_path)) == "working"
+
+    def test_stale_thinking_all_witnesses_quiet_decays_to_idle(self, tmp_path):
+        sessions_dir = self._pid_file(tmp_path, "idle")
+        with patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor.read_hook_state",
+                   return_value=self._hook(4 * 3600)), \
+             patch("claude_monitor._pid_map", {"sid": 63697}), \
+             patch("claude_monitor.SESSIONS_DIR", sessions_dir):
+            assert determine_status("sid", 0, "", self._old_transcript(tmp_path)) == "idle"
+
+    def test_stale_thinking_recent_entry_is_waiting(self, tmp_path):
+        sessions_dir = self._pid_file(tmp_path, "idle")
+        with patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor.read_hook_state",
+                   return_value=self._hook(600, entered_age_s=200)), \
+             patch("claude_monitor._pid_map", {"sid": 63697}), \
+             patch("claude_monitor.SESSIONS_DIR", sessions_dir):
+            assert determine_status("sid", 0, "", self._old_transcript(tmp_path)) == "waiting"
+
+    def test_old_hook_but_pid_busy_stays_working(self, tmp_path):
+        sessions_dir = self._pid_file(tmp_path, "busy")
+        with patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor.read_hook_state",
+                   return_value=self._hook(4 * 3600)), \
+             patch("claude_monitor._pid_map", {"sid": 63697}), \
+             patch("claude_monitor.SESSIONS_DIR", sessions_dir):
+            assert determine_status("sid", 0, "", self._old_transcript(tmp_path)) == "working"
+
+    def test_old_hook_but_fresh_transcript_stays_working(self, tmp_path):
+        p = tmp_path / "t.jsonl"
+        p.touch()  # mtime = now
+        sessions_dir = self._pid_file(tmp_path, "idle")
+        with patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor.read_hook_state",
+                   return_value=self._hook(4 * 3600)), \
+             patch("claude_monitor._pid_map", {"sid": 63697}), \
+             patch("claude_monitor.SESSIONS_DIR", sessions_dir):
+            assert determine_status("sid", 0, "", str(p)) == "working"
+
+
 class TestSortSessions:
     def test_sort_by_activity(self):
         now = time.time()
