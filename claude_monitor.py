@@ -2648,25 +2648,27 @@ def _snapshot_window_sids() -> set[str]:
         return set()
 
 
-def _auto_rename_after_resume(old_name: str, prior_sids: set[str]) -> None:
+def _auto_rename_after_resume(old_name: str, expected_sid8: str) -> None:
     """Wait for the resumed session's window to appear, then send /rename.
 
-    Polls for a new ·sid8 marker (one not in prior_sids) — that's the
-    resumed session's hook-written title. Raises that specific window
-    before typing, so focus loss during the wait doesn't misfire.
+    The resume KNOWS which sid it resumed (claude --resume preserves the sid),
+    so we wait for that exact ·sid8 marker and type only into it. The previous
+    snapshot-diff heuristic ("whatever marker is new must be the resumed one")
+    could lock onto an unrelated running session whose marker flickered out of
+    the before-snapshot during a title rewrite, then type a /rename into it as
+    a unique match (observed twice on 2026-06-05: tools-monitor renamed to
+    prep-CFITtalk and then to config-claude.md). Never infer what is known.
     """
     deadline = time.time() + 15
     new_sid8 = None
     while time.time() < deadline:
         time.sleep(0.8)
-        current = _snapshot_window_sids()
-        fresh = current - prior_sids
-        if fresh:
-            new_sid8 = next(iter(fresh))
+        if expected_sid8 in _snapshot_window_sids():
+            new_sid8 = expected_sid8
             break
     if not new_sid8:
         mlog("DIVERGE", "auto_rename_no_new_window",
-             name=old_name, prior_sids=sorted(prior_sids))
+             name=old_name, expected=expected_sid8)
         return
 
     name_json = json.dumps(old_name)
@@ -2759,9 +2761,6 @@ def resume_session(session: Session) -> bool:
              path=session.transcript_path)
         return False
 
-    # Snapshot existing ·sid8 markers so auto-rename can detect the new one
-    prior_sids = _snapshot_window_sids()
-
     # Ghostty: open new tab via keystroke, then type the command
     quoted_cwd = shlex.quote(cwd)
     jxa = f"""(() => {{
@@ -2810,7 +2809,7 @@ def resume_session(session: Session) -> bool:
             if session.title and session.title not in junk and len(session.title) >= 3:
                 threading.Thread(
                     target=_auto_rename_after_resume,
-                    args=(session.title, prior_sids),
+                    args=(session.title, base_sid(session.session_id)[:8]),
                     daemon=True,
                 ).start()
             return True

@@ -185,6 +185,37 @@ class TestKeystrokeMistargetGuards:
         # The guard must gate TYPING (thenText), not raising.
         assert "thenText && sidMatches.length > 1" in src
 
+    def test_auto_rename_waits_for_the_resumed_sid_not_any_fresh_marker(self):
+        """Fixture from 2026-06-05: the snapshot-diff heuristic locked onto
+        tools-monitor's marker (flickered out of the before-snapshot) and typed
+        /rename prep-CFITtalk, then /rename config-claude.md, into it. The
+        resume knows its sid; auto-rename must target exactly that marker."""
+        from unittest.mock import patch as _patch
+        from claude_monitor import _auto_rename_after_resume
+        # Snapshot shows OTHER markers (a flickering unrelated session) but
+        # never the expected one: must give up without typing.
+        with _patch("claude_monitor._snapshot_window_sids",
+                    return_value={"7a5651f1", "deadbeef"}), \
+             _patch("claude_monitor.time.sleep"), \
+             _patch("claude_monitor.time.time", side_effect=[0, 1, 16, 17, 18]), \
+             _patch("claude_monitor.subprocess.run") as run:
+            _auto_rename_after_resume("prep-CFITtalk", "4974b14f")
+            run.assert_not_called()
+
+    def test_auto_rename_proceeds_when_expected_marker_appears(self):
+        from unittest.mock import MagicMock, patch as _patch
+        from claude_monitor import _auto_rename_after_resume
+        ok = MagicMock()
+        ok.stdout = "sent:·4974b14f"
+        with _patch("claude_monitor._snapshot_window_sids",
+                    return_value={"4974b14f", "7a5651f1"}), \
+             _patch("claude_monitor.time.sleep"), \
+             _patch("claude_monitor.subprocess.run", return_value=ok) as run:
+            _auto_rename_after_resume("prep-CFITtalk", "4974b14f")
+            run.assert_called_once()
+            jxa = run.call_args[0][0][-1]
+            assert "·4974b14f" in jxa  # types only at the resumed sid's marker
+
     def test_sibling_split_assigns_per_pid_instance_id(self):
         """parse_sessions third pass: each sid@pid sibling derives instance_id
         from its own pid file startedAt (the dup_key root cause)."""
