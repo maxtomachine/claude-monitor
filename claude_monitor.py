@@ -4096,6 +4096,7 @@ class ClaudeMonitor(App):
         Binding("K", "setup_api_key", "API Key", show=False),
         Binding("slash", "start_search", "Search", show=False),
         Binding("escape", "clear_search", "Clear", show=False),
+        Binding("down", "search_to_table", show=False),
         Binding("v", "cycle_view", "View"),
         Binding("R", "restart", "Restart", show=False),
         Binding("j", "cursor_down", "↓", show=False),
@@ -5019,6 +5020,15 @@ class ClaudeMonitor(App):
         search_bar = self.query_one("#search-bar", Input)
         if search_bar.display or self._filter:
             self._dismiss_search()
+
+    def action_search_to_table(self) -> None:
+        # Down while typing in the search box: keep the filter, drop focus into
+        # the (filtered) table so hotkeys work on the matched rows. DataTable
+        # owns Down for cursor movement, so this only fires from the Input.
+        search_bar = self.query_one("#search-bar", Input)
+        if not search_bar.display:
+            return
+        self.query_one("#session-table", DataTable).focus()
 
     def _dismiss_search(self) -> None:
         search_bar = self.query_one("#search-bar", Input)

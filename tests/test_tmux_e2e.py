@@ -87,7 +87,7 @@ def tmux_monitor():
         check=True,
     )
     # Wait for the footer keybindings to appear (monitor finished mounting)
-    _wait_for("Kanban")
+    _wait_for("Refresh")
     yield SESSION
     subprocess.run(
         ["tmux", "kill-session", "-t", SESSION], capture_output=True,
@@ -111,14 +111,19 @@ class TestStartup:
 class TestKeybindings:
     def test_search_opens_and_closes(self, tmux_monitor):
         before = _capture()
+        assert "/ search" in before
         _send("/")
         time.sleep(0.5)
+        _send("zzqqx")
+        time.sleep(0.8)
         during = _capture()
+        assert "zzqqx" in during
         _send("Escape")
-        time.sleep(0.5)
+        time.sleep(0.8)
         after = _capture()
-        # Something should change when search opens and closes
-        assert before != during or after != during
+        # Esc snaps out: filter text gone, hint restored.
+        assert "zzqqx" not in after
+        assert "/ search" in after
 
     def test_kanban_opens(self, tmux_monitor):
         _send("k")
