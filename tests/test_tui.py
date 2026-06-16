@@ -343,6 +343,47 @@ class TestSearch:
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count == 0
 
+    async def test_letter_keys_type_into_search_not_hotkeys(self, sample_sessions):
+        """While the search box has focus, single-letter app hotkeys (s, r, q,
+        ...) are filter text, not actions."""
+        with _mock_sessions(sample_sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                sort_before = pilot.app.sort_mode
+                await pilot.press("slash")
+                await pilot.pause()
+                await pilot.press("s")
+                await pilot.pause()
+                search = pilot.app.query_one("#search-bar", Input)
+                assert search.value == "s"
+                assert pilot.app.sort_mode == sort_before
+
+    async def test_down_from_search_drops_to_table_keeping_filter(
+        self, sample_sessions
+    ):
+        with _mock_sessions(sample_sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("slash")
+                await pilot.pause()
+                search = pilot.app.query_one("#search-bar", Input)
+                search.value = "First"
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                assert table.row_count == 1
+                await pilot.press("down")
+                await pilot.pause()
+                assert table.has_focus
+                assert pilot.app._filter == "First"
+                assert table.row_count == 1
+                assert search.display is True
+                # Esc from the table still clears the filter and restores rows.
+                await pilot.press("escape")
+                await pilot.pause()
+                assert pilot.app._filter == ""
+                assert search.display is False
+                assert table.row_count >= 3
+
 
 class TestArchived:
     async def test_archive_toggle(self, sample_sessions):
