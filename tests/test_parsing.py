@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from claude_monitor import (
     build_session,
+    disambiguate_titles,
     filter_ignored,
     parse_sessions,
     parse_timestamp,
@@ -502,6 +503,43 @@ class TestFilterIgnored:
         ss = [make_session(session_id="a", title="foo&ignore"),
               make_session(session_id="sub1", title="subtask", parent_id="z")]
         assert {s.session_id for s in filter_ignored(ss)} == {"sub1"}
+
+
+class TestDisambiguateTitles:
+    def test_distinct_titles_untouched(self):
+        ss = [make_session(session_id="a1234567-x", title="alpha"),
+              make_session(session_id="b1234567-x", title="beta")]
+        disambiguate_titles(ss)
+        assert [s.title for s in ss] == ["alpha", "beta"]
+
+    def test_same_title_different_sid_gets_sid8(self):
+        ss = [make_session(session_id="a1234567-dead-beef", title="dup"),
+              make_session(session_id="b1234567-dead-beef", title="dup")]
+        disambiguate_titles(ss)
+        assert ss[0].title == "dup ·a1234567"
+        assert ss[1].title == "dup ·b1234567"
+
+    def test_siblings_same_sid_get_pid_suffix(self):
+        """Fixture from 2026-06-16: config-skills resumed twice (pids 27852 and
+        92899, same sid b9bb8e2d). The sid8 tag is identical for siblings, so
+        the second pass appends the @pid carrier-key suffix."""
+        sid = "b9bb8e2d-115f-4524-926d-28d0696d7fd0"
+        ss = [make_session(session_id=f"{sid}@27852", title="config-skills"),
+              make_session(session_id=f"{sid}@92899", title="config-skills")]
+        disambiguate_titles(ss)
+        assert ss[0].title == "config-skills ·b9bb8e2d@27852"
+        assert ss[1].title == "config-skills ·b9bb8e2d@92899"
+        assert ss[0].title != ss[1].title
+
+    def test_mixed_three_way(self):
+        sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        ss = [make_session(session_id=f"{sid}@1", title="x"),
+              make_session(session_id=f"{sid}@2", title="x"),
+              make_session(session_id="ffffffff-0000", title="x")]
+        disambiguate_titles(ss)
+        titles = [s.title for s in ss]
+        assert len(set(titles)) == 3
+        assert titles[2] == "x ·ffffffff"
 
 
 class TestTitleResolutionTreeStraggler:
