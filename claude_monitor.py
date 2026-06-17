@@ -1682,7 +1682,14 @@ def disambiguate_titles(flat: list[Session]) -> None:
     """Mutate titles in place so two visible rows never read identically.
     Pass 1 appends ·sid8 on a name collision. Pass 2 catches the sibling case
     (same conversation resumed in two pids: identical title AND identical sid8)
-    by appending the @pid/#startedAt suffix from the carrier key."""
+    by appending the pid/startedAt from the carrier key.
+
+    Suffixes use only the · separator: _group_key() treats '@' as the explicit
+    bugs@disclosey group sigil, so a literal '@pid' in a mutated title would
+    re-key the sibling to a different group than its peers, break the
+    contiguous-group invariant the renderer relies on, and DuplicateKey on the
+    second '__group__config' header (observed live 2026-06-16, b9bb8e2d twins).
+    """
     def _counts() -> dict[str, int]:
         c: dict[str, int] = {}
         for s in flat:
@@ -1697,9 +1704,9 @@ def disambiguate_titles(flat: list[Session]) -> None:
     for s in flat:
         if s.title and tc.get(s.title, 0) > 1:
             bare = base_sid(s.session_id)
-            suffix = s.session_id[len(bare):]
+            suffix = s.session_id[len(bare):].lstrip("@#")
             if suffix:
-                s.title = f"{s.title}{suffix}"
+                s.title = f"{s.title}·{suffix}"
 
 
 def filter_ignored(sessions: list[Session]) -> list[Session]:
