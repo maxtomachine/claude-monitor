@@ -522,14 +522,32 @@ class TestDisambiguateTitles:
     def test_siblings_same_sid_get_pid_suffix(self):
         """Fixture from 2026-06-16: config-skills resumed twice (pids 27852 and
         92899, same sid b9bb8e2d). The sid8 tag is identical for siblings, so
-        the second pass appends the @pid carrier-key suffix."""
+        the second pass appends the pid from the carrier key."""
         sid = "b9bb8e2d-115f-4524-926d-28d0696d7fd0"
         ss = [make_session(session_id=f"{sid}@27852", title="config-skills"),
               make_session(session_id=f"{sid}@92899", title="config-skills")]
         disambiguate_titles(ss)
-        assert ss[0].title == "config-skills ·b9bb8e2d@27852"
-        assert ss[1].title == "config-skills ·b9bb8e2d@92899"
+        assert ss[0].title == "config-skills ·b9bb8e2d·27852"
+        assert ss[1].title == "config-skills ·b9bb8e2d·92899"
         assert ss[0].title != ss[1].title
+
+    def test_disambiguation_preserves_group_key(self):
+        """The renderer groups by _group_key(s.title) AFTER disambiguation, so a
+        suffix that re-keys a sibling (the original '@pid' did, since '@' is the
+        explicit-group sigil) splits one group into non-contiguous runs and the
+        second '__group__config' header DuplicateKeys. The suffix must be
+        group-key-neutral."""
+        from claude_monitor import _group_key
+        sid = "b9bb8e2d-115f-4524-926d-28d0696d7fd0"
+        ss = [make_session(session_id="6e5743c6-aaa", title="config-claude.md"),
+              make_session(session_id=f"{sid}@27852", title="config-skills"),
+              make_session(session_id=f"{sid}@92899", title="config-skills"),
+              make_session(session_id="8f7e4862-bbb", title="config-MCPs")]
+        before = [_group_key(s.title) for s in ss]
+        disambiguate_titles(ss)
+        after = [_group_key(s.title) for s in ss]
+        assert before == after == ["config"] * 4
+        assert "@" not in ss[1].title and "@" not in ss[2].title
 
     def test_mixed_three_way(self):
         sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
