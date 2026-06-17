@@ -1678,6 +1678,30 @@ def base_sid(key: str) -> str:
 IGNORE_MARKER = "&ignore"
 
 
+def disambiguate_titles(flat: list[Session]) -> None:
+    """Mutate titles in place so two visible rows never read identically.
+    Pass 1 appends ·sid8 on a name collision. Pass 2 catches the sibling case
+    (same conversation resumed in two pids: identical title AND identical sid8)
+    by appending the @pid/#startedAt suffix from the carrier key."""
+    def _counts() -> dict[str, int]:
+        c: dict[str, int] = {}
+        for s in flat:
+            if s.title:
+                c[s.title] = c.get(s.title, 0) + 1
+        return c
+    tc = _counts()
+    for s in flat:
+        if s.title and tc.get(s.title, 0) > 1:
+            s.title = f"{s.title} ·{base_sid(s.session_id)[:8]}"
+    tc = _counts()
+    for s in flat:
+        if s.title and tc.get(s.title, 0) > 1:
+            bare = base_sid(s.session_id)
+            suffix = s.session_id[len(bare):]
+            if suffix:
+                s.title = f"{s.title}{suffix}"
+
+
 def filter_ignored(sessions: list[Session]) -> list[Session]:
     """Drop sessions whose name contains "&ignore" (case-insensitive) from
     monitoring entirely, along with their PID-siblings and subagents (keyed on
@@ -4558,15 +4582,7 @@ class ClaudeMonitor(App):
             else:
                 self._group_counts = {}
 
-            # Disambiguate visible title collisions so two sessions never look
-            # like one phantom duplicate row.
-            title_counts: dict[str, int] = {}
-            for s in flat:
-                if s.title:
-                    title_counts[s.title] = title_counts.get(s.title, 0) + 1
-            for s in flat:
-                if s.title and title_counts.get(s.title, 0) > 1:
-                    s.title = f"{s.title} ·{s.session_id[:8]}"
+            disambiguate_titles(flat)
 
             # Pre-render rows in background thread (Rich markup generation)
             visible_cols = self._visible_cols
