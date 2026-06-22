@@ -1508,6 +1508,17 @@ def _heal_hook_state(session_id: str) -> None:
         # Invalidate hook state cache
         _hook_state_cache.pop(session_id, None)
         mlog("heal", "hook_state_updated", sid=session_id[:12], pid=live_pid, tty=tty)
+        # Re-stamp the OSC tab title with the ·sid8 marker so jump-to-terminal
+        # can find it again (CC's own auto-title can clobber the hook stamp on
+        # a background tab, leaving the session reachable by ps but not by
+        # title; observed live 2026-06-21 as DIVERGE alive_but_unfound).
+        name = data.get("title") or session_id[:8]
+        if len(name) > 32:
+            name = name[:31] + "…"
+        title = f"✳ {name} ·{session_id[:8]}"
+        with open(f"/dev/{tty}", "w") as t:
+            t.write(f"\x1b]2;{title}\x07")
+        mlog("heal", "osc_restamped", sid=session_id[:12], tty=tty, title=title)
     except (OSError, json.JSONDecodeError):
         pass
 
@@ -2412,7 +2423,37 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
             }} else if (nameWindow) {{
                 targetName = nameWindow; matchedCand = nameCand;
             }}
-            if (!targetName) continue;
+            if (!targetName) {{
+                // Phase 3 (Ghostty only): a session can be a BACKGROUND TAB in a
+                // tabbed window, whose title never appears in app.windows.name()
+                // (that returns the active tab's title only). Walk the AX
+                // tabGroups; click the matching radioButton to surface the tab.
+                if (appName === "Ghostty") {{
+                    try {{
+                        const proc3 = se.processes.byName(appName);
+                        for (const w of proc3.windows()) {{
+                            let tabs;
+                            try {{ tabs = w.tabGroups[0].radioButtons(); }}
+                            catch(e) {{ continue; }}
+                            for (const tab of tabs) {{
+                                const tt = tab.title();
+                                if (!tt) continue;
+                                if (tt.includes(sid8) ||
+                                    candidates.slice(1).some(c => nameMatch(tt, c))) {{
+                                    if (thenText) return "abort_tab_type:" + tt;
+                                    try {{ proc3.frontmost = true; }} catch(e) {{}}
+                                    delay(0.05);
+                                    tab.click();
+                                    delay(0.1);
+                                    try {{ w.actions["AXRaise"].perform(); }} catch(e) {{}}
+                                    return "matched:tab:" + tt;
+                                }}
+                            }}
+                        }}
+                    }} catch(e) {{}}
+                }}
+                continue;
+            }}
 
             // proc.frontmost (not app.activate()) — activate() can switch
             // spaces to wherever the app's key window is, then race the

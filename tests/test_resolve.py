@@ -185,6 +185,29 @@ class TestKeystrokeMistargetGuards:
         # The guard must gate TYPING (thenText), not raising.
         assert "thenText && sidMatches.length > 1" in src
 
+    def test_raise_window_jxa_scans_background_tabs(self):
+        """Fixture from 2026-06-21: config-skills was a background tab in the
+        tools-monitor window with its ·sid8 marker clobbered, so the
+        window-title scan returned no_match (DIVERGE alive_but_unfound). The
+        JXA must fall through to walking AX tabGroups when no window title
+        matches, and never type into a tab found that way."""
+        import inspect
+        from claude_monitor import _raise_window_by_content
+        src = inspect.getsource(_raise_window_by_content)
+        assert "tabGroups[0].radioButtons()" in src
+        assert "abort_tab_type" in src
+        assert 'appName === "Ghostty"' in src
+
+    def test_heal_restamps_osc_marker(self):
+        """When heal corrects a stale hook pid/tty it must also re-write the
+        ·sid8 marker into that tty's OSC title so a drifted background tab is
+        findable again."""
+        import inspect
+        from claude_monitor import _heal_hook_state
+        src = inspect.getsource(_heal_hook_state)
+        assert "\\x1b]2;" in src
+        assert "osc_restamped" in src
+
     def test_auto_rename_waits_for_the_resumed_sid_not_any_fresh_marker(self):
         """Fixture from 2026-06-05: the snapshot-diff heuristic locked onto
         tools-monitor's marker (flickered out of the before-snapshot) and typed
