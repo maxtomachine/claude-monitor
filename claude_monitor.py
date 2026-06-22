@@ -4815,6 +4815,8 @@ class ClaudeMonitor(App):
                         else:
                             self.notify("Could not find or resume session", timeout=4)
                 mlog("menu", "jump_result", sid=s.session_id[:12], success=ok)
+                if ok:
+                    self.action_clear_search()
             elif action == "edit_name":
                 self.action_edit_name()
             elif action == "resume":
@@ -4826,6 +4828,8 @@ class ClaudeMonitor(App):
                 else:
                     self.notify("Could not open terminal", timeout=4)
                 mlog("menu", "resume_result", sid=s.session_id[:12], success=ok)
+                if ok:
+                    self.action_clear_search()
             elif action == "copy_id":
                 copy_to_clipboard(s.session_id)
                 self.notify("Copied", timeout=3)
