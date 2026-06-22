@@ -384,6 +384,43 @@ class TestSearch:
                 assert search.display is False
                 assert table.row_count >= 3
 
+    async def test_jump_clears_search(self, sample_sessions):
+        """A successful jump-to-terminal exits search mode so the full table
+        is showing when the user comes back to the monitor."""
+        with _mock_sessions(sample_sessions), \
+             patch("claude_monitor.focus_terminal_session", return_value=True):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("slash")
+                await pilot.pause()
+                search = pilot.app.query_one("#search-bar", Input)
+                search.value = "First"
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                assert table.row_count == 1
+                s = pilot.app._flat_rows[0]
+                pilot.app._make_menu_handler(s)("jump")
+                await pilot.pause()
+                assert pilot.app._filter == ""
+                assert search.display is False
+                assert table.row_count >= 3
+
+    async def test_failed_jump_keeps_search(self, sample_sessions):
+        with _mock_sessions(sample_sessions), \
+             patch("claude_monitor.focus_terminal_session", return_value=False), \
+             patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor._heal_hook_state"):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("slash")
+                await pilot.pause()
+                pilot.app.query_one("#search-bar", Input).value = "First"
+                await pilot.pause()
+                s = pilot.app._flat_rows[0]
+                pilot.app._make_menu_handler(s)("jump")
+                await pilot.pause()
+                assert pilot.app._filter == "First"
+
 
 class TestArchived:
     async def test_archive_toggle(self, sample_sessions):
