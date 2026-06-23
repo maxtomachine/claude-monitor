@@ -2125,18 +2125,24 @@ def generate_activity(s: Session) -> str:
 
 def sort_sessions(sessions: list[Session], mode: SortMode) -> list[Session]:
     if mode == SortMode.ACTIVITY:
-        return sorted(sessions, key=lambda s: s.last_activity, reverse=True)
+        out = sorted(sessions, key=lambda s: s.last_activity, reverse=True)
     elif mode == SortMode.STATUS:
-        return sorted(sessions, key=lambda s: (STATUS_PRIORITY.get(s.status, 9), -s.last_activity))
+        out = sorted(sessions, key=lambda s: (STATUS_PRIORITY.get(s.status, 9), -s.last_activity))
     elif mode == SortMode.ALPHA:
-        return sorted(sessions, key=lambda s: (s.title or s.session_id).lower())
+        out = sorted(sessions, key=lambda s: (s.title or s.session_id).lower())
     elif mode == SortMode.CONTEXT:
-        return sorted(sessions, key=lambda s: s.context_pct)
+        out = sorted(sessions, key=lambda s: s.context_pct)
     elif mode == SortMode.TOKENS:
-        return sorted(sessions, key=lambda s: s.tokens_out, reverse=True)
+        out = sorted(sessions, key=lambda s: s.tokens_out, reverse=True)
     elif mode == SortMode.COST:
-        return sorted(sessions, key=lambda s: s.cost, reverse=True)
-    return sessions
+        out = sorted(sessions, key=lambda s: s.cost, reverse=True)
+    else:
+        out = list(sessions)
+    # A '--' in the title is the group-lead marker (e.g. config--LEAD): float
+    # those to the top in EVERY sort mode. Stable sort preserves the mode's
+    # ordering among non-leads. Within-group order = this order, so a lead
+    # row always sits directly under its group header.
+    return sorted(out, key=lambda s: 0 if "--" in (s.title or "") else 1)
 
 
 # ── Column rendering ──────────────────────────────────────────────────────────
