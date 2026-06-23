@@ -317,6 +317,15 @@ fi
 _cachedir="$HOME/.claude/statusline-cache"
 mkdir -p "$_cachedir" 2>/dev/null
 if [ -n "$_sid" ]; then
+  # /rename does not fire a hook, so the OSC tab title (which the hook owns)
+  # keeps the old name until the next state transition. The statusline DOES
+  # see the new session_name immediately, so when it changes vs the cached
+  # value, re-stamp the OSC title here so the tab catches up right away.
+  _prev_name=$(cat "${_cachedir}/claude-name-${_sid}" 2>/dev/null)
+  if [ -n "$session_name" ] && [ "$session_name" != "$_prev_name" ]; then
+    printf '\033]2;\342\234\263 %s \302\267%s\007' \
+      "${session_name:0:32}" "${_sid:0:8}" > /dev/tty 2>/dev/null
+  fi
   for _dir in "$_cachedir" /tmp; do
     [ -n "$remaining" ] && printf '%s' "$remaining" > "${_dir}/claude-ctx-${_sid}"
     [ -n "$remote_url" ] && printf '%s' "$remote_url" > "${_dir}/claude-url-${_sid}"
