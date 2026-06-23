@@ -386,24 +386,30 @@ class TestSearch:
 
     async def test_jump_clears_search(self, sample_sessions):
         """A successful jump-to-terminal exits search mode so the full table
-        is showing when the user comes back to the monitor."""
+        is showing when the user comes back to the monitor. Asserted by
+        checking the handler invokes action_clear_search; the dismiss path
+        itself is covered by test_clear_search_restores_all."""
         with _mock_sessions(sample_sessions), \
-             patch("claude_monitor.focus_terminal_session", return_value=True):
+             patch("claude_monitor.focus_terminal_session", return_value=True), \
+             patch.object(ClaudeMonitor, "action_clear_search") as clear:
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                await pilot.press("slash")
-                await pilot.pause()
-                search = pilot.app.query_one("#search-bar", Input)
-                search.value = "First"
-                await pilot.pause()
-                table = pilot.app.query_one("#session-table", DataTable)
-                assert table.row_count == 1
                 s = pilot.app._flat_rows[0]
                 pilot.app._make_menu_handler(s)("jump")
+                clear.assert_called_once()
+
+    async def test_failed_jump_keeps_search(self, sample_sessions):
+        with _mock_sessions(sample_sessions), \
+             patch("claude_monitor.focus_terminal_session", return_value=False), \
+             patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor._heal_hook_state"), \
+             patch("claude_monitor._resolve_match_candidates", return_value=[]), \
+             patch.object(ClaudeMonitor, "action_clear_search") as clear:
+            async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                assert pilot.app._filter == ""
-                assert search.display is False
-                assert table.row_count >= 3
+                s = pilot.app._flat_rows[0]
+                pilot.app._make_menu_handler(s)("jump")
+                clear.assert_not_called()
 
     async def test_i_toggles_detail_panel(self, sample_sessions):
         with _mock_sessions(sample_sessions):
@@ -418,22 +424,6 @@ class TestSearch:
                 await pilot.press("i")
                 await pilot.pause()
                 assert panel.display is True
-
-    async def test_failed_jump_keeps_search(self, sample_sessions):
-        with _mock_sessions(sample_sessions), \
-             patch("claude_monitor.focus_terminal_session", return_value=False), \
-             patch("claude_monitor._is_session_alive", return_value=True), \
-             patch("claude_monitor._heal_hook_state"):
-            async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
-                await pilot.press("slash")
-                await pilot.pause()
-                pilot.app.query_one("#search-bar", Input).value = "First"
-                await pilot.pause()
-                s = pilot.app._flat_rows[0]
-                pilot.app._make_menu_handler(s)("jump")
-                await pilot.pause()
-                assert pilot.app._filter == "First"
 
 
 class TestArchived:
