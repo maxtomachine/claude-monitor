@@ -5065,16 +5065,23 @@ class ClaudeMonitor(App):
             detail_parts.append("[dim]Press Enter → Resume to continue this session[/]")
 
         tasks = load_tasks(s.session_id)
+        body = None
         if tasks:
             detail_parts.append(format_plan(tasks))
         elif s.last_assistant_text:
-            preview = _escape_markup(s.last_assistant_text[:400])
-            detail_parts.append(f"[italic]{preview}[/italic]")
+            from rich.markdown import Markdown
+            body = Markdown(s.last_assistant_text[:1200],
+                            code_theme="monokai", hyperlinks=False)
 
         if not _get_api_key():
             detail_parts.append("[dim #D97757]Press K to add API key for haiku session summaries[/]")
 
-        self.query_one("#detail-panel", Static).update("\n".join(detail_parts))
+        from rich.console import Group
+        from rich.text import Text
+        head = Text.from_markup("\n".join(detail_parts))
+        self.query_one("#detail-panel", Static).update(
+            Group(head, body) if body else head
+        )
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "search-bar":
