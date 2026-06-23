@@ -405,6 +405,20 @@ class TestSearch:
                 assert search.display is False
                 assert table.row_count >= 3
 
+    async def test_i_toggles_detail_panel(self, sample_sessions):
+        with _mock_sessions(sample_sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                panel = pilot.app.query_one("#detail-panel", Static)
+                assert panel.display is True
+                await pilot.press("i")
+                await pilot.pause()
+                assert panel.display is False
+                assert pilot.app.show_detail is False
+                await pilot.press("i")
+                await pilot.pause()
+                assert panel.display is True
+
     async def test_failed_jump_keeps_search(self, sample_sessions):
         with _mock_sessions(sample_sessions), \
              patch("claude_monitor.focus_terminal_session", return_value=False), \

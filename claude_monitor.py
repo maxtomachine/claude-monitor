@@ -4175,6 +4175,7 @@ class ClaudeMonitor(App):
         Binding("n", "edit_name", "Name"),
         Binding("P", "proactive_group", "/proactive→group", show=False),
         Binding("g", "toggle_groups", "Group"),
+        Binding("i", "toggle_detail", "Info", show=False),
         Binding("pageup", "prev_group", "PgUp", show=False, priority=True),
         Binding("pagedown", "next_group", "PgDn", show=False, priority=True),
         Binding("home", "table_home", "Home", show=False, priority=True),
@@ -4191,6 +4192,7 @@ class ClaudeMonitor(App):
     show_archived: reactive[bool] = reactive(False)
     show_scheduled: reactive[bool] = reactive(False)
     show_groups: reactive[bool] = reactive(True)
+    show_detail: reactive[bool] = reactive(True)
     debug_logging: reactive[bool] = reactive(True)  # ON by default
     sessions: list[Session] = []
     _flat_rows: list[Session] = []
@@ -5302,6 +5304,12 @@ class ClaudeMonitor(App):
         self.refresh_sessions()
         self.notify(f"Grouping {'on' if self.show_groups else 'off'}", timeout=3)
 
+    def action_toggle_detail(self) -> None:
+        self.show_detail = not self.show_detail
+        self.query_one("#detail-panel", Static).display = self.show_detail
+        self._save_view_state()
+        self.notify(f"Preview {'on' if self.show_detail else 'off'}", timeout=2)
+
     def action_edit_name(self) -> None:
         """Open inline prompt, then send /rename <name> to the selected session."""
         table = self.query_one(DataTable)
@@ -5449,6 +5457,7 @@ class ClaudeMonitor(App):
             "show_subagents": self.show_subagents,
             "show_archived": self.show_archived,
             "show_groups": self.show_groups,
+            "show_detail": self.show_detail,
             "view": self._current_view,
         }
         save_prefs(prefs)
@@ -5466,6 +5475,12 @@ class ClaudeMonitor(App):
         self.show_subagents = bool(vs.get("show_subagents", self.show_subagents))
         self.show_archived = bool(vs.get("show_archived", self.show_archived))
         self.show_groups = bool(vs.get("show_groups", self.show_groups))
+        self.show_detail = bool(vs.get("show_detail", self.show_detail))
+        if not self.show_detail:
+            try:
+                self.query_one("#detail-panel", Static).display = False
+            except Exception:
+                pass
         view = vs.get("view", "rows")
         if view in self._view_modes and view != "rows":
             self._pending_view_restore = view
