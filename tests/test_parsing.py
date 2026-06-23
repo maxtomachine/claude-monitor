@@ -255,6 +255,21 @@ class TestSortSessions:
         result = sort_sessions([s1, s2], SortMode.STATUS)
         assert result[0].session_id == "working"
 
+    def test_double_dash_lead_floats_to_top_in_every_mode(self):
+        """'config--LEAD' is the group-lead marker; it must outrank every
+        other row in every sort mode so it lands directly under its group
+        header regardless of which sort the user has cycled to."""
+        lead = make_session(session_id="L", title="config--LEAD",
+                            status="archived", cost=0.01, last_activity=1.0,
+                            context_pct=99, tokens_out=1)
+        other = make_session(session_id="O", title="config-asana",
+                             status="working", cost=999.0, last_activity=999.0,
+                             context_pct=1, tokens_out=999_999)
+        for mode in SortMode:
+            result = sort_sessions([other, lead], mode)
+            assert result[0].session_id == "L", f"lead not first in {mode}"
+            assert result[1].session_id == "O"
+
 
 class TestHookState:
     def test_missing_returns_none(self, tmp_path):
