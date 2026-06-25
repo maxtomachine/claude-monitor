@@ -5093,7 +5093,7 @@ class ClaudeMonitor(App):
                             code_theme="monokai", hyperlinks=False)
 
         if not _get_api_key():
-            detail_parts.append("[dim #D97757]Press K to add API key for haiku session summaries[/]")
+            detail_parts.append("[dim #D97757]Press Shift+K to add API key for haiku session summaries[/]")
 
         from rich.console import Group
         from rich.text import Text
