@@ -2437,6 +2437,10 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
                 if (appName === "Ghostty") {{
                     try {{
                         const proc3 = se.processes.byName(appName);
+                        // Collect all tab hits first so we can prove sid
+                        // uniqueness before typing (mirrors Phase-1's
+                        // abort_multi_sid guard for background tabs).
+                        const sidHits = [], nameHits = [];
                         for (const w of proc3.windows()) {{
                             let tabs;
                             try {{ tabs = w.tabGroups[0].radioButtons(); }}
@@ -2444,17 +2448,32 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
                             for (const tab of tabs) {{
                                 const tt = tab.title();
                                 if (!tt) continue;
-                                if (tt.includes(sid8) ||
-                                    candidates.slice(1).some(c => nameMatch(tt, c))) {{
-                                    if (thenText) return "abort_tab_type:" + tt;
-                                    try {{ proc3.frontmost = true; }} catch(e) {{}}
-                                    delay(0.05);
-                                    tab.click();
-                                    delay(0.1);
-                                    try {{ w.actions["AXRaise"].perform(); }} catch(e) {{}}
-                                    return "matched:tab:" + tt;
-                                }}
+                                if (tt.includes(sid8)) sidHits.push([w, tab, tt]);
+                                else if (candidates.slice(1).some(c => nameMatch(tt, c)))
+                                    nameHits.push([w, tab, tt]);
                             }}
+                        }}
+                        const hit = sidHits[0] || nameHits[0];
+                        if (hit) {{
+                            const [w, tab, tt] = hit;
+                            if (thenText) {{
+                                // Type only when exactly one tab carries the
+                                // sid marker — name-only or duplicate-sid hits
+                                // remain refused (wrong-tab typing is
+                                // unrecoverable).
+                                if (sidHits.length !== 1)
+                                    return "abort_tab_type:" + tt + ":" + sidHits.length;
+                            }}
+                            try {{ proc3.frontmost = true; }} catch(e) {{}}
+                            delay(0.05);
+                            tab.click();
+                            delay(0.1);
+                            try {{ w.actions["AXRaise"].perform(); }} catch(e) {{}}
+                            if (thenText) {{
+                                delay(0.2);
+                                se.keystroke(thenText); delay(0.1); se.keyCode(36);
+                            }}
+                            return "matched:tab:" + tt;
                         }}
                     }} catch(e) {{}}
                 }}
