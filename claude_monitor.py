@@ -2865,19 +2865,14 @@ def resume_session(session: Session) -> bool:
         const cwd = {json.dumps(quoted_cwd)};
         const cmd = {json.dumps(cmd)};
 
-        // Try Ghostty, then iTerm2. Open a new WINDOW (Cmd+N), not a tab:
-        // Resume fires from the monitor, so the frontmost window is the
-        // monitor's own window; Cmd+T would land the resumed session as the
-        // monitor's sibling tab and perturb the monitor tab (observed
-        // 2026-08-03: the ·MONITOR marker was lost, breaking the jumpback
-        // hotkey). A new window can't touch the monitor's window or title.
+        // Try Ghostty, then iTerm2 (both use Cmd+T for new tab)
         for (const appName of ["Ghostty", "iTerm2"]) {{
             try {{
                 const proc = se.processes.byName(appName);
                 proc.name();
                 proc.frontmost = true;
                 delay(0.2);
-                se.keystroke("n", {{using: "command down"}});
+                se.keystroke("t", {{using: "command down"}});
                 delay(0.5);
                 se.keystroke("cd " + cwd + " && " + cmd);
                 delay(0.1);
