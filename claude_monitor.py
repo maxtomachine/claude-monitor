@@ -2181,7 +2181,9 @@ def render_row(s: Session, visible_cols: list[str], spin_idx: int = 0) -> list[s
             if s.is_subagent:
                 cells.append(f"[dim]└─ {s.title}[/]")
             else:
-                t = s.title
+                # Live sessions render bold so they pop against the dim
+                # (archived) and dark-gray (closed) rows.
+                t = s.title if s.status in ("archived", "closed") else f"[bold]{s.title}[/bold]"
                 if s.subagents:
                     t += f" [dim](+{len(s.subagents)})[/]"
                 cells.append(t)
