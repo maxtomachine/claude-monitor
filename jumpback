@@ -5,12 +5,25 @@
 #   Ghostty:  keybind = super+m=exec:~/Projects/claude-monitor/jumpback
 #   skhd:     cmd - m : ~/Projects/claude-monitor/jumpback
 #   Shortcuts.app: create a "Run Shell Script" shortcut, bind in System Settings
+#
+# Launch policy: a duplicate monitor is only spawned on POSITIVE proof of
+# absence (a clean, complete Ghostty walk with zero ·MONITOR matches AND no
+# live monitor process). A thrown/partial walk is a transient scripting
+# failure under GUI churn, not "no monitor": it is retried, never treated
+# as absence. (2026-08-03: a blanket try/catch swallowed a transient walk
+# failure and fell straight to newWindow, spawning duplicates while a
+# ·MONITOR tab plainly existed.)
 
-exec osascript -l JavaScript -e '(() => {
+LOG="$HOME/.claude/jumpback.log"
+
+walk() {
+osascript -l JavaScript -e '(() => {
     const se = Application("System Events");
 
-    // Ghostty: walk windows AND tabs via its scripting API. The monitor may be
-    // a background tab — window.name() only shows the FRONT tab title.
+    // Ghostty: walk windows AND tabs via its scripting API. The monitor may
+    // be a background tab; window.name() only shows the FRONT tab title.
+    // Any throw during the walk = incomplete result: report it, do not
+    // conclude the monitor is absent.
     try {
         const ghostty = Application("Ghostty");
         for (const w of ghostty.windows()) {
@@ -30,7 +43,16 @@ exec osascript -l JavaScript -e '(() => {
                 }
             }
         }
-    } catch(e) {}
+    } catch(e) { return "err:walk:" + e.message; }
+
+    // Cross-space raise via the Ghostty Window menu (lists background
+    // tabs) before giving up. Same technique as the monitor own raise.
+    try {
+        const proc = se.processes.byName("Ghostty");
+        const menu = proc.menuBars[0].menuBarItems.byName("Window").menus[0];
+        const item = menu.menuItems.name().find(n => n && n.includes("·MONITOR"));
+        if (item) { menu.menuItems.byName(item).click(); return "ok:menu"; }
+    } catch(e) { return "err:menu:" + e.message; }
 
     // iTerm2/Terminal fallback: window-title scan (no tab API needed there)
     for (const appName of ["iTerm2", "Terminal"]) {
@@ -57,13 +79,38 @@ exec osascript -l JavaScript -e '(() => {
         } catch(e) {}
     }
 
-    // No monitor window anywhere — launch one
-    try {
-        const ghostty = Application("Ghostty");
-        const w = ghostty.newWindow({
-            withConfiguration: {command: "'"$HOME"'/.local/bin/claude-monitor"}
-        });
-        ghostty.activateWindow(w);
-        return "launched";
-    } catch(e) { return "not_found:" + e.message; }
-})()'
+    return "not_found";
+})()' 2>/dev/null
+}
+
+result=""
+for attempt in 1 2 3; do
+    result="$(walk)"
+    case "$result" in
+        ok:*) break ;;
+        err:*|"") [ "$attempt" -lt 3 ] && sleep 0.2 ;;
+        *) break ;;
+    esac
+done
+
+# Absence must also be proven at the process layer: a live monitor process
+# means the walk missed a real tab, so never spawn a duplicate.
+if [ "$result" = "not_found" ] && pgrep -qf 'claude_monitor\.py'; then
+    result="err:proc_live_no_tab"
+fi
+
+if [ "$result" = "not_found" ]; then
+    result="$(osascript -l JavaScript -e '(() => {
+        try {
+            const ghostty = Application("Ghostty");
+            const w = ghostty.newWindow({
+                withConfiguration: {command: "'"$HOME"'/.local/bin/claude-monitor"}
+            });
+            ghostty.activateWindow(w);
+            return "launched";
+        } catch(e) { return "err:launch:" + e.message; }
+    })()' 2>/dev/null)"
+fi
+
+printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${result:-empty}" >> "$LOG" 2>/dev/null
+echo "$result"
