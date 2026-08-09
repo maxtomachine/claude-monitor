@@ -69,6 +69,7 @@ Single file: `claude_monitor.py`. Key sections:
 | `P` | Broadcast `/proactive` to all sessions in cursor's group |
 | `PageUp` / `PageDown` | Jump to previous/next group header |
 | `Home` / `End` | Jump to first/last row |
+| `Ctrl+letter` (typed in sequence) | Type-ahead jump to a group by name, like Finder/Explorer find (e.g. Ctrl+s Ctrl+t Ctrl+r Ctrl+a → strategy) |
 | `Enter` | Session context menu |
 | `double-click` | Jump to session's terminal (single-click highlights only) |
 | `Shift+Up/Down` | Extend multi-row selection |

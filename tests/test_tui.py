@@ -613,6 +613,122 @@ class TestProactiveGroup:
                 mock_bc.assert_not_called()
 
 
+class TestTypeaheadJump:
+    """Ctrl+letter, typed in sequence like Finder/Explorer type-ahead find,
+    jumps the cursor to the group whose name matches the accumulated
+    buffer (e.g. Ctrl+s Ctrl+t Ctrl+r Ctrl+a -> 'strategy')."""
+
+    @pytest.fixture
+    def grouped_sessions(self):
+        # A singleton group folds into "ungrouped" (see TestProactiveGroup);
+        # strategy needs 2+ members to render as its own group header.
+        return [
+            make_session(session_id="bash-1", title="bashing-alpha", status="idle"),
+            make_session(session_id="bash-2", title="bashing-beta", status="working"),
+            make_session(session_id="strat-1", title="strategy-main", status="idle"),
+            make_session(session_id="strat-2", title="strategy-teamplan", status="idle"),
+            make_session(session_id="other-1", title="other-thing", status="idle"),
+        ]
+
+    async def test_single_letter_jumps_to_group_header(self, grouped_sessions):
+        with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
+             patch("claude_monitor._is_session_alive", return_value=True):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                await pilot.press("ctrl+s")
+                await pilot.pause()
+                cr = table.cursor_row
+                assert pilot.app._row_map[cr] is None  # landed on a header row
+                nxt = next(s for s in pilot.app._row_map[cr:] if s)
+                assert nxt.title.startswith("strategy")
+
+    async def test_multi_letter_sequence_narrows_match(self, grouped_sessions):
+        with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
+             patch("claude_monitor._is_session_alive", return_value=True):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                for k in ("ctrl+b", "ctrl+a", "ctrl+s", "ctrl+h"):
+                    await pilot.press(k)
+                await pilot.pause()
+                cr = table.cursor_row
+                nxt = next(s for s in pilot.app._row_map[cr:] if s)
+                assert nxt.title.startswith("bashing")
+                assert pilot.app._typeahead_buffer == "bash"
+
+    async def test_timeout_resets_buffer(self, grouped_sessions):
+        with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
+             patch("claude_monitor._is_session_alive", return_value=True):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("ctrl+b")
+                await pilot.pause()
+                pilot.app._typeahead_last_key -= 10  # force timeout
+                await pilot.press("ctrl+s")
+                await pilot.pause()
+                # Stale "b" buffer must not survive; fresh "s" alone matches strategy.
+                assert pilot.app._typeahead_buffer == "s"
+                table = pilot.app.query_one("#session-table", DataTable)
+                nxt = next(s for s in pilot.app._row_map[table.cursor_row:] if s)
+                assert nxt.title.startswith("strategy")
+
+    async def test_no_match_does_not_move_cursor(self, grouped_sessions):
+        with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
+             patch("claude_monitor._is_session_alive", return_value=True):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                table.move_cursor(row=0)
+                await pilot.press("ctrl+z")
+                await pilot.pause()
+                assert table.cursor_row == 0
+
+    async def test_ignored_while_modal_open(self, grouped_sessions):
+        with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
+             patch("claude_monitor._is_session_alive", return_value=True):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                row = next(i for i, s in enumerate(pilot.app._row_map) if s)
+                table.move_cursor(row=row)
+                await pilot.press("enter")  # opens SessionMenu (a real row, not a header)
+                await pilot.pause()
+                assert len(pilot.app.screen_stack) > 1
+                await pilot.press("ctrl+s")
+                await pilot.pause()
+                await pilot.press("escape")
+                await pilot.pause()
+                assert table.cursor_row == row
+
+    async def test_ignored_while_search_focused(self, grouped_sessions):
+        with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
+             patch("claude_monitor._is_session_alive", return_value=True):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                table.move_cursor(row=0)
+                await pilot.press("slash")
+                await pilot.pause()
+                await pilot.press("ctrl+s")
+                await pilot.pause()
+                assert table.cursor_row == 0
+
+    async def test_ungrouped_view_jumps_to_first_row_of_group(self, grouped_sessions):
+        with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
+             patch("claude_monitor._is_session_alive", return_value=True):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                pilot.app.show_groups = False
+                pilot.app.refresh_sessions()
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                await pilot.press("ctrl+s")
+                await pilot.pause()
+                sel = pilot.app._row_map[table.cursor_row]
+                assert sel is not None and sel.title.startswith("strategy")
+
+
 class TestTitleDisambiguation:
     async def test_duplicate_titles_get_sid_suffix(self):
         dups = [
