@@ -3647,6 +3647,8 @@ class ClaudeMonitor(App):
     _selection: set[str] = set()
     _selection_anchor: str | None = None
     _delete_armed_for: frozenset[str] | None = None
+    _typeahead_buffer: str = ""
+    _typeahead_last_key: float = 0.0
     _last_rendered: dict[str, list[str]] = {}
     _extending_cursor: bool = False
 
@@ -4944,6 +4946,51 @@ class ClaudeMonitor(App):
     def _group_header_indices(self) -> list[int]:
         """Return row indices of group header rows (not spacers)."""
         return list(self._group_header_rows)
+
+    _TYPEAHEAD_TIMEOUT_S = 1.2
+
+    def _typeahead_anchors(self) -> list[tuple[str, int]]:
+        """(label, row_index) pairs, in display order, for the Ctrl+letter
+        jump: one entry per group. Grouped view lands on the header row;
+        ungrouped has no headers, so it lands on the group's first row."""
+        if self.show_groups and self._group_header_rows:
+            return list(zip(self._group_counts.keys(), self._group_header_rows))
+        seen: dict[str, int] = {}
+        for i, s in enumerate(self._row_map):
+            if s is None or s.is_subagent:
+                continue
+            seen.setdefault(_group_key(s.title), i)
+        return list(seen.items())
+
+    def on_key(self, event: events.Key) -> None:
+        """Ctrl+letter, typed in sequence (Ctrl held the whole time, like
+        Finder/Explorer type-ahead find), jumps the cursor to the first
+        group whose name starts with the typed letters — e.g. Ctrl+s,
+        Ctrl+t, Ctrl+r, Ctrl+a jumps to 'strategy'. Plain letters stay
+        hotkeys; Ctrl+letter is otherwise unused."""
+        key = event.key
+        if len(key) != 6 or not key.startswith("ctrl+") or not key[5].isalpha():
+            return
+        if len(self.screen_stack) > 1 or isinstance(self.focused, Input):
+            return
+        event.stop()
+        letter = key[5]
+        now = time.time()
+        if now - self._typeahead_last_key > self._TYPEAHEAD_TIMEOUT_S:
+            self._typeahead_buffer = ""
+        self._typeahead_last_key = now
+        anchors = self._typeahead_anchors()
+        if not anchors:
+            return
+        candidate = self._typeahead_buffer + letter
+        idx = next((i for lbl, i in anchors if lbl.lower().startswith(candidate.lower())), None)
+        if idx is None:
+            candidate = letter
+            idx = next((i for lbl, i in anchors if lbl.lower().startswith(candidate.lower())), None)
+        if idx is None:
+            return
+        self._typeahead_buffer = candidate
+        self.query_one("#session-table", DataTable).move_cursor(row=idx)
 
     def action_prev_group(self) -> None:
         if not self.show_groups:
