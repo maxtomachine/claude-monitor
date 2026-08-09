@@ -99,7 +99,7 @@ class TestStartup:
         content = _capture()
         # Footer keybindings present
         assert "Quit" in content
-        assert "Kanban" in content
+        assert "Refresh" in content
 
     def test_table_renders(self, tmux_monitor):
         content = _capture()
@@ -124,16 +124,6 @@ class TestKeybindings:
         # Esc snaps out: filter text gone, hint restored.
         assert "zzqqx" not in after
         assert "/ search" in after
-
-    def test_kanban_opens(self, tmux_monitor):
-        _send("k")
-        content = _wait_for("Kanban Board")
-        assert "Working" in content
-        assert "Idle" in content
-        _send("Escape")
-        time.sleep(0.5)
-        content = _capture()
-        assert "Kanban Board" not in content
 
     def test_column_picker_opens(self, tmux_monitor):
         _send("c")
@@ -175,32 +165,3 @@ class TestSpinner:
         assert working_line1 and working_line2
 
 
-class TestKanbanNavigation:
-    def test_arrow_keys_move_selection(self, tmux_monitor):
-        _send("k")
-        _wait_for("Kanban Board")
-        snap1 = _capture()
-        _send("Right")
-        time.sleep(0.3)
-        snap2 = _capture()
-        # Selection highlight border should have moved
-        # (hard to assert precisely in ANSI; just check something changed)
-        _send("Escape")
-        # Best-effort: assert that pane content changed after navigation.
-        # May collide if selection was already at rightmost non-empty column.
-        if snap1 == snap2:
-            pytest.skip("selection didn't visibly move (edge position)")
-
-    def test_enter_opens_session_menu(self, tmux_monitor):
-        _send("k")
-        _wait_for("Kanban Board")
-        snap_before = _capture()
-        if snap_before.count("—") >= 5:
-            pytest.skip("all columns empty — no card to select")
-        _send("Enter")
-        time.sleep(0.5)
-        content = _capture()
-        # SessionMenu shows Jump/Resume options
-        assert "Jump" in content or "Resume" in content or "Copy" in content
-        _send("Escape")
-        _send("Escape")
