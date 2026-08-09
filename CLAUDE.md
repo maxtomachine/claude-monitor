@@ -56,16 +56,19 @@ Single file: `claude_monitor.py`. Key sections:
 | `r` | Refresh |
 | `s` | Cycle sort mode |
 | `a` | Toggle subagent rows |
-| `z` | Toggle archived/resumable sessions |
+| `h` | Toggle archived/resumable sessions (history mode) |
 | `c` | Column picker |
-| `/` | Search/filter |
-| `k` | Kanban board view |
-| `t` | Toggle dark/light theme |
+| `g` | Toggle grouping |
+| `i` | Toggle the preview/detail panel |
+| `/` | Search/filter (typing filters; `↓` drops into the table keeping the filter; `Esc` clears) |
+| `K` | Add/edit Anthropic API key (for haiku session summaries) |
 | `R` | Restart monitor (picks up code changes) |
 | `j` | Cursor down |
 | `n` | Send `/rename` to selected session |
 | `p` | Pin/unpin session (pinned stays visible after close) |
 | `P` | Broadcast `/proactive` to all sessions in cursor's group |
+| `PageUp` / `PageDown` | Jump to previous/next group header |
+| `Home` / `End` | Jump to first/last row |
 | `Enter` | Session context menu |
 | `double-click` | Jump to session's terminal (single-click highlights only) |
 | `Shift+Up/Down` | Extend multi-row selection |

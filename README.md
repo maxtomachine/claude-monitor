@@ -83,12 +83,11 @@ A Textual-based terminal app showing all active Claude sessions in a sortable, s
 | Key | What it does |
 |-----|--------------|
 | `Enter` | Action menu — jump to terminal, rename, copy ID, open remote, kill |
-| `k` | Kanban board — sessions grouped by status column, arrow-key navigation |
 | `s` | Cycle sort — activity, status, context %, tokens, cost |
 | `/` | Search — filter by session name, project, model, or status |
 | `c` | Column picker — show/hide columns, reorder with Shift+arrows |
 | `a` | Toggle subagent rows — see spawned agents nested under parents |
-| `z` | Show archived — include closed/old sessions with option to resume |
+| `h` | Show archived — include closed/old sessions with option to resume |
 | `t` | Dark/light theme toggle |
 | `n` | Send `/rename` to the selected session (patches unnamed sessions) |
 | `p` | Pin/unpin: pinned sessions stay visible even after they close |

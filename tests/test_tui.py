@@ -16,8 +16,6 @@ from claude_monitor import (
     ClaudeMonitor,
     SessionMenu,
     ColumnPicker,
-    KanbanView,
-    TimelineView,
     StatsBar,
     Session,
     ALL_COLUMNS,
@@ -519,82 +517,6 @@ class TestSubagents:
                 assert table.row_count == 1
 
 
-class TestKanban:
-    async def test_kanban_opens_and_closes(self, sample_sessions):
-        with _mock_sessions(sample_sessions):
-            async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
-                await pilot.press("v")
-                await pilot.pause()
-                assert isinstance(pilot.app.screen, KanbanView)
-                await pilot.press("escape")
-                await pilot.pause()
-                assert not isinstance(pilot.app.screen, KanbanView)
-
-    async def test_kanban_shows_columns(self):
-        sessions = [
-            make_session(session_id="w1", title="Worker", status="working"),
-            make_session(session_id="i1", title="Idler", status="idle"),
-        ]
-        with _mock_sessions(sessions):
-            async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
-                await pilot.press("v")
-                await pilot.pause()
-                screen = pilot.app.screen
-                cards = screen.query(".kanban-card")
-                assert len(cards) == 2
-
-    async def test_kanban_excludes_subagents(self):
-        sub = make_session(session_id="sub-1", is_subagent=True, parent_id="p1")
-        parent = make_session(session_id="p1", title="Parent", subagents=[sub])
-        with _mock_sessions([parent]):
-            async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
-                await pilot.press("v")
-                await pilot.pause()
-                cards = pilot.app.screen.query(".kanban-card")
-                assert len(cards) == 1
-
-    async def test_kanban_arrow_navigation(self):
-        sessions = [
-            make_session(session_id="w1", title="W1", status="working"),
-            make_session(session_id="w2", title="W2", status="working"),
-            make_session(session_id="i1", title="I1", status="idle"),
-        ]
-        with _mock_sessions(sessions):
-            async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
-                await pilot.press("v")
-                await pilot.pause()
-                screen = pilot.app.screen
-                start_col = screen._col
-                assert screen._row == 0
-                # Right jumps to next non-empty column
-                await pilot.press("right")
-                await pilot.pause()
-                assert screen._col != start_col
-                # Row clamped to new column's length
-                assert screen._row < len(screen._grid[screen._col])
-
-    async def test_kanban_enter_opens_session_menu(self):
-        s = make_session(session_id="w1", title="Worker", status="working")
-        with _mock_sessions([s]):
-            async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
-                await pilot.press("v")
-                await pilot.pause()
-                await pilot.press("enter")
-                await pilot.pause()
-                # SessionMenu opens on top; KanbanView still underneath
-                assert isinstance(pilot.app.screen, SessionMenu)
-                assert any(isinstance(sc, KanbanView) for sc in pilot.app.screen_stack)
-                # Escape → back to kanban
-                await pilot.press("escape")
-                await pilot.pause()
-                assert isinstance(pilot.app.screen, KanbanView)
-
-
 class TestEmptyState:
     async def test_mount_with_no_sessions_does_not_crash(self):
         # Regression: cursor_row is -1 on an empty DataTable; must not index
@@ -689,58 +611,6 @@ class TestProactiveGroup:
                 await pilot.press("P")
                 await pilot.pause()
                 mock_bc.assert_not_called()
-
-
-class TestTimeline:
-    async def test_timeline_opens_and_closes(self, sample_sessions):
-        with _mock_sessions(sample_sessions):
-            async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
-                # v once → kanban, v again → timeline
-                await pilot.press("v")
-                await pilot.pause()
-                assert isinstance(pilot.app.screen, KanbanView)
-                await pilot.press("v")
-                await pilot.pause()
-                assert isinstance(pilot.app.screen, TimelineView)
-                await pilot.press("escape")
-                await pilot.pause()
-                assert not isinstance(pilot.app.screen, TimelineView)
-
-    async def test_timeline_shows_bars(self):
-        sessions = [
-            make_session(session_id="w1", title="Worker", status="working"),
-            make_session(session_id="i1", title="Idler", status="idle"),
-        ]
-        with _mock_sessions(sessions):
-            async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
-                await pilot.press("v")
-                await pilot.pause()
-                await pilot.press("v")
-                await pilot.pause()
-                bars = pilot.app.screen.query(".timeline-bar")
-                assert len(bars) == 2
-
-    async def test_view_cycle_full_loop(self, sample_sessions):
-        """v cycles: rows → kanban → timeline → rows."""
-        with _mock_sessions(sample_sessions):
-            async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
-                # Start in rows
-                assert not isinstance(pilot.app.screen, (KanbanView, TimelineView))
-                # v → kanban
-                await pilot.press("v")
-                await pilot.pause()
-                assert isinstance(pilot.app.screen, KanbanView)
-                # v → timeline
-                await pilot.press("v")
-                await pilot.pause()
-                assert isinstance(pilot.app.screen, TimelineView)
-                # v → rows (back to default)
-                await pilot.press("v")
-                await pilot.pause()
-                assert not isinstance(pilot.app.screen, (KanbanView, TimelineView))
 
 
 class TestTitleDisambiguation:
