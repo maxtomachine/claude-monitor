@@ -18,6 +18,7 @@ from claude_monitor import (
     SortMode,
     read_hook_state,
     read_session_memory_title,
+    resume_session,
     _resolve_match_candidates,
     _pid_is_claude,
     _is_session_alive,
@@ -352,6 +353,40 @@ class TestSessionLiveness:
              patch("claude_monitor.SESSIONS_DIR", tmp_path):
             assert _is_session_alive("old-sid") is False
             assert _is_session_alive("new-sid") is True
+
+    def test_stale_hook_pid_falls_through_to_resume_grace_not_dead(self, tmp_path):
+        """Fixture from 2026-08-15 (config-MCPs, sid 8f7e4862): the hook state
+        still names an old PID that has since been recycled to a DIFFERENT
+        live session. The old code asserted dead outright on that mismatch,
+        which raced past the 60s post-resume grace period — a rapid second
+        click read the just-launched session as not-alive and fired a
+        duplicate resume, which Claude Code's own single-instance guard then
+        killed (the reported 'coughing to a blank Ghostty'). The stale hook
+        lead must be a dead end, not a verdict: grace still wins."""
+        (tmp_path / "4538.json").write_text('{"sessionId": "unrelated-sid", "pid": 4538}')
+        with patch("claude_monitor._pid_map", {}), \
+             patch("claude_monitor._refresh_pid_map"), \
+             patch("claude_monitor._recently_resumed", {"just-resumed-sid": time.time()}), \
+             patch("claude_monitor.read_hook_state", return_value={"pid": 4538}), \
+             patch("claude_monitor._pid_is_claude", return_value=True), \
+             patch("claude_monitor.SESSIONS_DIR", tmp_path):
+            assert _is_session_alive("just-resumed-sid") is True
+
+    def test_resume_session_busts_pid_map_cache(self, tmp_path):
+        """A successful resume must invalidate the PID-map cache itself, not
+        rely on each caller to remember: one caller (the jump action's
+        resume-fallback) didn't, so a fast second click could still read a
+        stale pre-resume map and see 'not alive', firing a duplicate resume."""
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text("{}\n")
+        s = make_session(session_id="sid-1", transcript_path=str(transcript))
+        ok_result = type("R", (), {"stdout": "Ghostty", "returncode": 0})()
+        import claude_monitor
+        claude_monitor._pid_map_ts = 12345.0
+        with patch("claude_monitor.subprocess.run", return_value=ok_result), \
+             patch("claude_monitor._derive_cwd_from_transcript", return_value=None):
+            assert resume_session(s) is True
+        assert claude_monitor._pid_map_ts == 0
 
 
 class TestBackgroundActivity:
