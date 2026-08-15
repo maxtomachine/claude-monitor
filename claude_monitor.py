@@ -3491,7 +3491,9 @@ class DosFooter(Static):
     """
 
     def __init__(self, items: list[tuple[str, str]], **kwargs) -> None:
-        # items: [(key, label), ...] where key is the highlighted letter
+        # items: [(key, label), ...] where key is the highlighted letter.
+        # Every item here is Ctrl+<key> (plain letters are the type-ahead
+        # group jump), so each label is prefixed with the caret notation.
         parts = []
         for key, label in items:
             idx = label.lower().find(key.lower())
@@ -3499,9 +3501,9 @@ class DosFooter(Static):
                 before = label[:idx]
                 letter = label[idx]
                 after = label[idx + 1:]
-                parts.append(f"{before}[bold #D97757]{letter}[/]{after}")
+                parts.append(f"^{before}[bold #D97757]{letter}[/]{after}")
             else:
-                parts.append(f"[bold #D97757]{key}[/] {label}")
+                parts.append(f"^[bold #D97757]{key}[/] {label}")
         super().__init__("  ".join(parts), **kwargs)
 
 
@@ -3588,30 +3590,43 @@ class ClaudeMonitor(App):
     }
     """
 
+    # Plain letters (no modifier) are reserved for the type-ahead group jump
+    # (see on_key): every command that used to sit on a bare letter now
+    # requires Ctrl, so typing a group's name never fires a hotkey mid-word.
+    # Shift-bound (K/R/P) and non-letter bindings are untouched.
+    #
+    # Ctrl+H and Ctrl+I are NOT ctrl+letter to Textual: the xterm input
+    # protocol Textual speaks (drivers/linux_driver.py has no Kitty/enhanced
+    # keyboard negotiation) encodes them identically to Backspace and Tab, so
+    # a binding on either is permanently unreachable, not merely a bug to
+    # fix. archived/detail moved to z/v to dodge that; verified live that
+    # Ctrl+H and Backspace fire the same action and Ctrl+I is silently
+    # swallowed like Tab. Ctrl+S is fine here (linux_driver.py explicitly
+    # clears IXON/IXOFF), a tmux-nested test transiently ate it.
     BINDINGS = [
-        Binding("q", "quit", "Quit"),
-        Binding("r", "refresh", "Refresh"),
-        Binding("s", "cycle_sort", "Sort"),
-        Binding("a", "toggle_subagents", "Agents"),
-        Binding("h", "toggle_archived", "History"),
-        Binding("c", "pick_columns", "Columns"),
+        Binding("ctrl+q", "quit", "Quit"),
+        Binding("ctrl+r", "refresh", "Refresh"),
+        Binding("ctrl+s", "cycle_sort", "Sort"),
+        Binding("ctrl+a", "toggle_subagents", "Agents"),
+        Binding("ctrl+z", "toggle_archived", "History"),
+        Binding("ctrl+c", "pick_columns", "Columns"),
         # Binding("l", "statusline_config", "Statusline"),  # TODO: re-enable after statusline merge
-        Binding("d", "toggle_debug", "Debug", show=False),
+        Binding("ctrl+d", "toggle_debug", "Debug", show=False),
         Binding("K", "setup_api_key", "API Key", show=False),
         Binding("slash", "start_search", "Search", show=False),
         Binding("escape", "clear_search", "Clear", show=False),
         Binding("down", "search_to_table", show=False),
         Binding("R", "restart", "Restart", show=False),
-        Binding("j", "cursor_down", "↓", show=False),
-        Binding("n", "edit_name", "Name"),
+        Binding("ctrl+j", "cursor_down", "↓", show=False),
+        Binding("ctrl+n", "edit_name", "Name"),
         Binding("P", "proactive_group", "/proactive→group", show=False),
-        Binding("g", "toggle_groups", "Group"),
-        Binding("i", "toggle_detail", "Info", show=False),
+        Binding("ctrl+g", "toggle_groups", "Group"),
+        Binding("ctrl+v", "toggle_detail", "Info", show=False),
         Binding("pageup", "prev_group", "PgUp", show=False, priority=True),
         Binding("pagedown", "next_group", "PgDn", show=False, priority=True),
         Binding("home", "table_home", "Home", show=False, priority=True),
         Binding("end", "table_end", "End", show=False, priority=True),
-        Binding("p", "toggle_pin", "Pin", show=False),
+        Binding("ctrl+p", "toggle_pin", "Pin", show=False),
         Binding("backspace", "hide_selected", "Hide", show=False),
         Binding("delete", "hide_selected", "Hide", show=False),
         Binding("shift+up", "extend_selection(-1)", "Select↑", show=False, priority=True),
@@ -4950,7 +4965,7 @@ class ClaudeMonitor(App):
     _TYPEAHEAD_TIMEOUT_S = 1.2
 
     def _typeahead_anchors(self) -> list[tuple[str, int]]:
-        """(label, row_index) pairs, in display order, for the Ctrl+letter
+        """(label, row_index) pairs, in display order, for the plain-letter
         jump: one entry per group. Grouped view lands on the header row;
         ungrouped has no headers, so it lands on the group's first row."""
         if self.show_groups and self._group_header_rows:
@@ -4963,18 +4978,19 @@ class ClaudeMonitor(App):
         return list(seen.items())
 
     def on_key(self, event: events.Key) -> None:
-        """Ctrl+letter, typed in sequence (Ctrl held the whole time, like
-        Finder/Explorer type-ahead find), jumps the cursor to the first
-        group whose name starts with the typed letters — e.g. Ctrl+s,
-        Ctrl+t, Ctrl+r, Ctrl+a jumps to 'strategy'. Plain letters stay
-        hotkeys; Ctrl+letter is otherwise unused."""
+        """A bare letter, typed in sequence like Finder/Explorer type-ahead
+        find, jumps the cursor to the first group whose name starts with
+        the typed letters: s, t, r, a jumps to 'strategy'. Every hotkey
+        now requires Ctrl (see BINDINGS), so a plain letter never collides
+        with one; the three Shift-bound hotkeys (K/R/P) are matched by
+        Bindings before this handler ever sees them."""
         key = event.key
-        if len(key) != 6 or not key.startswith("ctrl+") or not key[5].isalpha():
+        if len(key) != 1 or not key.isalpha():
             return
         if len(self.screen_stack) > 1 or isinstance(self.focused, Input):
             return
         event.stop()
-        letter = key[5]
+        letter = key
         now = time.time()
         if now - self._typeahead_last_key > self._TYPEAHEAD_TIMEOUT_S:
             self._typeahead_buffer = ""

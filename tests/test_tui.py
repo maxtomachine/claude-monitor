@@ -114,7 +114,7 @@ class TestKeyBindings:
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
                 initial_sort = pilot.app.sort_mode
-                await pilot.press("s")
+                await pilot.press("ctrl+s")
                 await pilot.pause()
                 assert pilot.app.sort_mode != initial_sort
 
@@ -123,10 +123,10 @@ class TestKeyBindings:
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
                 assert pilot.app.show_subagents is False
-                await pilot.press("a")
+                await pilot.press("ctrl+a")
                 await pilot.pause()
                 assert pilot.app.show_subagents is True
-                await pilot.press("a")
+                await pilot.press("ctrl+a")
                 await pilot.pause()
                 assert pilot.app.show_subagents is False
 
@@ -147,16 +147,15 @@ class TestKeyBindings:
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                await pilot.press("j")
-                await pilot.press("j")
-                await pilot.press("v")
+                await pilot.press("ctrl+j")
+                await pilot.press("ctrl+j")
                 await pilot.pause()
 
     async def test_refresh_keybinding(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                await pilot.press("r")
+                await pilot.press("ctrl+r")
                 await pilot.pause()
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count >= 3
@@ -271,7 +270,7 @@ class TestColumnPicker:
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                await pilot.press("c")
+                await pilot.press("ctrl+c")
                 await pilot.pause()
                 assert len(pilot.app.screen_stack) > 1
 
@@ -279,7 +278,7 @@ class TestColumnPicker:
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                await pilot.press("c")
+                await pilot.press("ctrl+c")
                 await pilot.pause()
                 assert len(pilot.app.screen_stack) > 1
                 await pilot.press("escape")
@@ -290,7 +289,7 @@ class TestColumnPicker:
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                await pilot.press("c")
+                await pilot.press("ctrl+c")
                 await pilot.pause()
                 screen = pilot.app.screen
                 picker = screen
@@ -342,8 +341,8 @@ class TestSearch:
                 assert table.row_count == 0
 
     async def test_letter_keys_type_into_search_not_hotkeys(self, sample_sessions):
-        """While the search box has focus, single-letter app hotkeys (s, r, q,
-        ...) are filter text, not actions."""
+        """While the search box has focus, plain letters are filter text,
+        not the type-ahead group jump (every real hotkey needs Ctrl)."""
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
@@ -415,11 +414,11 @@ class TestSearch:
                 await pilot.pause()
                 panel = pilot.app.query_one("#detail-panel", Static)
                 assert panel.display is True
-                await pilot.press("i")
+                await pilot.press("ctrl+v")
                 await pilot.pause()
                 assert panel.display is False
                 assert pilot.app.show_detail is False
-                await pilot.press("i")
+                await pilot.press("ctrl+v")
                 await pilot.pause()
                 assert panel.display is True
 
@@ -430,10 +429,10 @@ class TestArchived:
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
                 assert pilot.app.show_archived is False
-                await pilot.press("h")
+                await pilot.press("ctrl+z")
                 await pilot.pause()
                 assert pilot.app.show_archived is True
-                await pilot.press("h")
+                await pilot.press("ctrl+z")
                 await pilot.pause()
                 assert pilot.app.show_archived is False
 
@@ -455,7 +454,7 @@ class TestArchived:
                 await pilot.pause()
                 table = pilot.app.query_one("#session-table", DataTable)
                 before = table.row_count
-                await pilot.press("h")
+                await pilot.press("ctrl+z")
                 await pilot.pause()
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count > before  # archived session appeared
@@ -499,7 +498,7 @@ class TestSubagents:
                 await pilot.pause()
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count == 1
-                await pilot.press("a")
+                await pilot.press("ctrl+a")
                 await pilot.pause()
                 assert table.row_count == 2
 
@@ -509,9 +508,9 @@ class TestSubagents:
         with _mock_sessions([parent]):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                await pilot.press("a")
+                await pilot.press("ctrl+a")
                 await pilot.pause()
-                await pilot.press("a")
+                await pilot.press("ctrl+a")
                 await pilot.pause()
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count == 1
@@ -614,9 +613,10 @@ class TestProactiveGroup:
 
 
 class TestTypeaheadJump:
-    """Ctrl+letter, typed in sequence like Finder/Explorer type-ahead find,
-    jumps the cursor to the group whose name matches the accumulated
-    buffer (e.g. Ctrl+s Ctrl+t Ctrl+r Ctrl+a -> 'strategy')."""
+    """A plain letter, typed in sequence like Finder/Explorer type-ahead
+    find, jumps the cursor to the group whose name matches the accumulated
+    buffer (e.g. s t r a -> 'strategy'). Every real hotkey now requires
+    Ctrl, so a bare letter is always free for this."""
 
     @pytest.fixture
     def grouped_sessions(self):
@@ -636,7 +636,7 @@ class TestTypeaheadJump:
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
                 table = pilot.app.query_one("#session-table", DataTable)
-                await pilot.press("ctrl+s")
+                await pilot.press("s")
                 await pilot.pause()
                 cr = table.cursor_row
                 assert pilot.app._row_map[cr] is None  # landed on a header row
@@ -649,7 +649,7 @@ class TestTypeaheadJump:
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
                 table = pilot.app.query_one("#session-table", DataTable)
-                for k in ("ctrl+b", "ctrl+a", "ctrl+s", "ctrl+h"):
+                for k in ("b", "a", "s", "h"):
                     await pilot.press(k)
                 await pilot.pause()
                 cr = table.cursor_row
@@ -662,10 +662,10 @@ class TestTypeaheadJump:
              patch("claude_monitor._is_session_alive", return_value=True):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                await pilot.press("ctrl+b")
+                await pilot.press("b")
                 await pilot.pause()
                 pilot.app._typeahead_last_key -= 10  # force timeout
-                await pilot.press("ctrl+s")
+                await pilot.press("s")
                 await pilot.pause()
                 # Stale "b" buffer must not survive; fresh "s" alone matches strategy.
                 assert pilot.app._typeahead_buffer == "s"
@@ -680,7 +680,7 @@ class TestTypeaheadJump:
                 await pilot.pause()
                 table = pilot.app.query_one("#session-table", DataTable)
                 table.move_cursor(row=0)
-                await pilot.press("ctrl+z")
+                await pilot.press("z")
                 await pilot.pause()
                 assert table.cursor_row == 0
 
@@ -695,7 +695,7 @@ class TestTypeaheadJump:
                 await pilot.press("enter")  # opens SessionMenu (a real row, not a header)
                 await pilot.pause()
                 assert len(pilot.app.screen_stack) > 1
-                await pilot.press("ctrl+s")
+                await pilot.press("s")
                 await pilot.pause()
                 await pilot.press("escape")
                 await pilot.pause()
@@ -710,7 +710,7 @@ class TestTypeaheadJump:
                 table.move_cursor(row=0)
                 await pilot.press("slash")
                 await pilot.pause()
-                await pilot.press("ctrl+s")
+                await pilot.press("s")
                 await pilot.pause()
                 assert table.cursor_row == 0
 
@@ -723,7 +723,7 @@ class TestTypeaheadJump:
                 pilot.app.refresh_sessions()
                 await pilot.pause()
                 table = pilot.app.query_one("#session-table", DataTable)
-                await pilot.press("ctrl+s")
+                await pilot.press("s")
                 await pilot.pause()
                 sel = pilot.app._row_map[table.cursor_row]
                 assert sel is not None and sel.title.startswith("strategy")
