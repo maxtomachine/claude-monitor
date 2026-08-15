@@ -50,26 +50,30 @@ Single file: `claude_monitor.py`. Key sections:
 
 ## Current keybindings
 
+Plain letters (no modifier) are reserved for the type-ahead group jump below, so every command sits on `Ctrl+letter` instead. `K`/`R`/`P` are the three exceptions: they were already Shift-bound and don't collide with a bare letter.
+
+`Ctrl+h` and `Ctrl+i` are NOT usable bindings: the plain xterm input protocol Textual speaks encodes them identically to Backspace and Tab (no Kitty/enhanced-keyboard negotiation in `drivers/linux_driver.py`), so a binding on either is unreachable, not merely buggy. History and the preview panel sit on `z`/`v` instead. `Ctrl+s`/`Ctrl+q` were briefly suspected of the same problem (they're the classic XON/XOFF flow-control bytes) but `linux_driver.py` explicitly clears `IXON`/`IXOFF`, and both work; a failure to fire is a symptom of testing nested inside tmux, not a real collision.
+
 | Key | Action |
 |-----|--------|
-| `q` | Quit |
-| `r` | Refresh |
-| `s` | Cycle sort mode |
-| `a` | Toggle subagent rows |
-| `h` | Toggle archived/resumable sessions (history mode) |
-| `c` | Column picker |
-| `g` | Toggle grouping |
-| `i` | Toggle the preview/detail panel |
+| `letter` (typed in sequence) | Type-ahead jump to a group by name, like Finder/Explorer find (e.g. `s` `t` `r` `a` → strategy) |
+| `Ctrl+q` | Quit |
+| `Ctrl+r` | Refresh |
+| `Ctrl+s` | Cycle sort mode |
+| `Ctrl+a` | Toggle subagent rows |
+| `Ctrl+z` | Toggle archived/resumable sessions (history mode) |
+| `Ctrl+c` | Column picker |
+| `Ctrl+g` | Toggle grouping |
+| `Ctrl+v` | Toggle the preview/detail panel |
 | `/` | Search/filter (typing filters; `↓` drops into the table keeping the filter; `Esc` clears) |
 | `K` | Add/edit Anthropic API key (for haiku session summaries) |
 | `R` | Restart monitor (picks up code changes) |
-| `j` | Cursor down |
-| `n` | Send `/rename` to selected session |
-| `p` | Pin/unpin session (pinned stays visible after close) |
+| `Ctrl+j` | Cursor down |
+| `Ctrl+n` | Send `/rename` to selected session |
+| `Ctrl+p` | Pin/unpin session (pinned stays visible after close) |
 | `P` | Broadcast `/proactive` to all sessions in cursor's group |
 | `PageUp` / `PageDown` | Jump to previous/next group header |
 | `Home` / `End` | Jump to first/last row |
-| `Ctrl+letter` (typed in sequence) | Type-ahead jump to a group by name, like Finder/Explorer find (e.g. Ctrl+s Ctrl+t Ctrl+r Ctrl+a → strategy) |
 | `Enter` | Session context menu |
 | `double-click` | Jump to session's terminal (single-click highlights only) |
 | `Shift+Up/Down` | Extend multi-row selection |

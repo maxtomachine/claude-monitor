@@ -80,24 +80,26 @@ The statusline is symlinked, so pulling updates it everywhere instantly.
 
 A Textual-based terminal app showing all active Claude sessions in a sortable, searchable table.
 
+Plain letters, typed in sequence, are a Finder-style type-ahead: they jump the cursor to the group whose name starts with what you typed (e.g. `s` `t` `r` `a` → strategy). Every command below sits on `Ctrl+letter` instead, so it never fires mid-word. `K`/`R`/`P` were already Shift-bound and don't collide.
+
 | Key | What it does |
 |-----|--------------|
 | `Enter` | Action menu — jump to terminal, rename, copy ID, open remote, kill |
-| `s` | Cycle sort — activity, status, context %, tokens, cost |
+| `letter` (typed in sequence) | Type-ahead jump to a group by name |
+| `Ctrl+s` | Cycle sort — activity, status, context %, tokens, cost |
 | `/` | Search — filter by session name, project, model, or status |
-| `c` | Column picker — show/hide columns, reorder with Shift+arrows |
-| `a` | Toggle subagent rows — see spawned agents nested under parents |
-| `h` | Show archived — include closed/old sessions with option to resume |
-| `t` | Dark/light theme toggle |
-| `n` | Send `/rename` to the selected session (patches unnamed sessions) |
-| `p` | Pin/unpin: pinned sessions stay visible even after they close |
+| `Ctrl+c` | Column picker — show/hide columns, reorder with Shift+arrows |
+| `Ctrl+a` | Toggle subagent rows — see spawned agents nested under parents |
+| `Ctrl+z` | Show archived — include closed/old sessions with option to resume |
+| `Ctrl+n` | Send `/rename` to the selected session (patches unnamed sessions) |
+| `Ctrl+p` | Pin/unpin: pinned sessions stay visible even after they close |
 | `P` | Broadcast `/proactive` to all sessions in the cursor's group |
 | `double-click` | Jump straight to the session's terminal (single-click highlights) |
 | `Shift+Up/Down`, `Shift+Click` | Extend multi-row selection |
 | `Delete` | Hide selected closed/archived row(s); press twice to confirm |
 | `R` | Restart the monitor in-place (picks up code changes) |
-| `r` | Force refresh |
-| `q` | Quit |
+| `Ctrl+r` | Force refresh |
+| `Ctrl+q` | Quit |
 
 **Row markers**: `⊙` pinned · `↻` scheduled run (sdk/headless; collapsed to the latest per project by default) · a pulsing `●` means the session just flipped to waiting and wants your attention (clears when you jump to it, fades after 5 min).
 
