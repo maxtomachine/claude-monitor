@@ -1198,17 +1198,29 @@ def _is_session_alive(session_id: str, display_title: str = "") -> bool:
         try:
             pid = int(hook["pid"])
             if _pid_is_claude(pid):
-                # The PID is a live claude — but after /branch the SAME PID
-                # serves a different session. Cross-check the canonical
-                # PID→sessionId map; if the PID has moved on, this sid is dead.
+                # The PID is a live claude — but after /branch, or once the
+                # PID has simply been recycled to an unrelated session, the
+                # SAME PID now serves a different sid. Cross-check the
+                # canonical PID→sessionId map; if it disagrees, this hook
+                # lead is a dead end — fall through to the grace-period
+                # check below rather than asserting dead outright (a stale
+                # hook pid must never override "we just resumed this",
+                # or a rapid second resume looks alive-but-unreachable and
+                # spawns a duplicate that gets kicked by CC's own
+                # single-instance guard — observed live 2026-08-15,
+                # config-MCPs, sid 8f7e4862).
                 pid_file = SESSIONS_DIR / f"{pid}.json"
+                now_serves = ""
                 try:
                     pdata = json.loads(pid_file.read_text())
-                    if pdata.get("sessionId") and pdata["sessionId"] != session_id:
-                        return False
+                    now_serves = pdata.get("sessionId", "")
                 except (OSError, json.JSONDecodeError):
                     pass
-                return True
+                if now_serves and now_serves != session_id:
+                    mlog("DIVERGE", "stale_hook_pid", sid=session_id[:12], pid=pid,
+                         now_serves=now_serves[:12])
+                else:
+                    return True
         except ValueError:
             pass
 
@@ -2900,6 +2912,15 @@ def resume_session(session: Session) -> bool:
              via=out, rc=result.returncode)
         if result.returncode == 0 and out in ("Ghostty", "iTerm2", "Terminal"):
             _recently_resumed[session.session_id] = time.time()
+            # Force a fresh PID-map read on the next liveness check. Every
+            # caller used to have to remember this itself; one (the jump
+            # action's resume-fallback) didn't, so a fast second click could
+            # still read a cached pre-resume map and see "not alive",
+            # firing a second resume of the same sid — the duplicate then
+            # gets kicked by Claude Code's own single-instance guard
+            # (observed live 2026-08-15, config-MCPs).
+            global _pid_map_ts
+            _pid_map_ts = 0
             # Auto-rename the new session to match the old name. Skip junk
             # fallback titles (home-dir basename, sid8, generic placeholders)
             # — applying those would overwrite a better auto-generated name.
@@ -4269,8 +4290,6 @@ class ClaudeMonitor(App):
                 ok = resume_session(s)
                 if ok:
                     self.notify(f"Resuming {s.title[:20]}…", timeout=4)
-                    global _pid_map_ts
-                    _pid_map_ts = 0
                 else:
                     self.notify("Could not open terminal", timeout=4)
                 mlog("menu", "resume_result", sid=s.session_id[:12], success=ok)
