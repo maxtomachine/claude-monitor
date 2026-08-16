@@ -513,13 +513,13 @@ class TestPinnedSurvivesHistoryOff:
     in parse_sessions dropped pinned sessions before the render-time pin guard
     could re-admit them."""
 
-    def _setup(self, tmp_path):
+    def _setup(self, tmp_path, age_days=2):
         sid = "pinned00-dead-beef-cafe-000000000001"
         proj = tmp_path / "-Users-test-proj"
         proj.mkdir()
         t = proj / f"{sid}.jsonl"
         t.write_text(make_transcript_jsonl(tokens_out=500))
-        old = time.time() - 86400 * 2  # 2 days: archived but inside 7-day cutoff
+        old = time.time() - 86400 * age_days
         import os as _os
         _os.utime(t, (old, old))
         return sid, t
@@ -541,6 +541,16 @@ class TestPinnedSurvivesHistoryOff:
 
     def test_pinned_old_dead_session_kept(self, tmp_path):
         sid, _ = self._setup(tmp_path)
+        ids = {s.session_id for s in self._run(tmp_path, pinned={sid})}
+        assert sid in ids
+
+    def test_pinned_ancient_session_never_expires(self, tmp_path):
+        """Fixture from 2026-08-16 (Max: 'pins should stay until I unpin
+        them'). A prior version made a pin's exemption expire after 7 days
+        (archive_cutoff) — Max corrected that: a pin is permanent, full stop.
+        Whether an inactive pin is currently SHOWN is a separate concern
+        (Ctrl+O / hide_inactive_pins in the TUI), not an age question here."""
+        sid, _ = self._setup(tmp_path, age_days=400)
         ids = {s.session_id for s in self._run(tmp_path, pinned={sid})}
         assert sid in ids
 

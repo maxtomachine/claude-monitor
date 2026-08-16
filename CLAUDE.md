@@ -74,16 +74,17 @@ Column defaults changed to match: `duration` moved from on to off (`session`,
 the transcript's last real tool call, not a guess, so it earns its default
 slot in a way the old inferred sub-statuses never did.
 
-## Pins step down, they don't last forever
+## Pins are permanent; hiding inactive ones is a separate toggle
 
-A pin used to be a permanent, unconditional exemption from every age filter.
-101 pins accumulated with zero cleanup pressure, since nothing ever pushed one
-out of view. A pin now only survives past the normal 7-day `archive_cutoff`
-while it's within that window (`pin_recent` in `parse_sessions()`); past that
-it needs `Ctrl+z` like any other old session. Within the window it still shows
-unconditionally, rendered dim once its status is `closed` (existing bold/dim
-logic, unchanged), a visible "step down" that reminds you to finish or unpin
-before it drops out.
+A pin is an unconditional exemption from every age filter in `parse_sessions()`,
+by design: it stays until you unpin it, full stop (Max: "pins should stay
+until I unpin them"). An earlier version of this made pins auto-expire after
+7 days instead, which Max corrected: he wanted the simpler thing, an on/off
+filter, not an age-based decay he'd have to reason about. `Ctrl+O`
+(`hide_inactive_pins`, off by default) hides a pinned-but-closed session from
+the default view without touching the underlying pin at all; unpin it or flip
+the toggle back to see it again. `Ctrl+z` history mode still shows everything
+regardless of this toggle.
 
 ## Current keybindings
 
@@ -107,7 +108,8 @@ Plain letters (no modifier) are reserved for the type-ahead group jump below, so
 | `R` | Restart monitor (picks up code changes) |
 | `Ctrl+j` | Cursor down |
 | `Ctrl+n` | Send `/rename` to selected session |
-| `Ctrl+p` | Pin/unpin session (pinned stays visible for a while after close, then drops to `Ctrl+z` history like any old session) |
+| `Ctrl+p` | Pin/unpin session (a pin never expires on its own) |
+| `Ctrl+o` | Hide/show pinned-but-closed sessions in the default view (the pin itself is untouched either way) |
 | `P` | Broadcast `/proactive` to all sessions in cursor's group |
 | `PageUp` / `PageDown` | Jump to previous/next group header |
 | `Home` / `End` | Jump to first/last row |
