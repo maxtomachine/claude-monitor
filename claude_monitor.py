@@ -2852,7 +2852,21 @@ def _auto_rename_after_resume(old_name: str, expected_sid8: str) -> None:
 
 
 def resume_session(session: Session) -> bool:
-    """Resume a Claude session in a new Ghostty tab (falls back to Terminal.app)."""
+    """Resume a Claude session in a new Ghostty window (falls back to Terminal.app).
+
+    Opens the window/runs the command entirely through each app's own native
+    scripting, never System Events keystroke/keyCode. Any Accessibility-
+    injected synthetic keyboard event, regardless of which key, was found to
+    trigger Claude Nest's push-to-talk (observed live 2026-08-15: a bare
+    synthetic Cmd+T *and* Cmd+N each fired it from Max's own terminal running
+    the identical osascript, while his real physical Cmd+N did not. The
+    Nest side reacts to Accessibility-injected input generically, not to a
+    specific key). newWindow's own command field sidesteps the whole class
+    of collision. Ghostty has no native new-tab equivalent, so this costs
+    the tab-in-current-window behavior; iTerm2 support (previously
+    keystroke-only) is dropped rather than left as a latent repeat of the
+    same collision for any iTerm2 user: it falls through to Terminal.app.
+    """
     cmd = f"claude --resume {session.session_id}"
     # Claude CLI resolves sessions by hashing the cwd. Use the original
     # launch directory: sessions-index projectPath > transcript path > last cwd.
@@ -2872,33 +2886,31 @@ def resume_session(session: Session) -> bool:
              path=session.transcript_path)
         return False
 
-    # Ghostty: open new tab via keystroke, then type the command
-    quoted_cwd = shlex.quote(cwd)
+    # Ghostty's `command` field takes ONE string it execs directly (no shell,
+    # confirmed live: a compound "a; b" string fails to launch) — run it
+    # through zsh -c instead. -i (interactive) is required: a bare zsh -c,
+    # and even zsh -lc (login only), sources neither .zshrc, so `claude`
+    # (PATH'd from the `export PATH=...` at the top of .zshrc, not a
+    # login-only file) comes back "command not found" — confirmed live,
+    # twice, with real Ghostty windows showing that exact error. Double
+    # shlex.quote (once for cwd inside the inner command, once for the
+    # whole inner command as zsh's -c argument) round-trips correctly even
+    # when cwd itself contains a single quote.
+    inner_cmd = f"cd {shlex.quote(cwd)} && {cmd}"
+    zsh_cmd = f"/bin/zsh -ic {shlex.quote(inner_cmd)}"
     jxa = f"""(() => {{
-        const se = Application("System Events");
-        const cwd = {json.dumps(quoted_cwd)};
-        const cmd = {json.dumps(cmd)};
+        const zshCmd = {json.dumps(zsh_cmd)};
+        try {{
+            const ghostty = Application("Ghostty");
+            const w = ghostty.newWindow({{withConfiguration: {{command: zshCmd}}}});
+            ghostty.activateWindow(w);
+            return "Ghostty";
+        }} catch (e) {{}}
 
-        // Try Ghostty, then iTerm2 (both use Cmd+T for new tab)
-        for (const appName of ["Ghostty", "iTerm2"]) {{
-            try {{
-                const proc = se.processes.byName(appName);
-                proc.name();
-                proc.frontmost = true;
-                delay(0.2);
-                se.keystroke("t", {{using: "command down"}});
-                delay(0.5);
-                se.keystroke("cd " + cwd + " && " + cmd);
-                delay(0.1);
-                se.keyCode(36);
-                return appName;
-            }} catch(e) {{}}
-        }}
-
-        // Fall back to Terminal.app
+        // Fall back to Terminal.app (native doScript — no keystroke here either)
         const term = Application("Terminal");
         term.activate();
-        term.doScript("cd " + cwd + " && " + cmd);
+        term.doScript({json.dumps(inner_cmd)});
         return "Terminal";
     }})()"""
 
@@ -2910,7 +2922,7 @@ def resume_session(session: Session) -> bool:
         out = result.stdout.strip()
         mlog("resume", "launched", sid=session.session_id[:12],
              via=out, rc=result.returncode)
-        if result.returncode == 0 and out in ("Ghostty", "iTerm2", "Terminal"):
+        if result.returncode == 0 and out in ("Ghostty", "Terminal"):
             _recently_resumed[session.session_id] = time.time()
             # Force a fresh PID-map read on the next liveness check. Every
             # caller used to have to remember this itself; one (the jump
@@ -3257,7 +3269,7 @@ class SessionMenu(ModalScreen[str]):
             options.append(Option("▶   Resume session", id="resume"))
         else:
             options.append(Option("🖥   Jump to terminal", id="jump"))
-            options.append(Option("▶   Resume in new tab", id="resume"))
+            options.append(Option("▶   Resume in new window", id="resume"))
             options.append(Option("🏷   Rename…", id="edit_name"))
         if self.menu_context == "timeline":
             options.append(Option("📊  Summarize period", id="summarize"))
@@ -4278,7 +4290,7 @@ class ClaudeMonitor(App):
                     else:
                         ok = resume_session(s)
                         if ok:
-                            self.notify(f"Resuming {s.title[:20]} in new tab", timeout=4)
+                            self.notify(f"Resuming {s.title[:20]} in new window", timeout=4)
                         else:
                             self.notify("Could not find or resume session", timeout=4)
                 mlog("menu", "jump_result", sid=s.session_id[:12], success=ok)
@@ -4831,7 +4843,7 @@ class ClaudeMonitor(App):
         else:
             ok = resume_session(s)
             if ok:
-                self.notify(f"Resuming {s.title[:20]} in new tab", timeout=4)
+                self.notify(f"Resuming {s.title[:20]} in new window", timeout=4)
             else:
                 self.notify("Could not find or resume session", timeout=4)
         mlog(log_cat, "rename", sid=s.session_id[:12], success=ok)
