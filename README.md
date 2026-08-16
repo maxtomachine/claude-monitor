@@ -12,32 +12,19 @@ You've got 6 Claude Code sessions open across 3 terminal windows. One is thinkin
 
 ## The solution
 
-A terminal dashboard that shows every session's status, what it's working on, how much context it's burned, and what it costs — updated in real time. Plus a two-line HUD statusline inside each Claude session.
+A terminal dashboard that shows every session's name, whether it's working, blocked on you, or just done, and what it's actually doing — updated in real time. Plus a two-line HUD statusline inside each Claude session.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
-│ Status   Session                    Model      Context     Tokens   Cost   Doing    │
+│ Session                            Status         Doing                             │
 ├─────────────────────────────────────────────────────────────────────────────────────┤
-│ ✻ WORKING Build monitor dashboard   Opus 4.6   ██████████  245k    $3.42  Editing…  │
-│ ? APPROVE Delete empty Gmail drafts  Opus 4.6   ████░░░░░░  1.2M    $6.76  Bash…    │
-│ ◌ IDLE    Refactor auth middleware   Sonnet 4.6 ██░░░░░░░░  890k   $12.50  Edited…  │
+│ Build monitor dashboard            ● WORKING       Editing claude_monitor.py         │
+│ Delete empty Gmail drafts          ◉ APPROVE       Awaiting approval                 │
+│ Refactor auth middleware           ○ done 22m      Edited auth.py                    │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Working sessions animate with a `·*✢✳✶✻` spinner. Press `k` for a kanban board:
-
-```
-┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
-│ ⊘ Closed │  │ ◌ Idle   │  │ ○ Waiting │  │ ◉ Approve│  │ ● Working│
-│   (2)    │  │   (1)    │  │   (0)    │  │   (1)    │  │   (2)    │
-├──────────┤  ├──────────┤  │          │  ├──────────┤  ├──────────┤
-│ auth-    │  │ refactor-│  │    —     │  │ gmail-   │  │ ✻ monitor│
-│ work     │  │ module   │  │          │  │ cleanup  │  │ Editing… │
-│          │  │ Edited…  │  │          │  │          │  ├──────────┤
-│ old-     │  │          │  │          │  │          │  │ ✶ deploy │
-│ session  │  │          │  │          │  │          │  │ Running… │
-└──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘
-```
+Working sessions animate with a `·*✢✳✶✻` spinner. Status is deliberately just three states: working, needs your approval, or done N-ago — the finer-grained guesses (idle vs waiting vs background) turned out to be reconstructed from decaying timers and didn't mean anything you'd act on, so they're gone. Context %, tokens, cost, and the rest are still there as optional columns (`Ctrl+C`), off by default now that context is Claude's own job to manage.
 
 ## Install
 
@@ -92,7 +79,7 @@ Plain letters, typed in sequence, are a Finder-style type-ahead: they jump the c
 | `Ctrl+a` | Toggle subagent rows — see spawned agents nested under parents |
 | `Ctrl+z` | Show archived — include closed/old sessions with option to resume |
 | `Ctrl+n` | Send `/rename` to the selected session (patches unnamed sessions) |
-| `Ctrl+p` | Pin/unpin: pinned sessions stay visible even after they close |
+| `Ctrl+p` | Pin/unpin: a pinned session stays visible for a while after it closes (a step-down reminder to finish or unpin), then needs `Ctrl+z` like anything else old |
 | `P` | Broadcast `/proactive` to all sessions in the cursor's group |
 | `double-click` | Jump straight to the session's terminal (single-click highlights) |
 | `Shift+Up/Down`, `Shift+Click` | Extend multi-row selection |
@@ -101,7 +88,7 @@ Plain letters, typed in sequence, are a Finder-style type-ahead: they jump the c
 | `Ctrl+r` | Force refresh |
 | `Ctrl+q` | Quit |
 
-**Row markers**: `⊙` pinned · `↻` scheduled run (sdk/headless; collapsed to the latest per project by default) · a pulsing `●` means the session just flipped to waiting and wants your attention (clears when you jump to it, fades after 5 min).
+**Row markers**: `⊙` pinned · `↻` scheduled run (sdk/headless; collapsed to the latest per project by default) · a pulsing `●` means the session just flipped to needing your approval (clears when you jump to it, fades after 5 min).
 
 **Opting a session out**: name a session with `&ignore` anywhere in it (e.g. `/rename scratch&ignore`) and the monitor stops tracking it entirely: every view, subagents included, even if pinned. Remove the marker to track it again.
 
@@ -202,17 +189,19 @@ Preferences persist at `~/.claude/monitor-prefs.json`:
 
 | Column | What it shows | Default |
 |--------|---------------|---------|
-| Status | Animated status with spinner | on |
 | Session | Name or AI-generated summary | on |
-| Project | Working directory | on |
-| Model | Opus 4.6, Sonnet 4.6, etc. | on |
-| Context | Color bar + percentage | on |
-| Compacts | Context compaction count | on |
-| Tokens | Total input + output tokens | on |
-| Cost | Estimated USD spent | on |
+| Status | working / needs approval / done N-ago, with spinner | on |
+| Doing | Last real tool/activity, fact-derived from the transcript | on |
+| Duration | Session lifetime | off |
+| Project | Working directory | off |
+| Model | Opus 4.6, Sonnet 4.6, etc. | off |
+| Context | Color bar + percentage | off |
+| Compacts | Context compaction count | off |
+| Tokens | Total input + output tokens | off |
+| Cost | Estimated USD spent | off |
 | MCP | MCP tool call count | off |
 | Msgs | Human + assistant message count | off |
-| Duration | Session lifetime | off |
+| Active | Time since last activity | off |
 | Active | Time since last activity | on |
 | Doing | Current activity description | on |
 

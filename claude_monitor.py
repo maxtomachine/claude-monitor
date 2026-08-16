@@ -228,8 +228,8 @@ TEXT_GERUND_PATTERNS = [
 ALL_COLUMNS = {
     "session":   {"label": "Session",  "default": True},
     "status":    {"label": "Status",   "default": True},
-    "duration":  {"label": "Duration", "default": True},
     "doing":     {"label": "Doing",    "default": True},
+    "duration":  {"label": "Duration", "default": False},
     "project":   {"label": "Project",  "default": False},
     "model":     {"label": "Model",    "default": False},
     "context":   {"label": "Context",  "default": False},
@@ -264,16 +264,14 @@ class SortMode(Enum):
 
 
 STATUS_PRIORITY = {
-    "working": 0, "background": 1, "debriefing": 2, "needs_approval": 3,
-    "waiting": 4, "idle": 5, "closed": 6, "archived": 7,
+    "needs_approval": 0, "working": 1, "debriefing": 2,
+    "done": 3, "closed": 4, "archived": 5,
 }
 STATUS_DISPLAY = {
-    "working": ("● WORKING", "green"),
-    "background": ("◐ BUSY", "cyan"),
-    "debriefing": ("⏳ DEBRIEFING", "magenta"),
     "needs_approval": ("◉ APPROVE", "yellow"),
-    "waiting": ("○ WAITING", "dark_orange"),
-    "idle": ("◌ IDLE", "dim"),
+    "working": ("● WORKING", "green"),
+    "debriefing": ("⏳ DEBRIEFING", "magenta"),
+    "done": ("○ done", "dim"),
     "closed": ("⊘ CLOSED", "rgb(100,100,100)"),
     "archived": ("◇ ARCHIVED", "dim"),
 }
@@ -728,13 +726,21 @@ def parse_sessions(include_archived: bool = False,
         session_id = jsonl_path.stem
         is_pinned = session_id in pinned
 
+        # A pin only keeps a closed session in the default (non-history) view
+        # while it's recent (within archive_cutoff): that's the "step down"
+        # tier reminding you to finish or unpin before it goes stale. Past
+        # that, a pin behaves like any other old session: history mode only.
+        # Without this, a pin was a permanent, one-way exemption from every
+        # age filter, so 101 pins accumulated with zero cleanup pressure.
+        pin_recent = is_pinned and mtime >= archive_cutoff
+
         is_archived = mtime < active_cutoff
-        if is_archived and not include_archived and not is_pinned:
+        if is_archived and not include_archived and not pin_recent:
             if not _is_session_alive(session_id):
                 tg = time.perf_counter()
                 continue
             is_archived = False
-        if mtime < archive_cutoff and not _is_session_alive(session_id) and not is_pinned:
+        if mtime < archive_cutoff and not _is_session_alive(session_id) and not pin_recent:
             tg = time.perf_counter()
             continue
         idx = meta.get(session_id, {})
@@ -826,7 +832,7 @@ def parse_sessions(include_archived: bool = False,
             or (hook.get("title") if hook else "")
             or "Claude"
         )
-        status = "idle"
+        status = "done"
         if hook:
             hs = hook.get("state", "")
             if hs == "thinking":
@@ -899,7 +905,7 @@ def parse_sessions(include_archived: bool = False,
                 session_id=f"{sid}@{pid}",
                 title=pdata.get("name") or base.title,
                 status=("working" if pstatus == "busy" else
-                        "waiting" if pstatus == "idle" else base.status),
+                        "done" if pstatus == "idle" else base.status),
                 last_activity=updated or base.last_activity,
                 context_is_estimate=True,
                 status_name=pdata.get("name") or base.status_name,
@@ -1028,7 +1034,7 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
             )
 
     status = determine_status(session_id, data["last_assistant_time"], display_title, path)
-    bg_count = count_background_activity(path) if status == "background" else 0
+    bg_count = count_background_activity(path) if status == "working" else 0
 
     # Context %: how much context is USED (burnt).
     # Statusline cache stores remaining %, so we flip it.
@@ -1594,23 +1600,33 @@ def _thinking_is_stale(session_id: str, hook: dict, transcript_path: str) -> boo
 
 def determine_status(session_id: str, last_assistant_time: float,
                      display_title: str = "", transcript_path: str = "") -> str:
+    """Two states actually matter: needs_approval (blocking on you, set by
+    the PermissionRequest hook the instant it fires) and everything else.
+    A prior version tried to also distinguish working/waiting/idle/background
+    via a four-tier fallback stack with 5-minute decay timers reconstructed
+    from polled files. A real incident held a closed session "working" for
+    4.5 hours on a stale hook (EBC-Shell, 2026-06-04), and Max's own read
+    was that none of those distinctions told him anything he'd act on.
+    Collapsed to what's actually reliable: is Claude mid-turn right now
+    (hook "thinking", still gated by the staleness guard below), is it
+    blocked on you, or is it just done, reported as elapsed time by the
+    caller (see format_ago on s.last_activity) rather than bucketed here."""
     alive = _is_session_alive(session_id)
     if not alive:
         return "closed"
 
-    def _idle_or_background(base: str) -> str:
-        if transcript_path:
-            # Hook says idle, but if the main transcript itself is being
-            # appended to, the model is streaming — slash commands and a few
-            # other paths can miss UserPromptSubmit so the hook never flips.
-            try:
-                if time.time() - os.stat(transcript_path).st_mtime < 5:
-                    return "working"
-            except OSError:
-                pass
-            if count_background_activity(transcript_path) > 0:
-                return "background"
-        return base
+    def _is_streaming_or_background() -> bool:
+        if not transcript_path:
+            return False
+        # Hook says idle, but if the transcript itself is being appended to,
+        # the model is streaming: slash commands and a few other paths can
+        # miss UserPromptSubmit so the hook never flips.
+        try:
+            if time.time() - os.stat(transcript_path).st_mtime < 5:
+                return True
+        except OSError:
+            pass
+        return count_background_activity(transcript_path) > 0
 
     # Tier 1: hook state files (real-time, event-driven)
     hook = read_hook_state(session_id)
@@ -1619,41 +1635,18 @@ def determine_status(session_id: str, last_assistant_time: float,
         if hook_state == "thinking":
             if not _thinking_is_stale(session_id, hook, transcript_path):
                 return "working"
-            # Stale thinking: the hook froze mid-turn (Stop never fired, a
-            # known coverage gap for slash-command, subagent, and remote-bridge
-            # turns) while CC's own pid file says idle and the transcript has
-            # gone quiet. Trusting it unconditionally kept a closed remote
-            # session "working" for 4.5 hours (EBC-Shell, 2026-06-04). Treat
-            # like a settled idle: waiting, decaying to idle.
             mlog("DIVERGE", "stale_thinking", sid=session_id[:12],
                  hook_ts=hook.get("timestamp", ""),
                  entered=hook.get("state_entered_at", ""))
-            entered = hook.get("state_entered_at", "")
-            if entered:
-                try:
-                    elapsed = time.time() - parse_timestamp(entered)
-                    return _idle_or_background("idle" if elapsed > 300 else "waiting")
-                except (ValueError, TypeError):
-                    pass
-            return _idle_or_background("waiting")
+            return "done"
         if hook_state == "approval":
             return "needs_approval"
-        if hook_state == "exited":
-            # A subagent's SessionEnd fires with the parent's session_id and
-            # writes "exited" to the parent's state file even though the parent
-            # is still running. We already know `alive` is True here, so the
-            # exited signal is stale — fall through to activity-based status.
-            return _idle_or_background("waiting")
-        if hook_state == "idle":
-            # Decay waiting → idle after 5 minutes of inactivity
-            entered = hook.get("state_entered_at", "")
-            if entered:
-                try:
-                    elapsed = time.time() - parse_timestamp(entered)
-                    return _idle_or_background("idle" if elapsed > 300 else "waiting")
-                except (ValueError, TypeError):
-                    pass
-            return _idle_or_background("waiting")
+        if hook_state in ("exited", "idle"):
+            # "exited" here is stale: a subagent's SessionEnd can write it to
+            # the parent's state file while the parent is still running, and
+            # we already know `alive` is True. Either way, fall through to
+            # the transcript to see if something's actually still moving.
+            return "working" if _is_streaming_or_background() else "done"
 
     # Tier 2: signal files (legacy)
     if SIGNALS_DIR.exists():
@@ -1661,20 +1654,15 @@ def determine_status(session_id: str, last_assistant_time: float,
         if signal_file.exists():
             try:
                 s = signal_file.read_text().strip()
-                return {"working": "working", "permission": "needs_approval",
-                        "stop": "waiting"}.get(s, "idle")
+                return {"working": "working",
+                        "permission": "needs_approval"}.get(s, "done")
             except OSError:
                 pass
 
-    # Tier 3: time-based heuristics (fallback)
-    now = time.time()
-    if last_assistant_time > 0:
-        elapsed = now - last_assistant_time
-        if elapsed < 30:
-            return "working"
-        elif elapsed < 300:
-            return _idle_or_background("waiting")
-    return _idle_or_background("idle")
+    # Tier 3: time-based heuristic (fallback, no hook file at all)
+    if last_assistant_time > 0 and time.time() - last_assistant_time < 30:
+        return "working"
+    return "working" if _is_streaming_or_background() else "done"
 
 
 # ── Session identity resolver (single chokepoint + self-audit) ──────────────────
@@ -2089,11 +2077,10 @@ def generate_activity(s: Session) -> str:
     """Generate a status-aware activity description.
 
     Working → gerund:     "Editing claude_monitor.py"
-    Approval → prompt:    "Awaiting approval — Editing config"
-    Waiting → gerund:     "Editing claude_monitor.py"
-    Idle → past tense:    "Edited claude_monitor.py"
+    Approval → prompt:    "Awaiting approval"
+    Done → past tense:    "Edited claude_monitor.py"
     """
-    if s.status == "background":
+    if s.background_count > 0:
         n = s.background_count
         return f"{n} agent{'s' if n != 1 else ''} running"
 
@@ -2129,7 +2116,7 @@ def generate_activity(s: Session) -> str:
     # Apply status-based transformation
     if s.status == "needs_approval":
         return "Awaiting approval"
-    elif s.status in ("idle", "waiting", "closed"):
+    elif s.status in ("done", "closed"):
         return _to_past_tense(gerund)
     else:
         return gerund
@@ -2160,11 +2147,13 @@ def sort_sessions(sessions: list[Session], mode: SortMode) -> list[Session]:
 # ── Column rendering ──────────────────────────────────────────────────────────
 
 
-def render_status_cell(status: str, spin_idx: int = 0) -> str:
+def render_status_cell(status: str, spin_idx: int = 0, last_activity: float = 0.0) -> str:
     icon, color = STATUS_DISPLAY.get(status, ("?", "white"))
     if status == "working":
         frame = SPINNER_FRAMES[spin_idx % len(SPINNER_FRAMES)]
         return f"[#D97757]{frame}[/] [{color}]WORKING[/]"
+    if status == "done" and last_activity > 0:
+        return f"[{color}]{icon} {format_ago(last_activity)}[/]"
     return f"[{color}]{icon}[/]"
 
 
@@ -2188,7 +2177,7 @@ def render_row(s: Session, visible_cols: list[str], spin_idx: int = 0) -> list[s
     cells = []
     for col in visible_cols:
         if col == "status":
-            cells.append(render_status_cell(s.status, spin_idx))
+            cells.append(render_status_cell(s.status, spin_idx, s.last_activity))
         elif col == "session":
             if s.is_subagent:
                 cells.append(f"[dim]└─ {s.title}[/]")
@@ -2226,7 +2215,7 @@ def render_row(s: Session, visible_cols: list[str], spin_idx: int = 0) -> list[s
                 if len(activity) > DOING_MAX_WIDTH:
                     activity = activity[:DOING_MAX_WIDTH - 1] + "…"
                 activity_escaped = _escape_markup(activity)
-                if s.status == "idle":
+                if s.status == "done":
                     cells.append(f"[dim]{activity_escaped}[/]")
                 elif s.status == "needs_approval":
                     cells.append(f"[yellow]{activity_escaped}[/]")
@@ -2955,23 +2944,7 @@ def resume_session(session: Session) -> bool:
 
 _SPIN_BASE = "·*✢✳✶✻"
 SPINNER_FRAMES = _SPIN_BASE + _SPIN_BASE[-2:0:-1]  # ping-pong: up then back down
-STATUS_ICON = {
-    "working": None,  # animated — uses SPINNER_FRAMES
-    "needs_approval": "?",
-    "waiting": ".",
-    "idle": "◌",
-    "closed": "x",
-}
 
-STATUS_COLOR = {
-    "working": "#5B8A72",
-    "needs_approval": "#B0A04F",
-    "waiting": "#B07D4F",
-    "idle": "#606060",
-    "closed": "#404040",
-    "archived": "#404040",
-    "debriefing": "#8B668B",
-}
 
 def _get_api_key() -> str:
     """Find an Anthropic API key from standard locations."""
@@ -3543,8 +3516,8 @@ class DosFooter(Static):
 class StatsBar(Horizontal):
     def compose(self) -> ComposeResult:
         yield Label("", id="stats-working")
-        yield Label("", id="stats-waiting")
-        yield Label("", id="stats-idle")
+        yield Label("", id="stats-approve")
+        yield Label("", id="stats-done")
         yield Label("", id="stats-closed")
         yield Label("", id="stats-total-cost")
         yield Label("", id="stats-sort")
@@ -3553,14 +3526,14 @@ class StatsBar(Horizontal):
 
     def update_stats(self, sessions: list[Session], sort_mode: SortMode) -> None:
         working = sum(1 for s in sessions if s.status == "working")
-        waiting = sum(1 for s in sessions if s.status in ("waiting", "needs_approval"))
-        idle = sum(1 for s in sessions if s.status == "idle")
+        approve = sum(1 for s in sessions if s.status == "needs_approval")
+        done = sum(1 for s in sessions if s.status == "done")
         closed = sum(1 for s in sessions if s.status == "closed")
         total_cost = sum(s.cost for s in sessions)
 
         self.query_one("#stats-working", Label).update(f" [green]● {working} working[/]  ")
-        self.query_one("#stats-waiting", Label).update(f" [dark_orange]○ {waiting} waiting[/]  ")
-        self.query_one("#stats-idle", Label).update(f" [dim]◌ {idle} idle[/]  ")
+        self.query_one("#stats-approve", Label).update(f" [yellow]◉ {approve} approve[/]  " if approve else "")
+        self.query_one("#stats-done", Label).update(f" [dim]○ {done} done[/]  ")
         self.query_one("#stats-closed", Label).update(f" [rgb(100,100,100)]⊘ {closed} closed[/]  " if closed else "")
         self.query_one("#stats-total-cost", Label).update(f" [cyan]Σ ${total_cost:.2f}[/]  ")
         self.query_one("#stats-sort", Label).update(f" [magenta]sort: {sort_mode.label}[/]")
@@ -4176,9 +4149,9 @@ class ClaudeMonitor(App):
             if prev and prev != s.status:
                 mlog("status", "transition", sid=s.session_id[:12],
                      title=s.title, prev=prev, new=s.status)
-                if s.status == "waiting":
+                if s.status == "needs_approval":
                     self._bell[s.session_id] = {"rang_at": time.time(), "acked": False}
-            if s.status != "waiting":
+            if s.status != "needs_approval":
                 self._bell.pop(s.session_id, None)
             self._prev_statuses[s.session_id] = s.status
 

@@ -143,8 +143,8 @@ class TestGenerateActivity:
         result = generate_activity(s)
         assert result == "Reading foo.py"
 
-    def test_idle_session_past_tense(self):
-        s = make_session(status="idle", last_tool="Read",
+    def test_done_session_past_tense(self):
+        s = make_session(status="done", last_tool="Read",
                          last_tool_input={"file_path": "/tmp/foo.py"})
         result = generate_activity(s)
         assert result == "Read foo.py"

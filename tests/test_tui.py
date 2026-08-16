@@ -48,9 +48,9 @@ def sample_sessions():
     return [
         make_session(session_id="sess-1", title="First Session", status="working",
                      cost=2.50, tokens_in=50_000, tokens_out=10_000, context_pct=70),
-        make_session(session_id="sess-2", title="Second Session", status="idle",
+        make_session(session_id="sess-2", title="Second Session", status="done",
                      cost=1.00, tokens_in=20_000, tokens_out=5_000, context_pct=90),
-        make_session(session_id="sess-3", title="Third Session", status="waiting",
+        make_session(session_id="sess-3", title="Third Session", status="needs_approval",
                      cost=5.00, tokens_in=100_000, tokens_out=30_000, context_pct=30),
     ]
 
@@ -311,6 +311,7 @@ class TestSearch:
                 search = pilot.app.query_one("#search-bar", Input)
                 search.value = "First"
                 await pilot.pause()
+                await pilot.pause()  # filtering runs via refresh_sessions' worker thread
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count == 1
 
@@ -323,7 +324,9 @@ class TestSearch:
                 search = pilot.app.query_one("#search-bar", Input)
                 search.value = "First"
                 await pilot.pause()
+                await pilot.pause()  # filtering runs via refresh_sessions' worker thread
                 await pilot.press("escape")
+                await pilot.pause()
                 await pilot.pause()
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count >= 3
@@ -337,6 +340,7 @@ class TestSearch:
                 search = pilot.app.query_one("#search-bar", Input)
                 search.value = "nonexistent-session-xyz"
                 await pilot.pause()
+                await pilot.pause()  # filtering runs via refresh_sessions' worker thread
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count == 0
 
@@ -366,6 +370,7 @@ class TestSearch:
                 search = pilot.app.query_one("#search-bar", Input)
                 search.value = "First"
                 await pilot.pause()
+                await pilot.pause()  # filtering runs via refresh_sessions' worker thread
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count == 1
                 await pilot.press("down")
@@ -526,6 +531,7 @@ class TestEmptyState:
                 # Explicitly drive a refresh cycle too
                 pilot.app.refresh_sessions()
                 await pilot.pause()
+                await pilot.pause()  # refresh_sessions runs in a worker thread
                 assert pilot.app._row_map == []
 
 
@@ -913,13 +919,13 @@ class TestHideAndMultiSelect:
 
 class TestBell:
     async def test_no_bell_on_startup(self):
-        sessions = [make_session(session_id="s1", title="t", status="waiting")]
+        sessions = [make_session(session_id="s1", title="t", status="needs_approval")]
         with _mock_sessions(sessions):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
                 assert pilot.app._bell == {}
 
-    async def test_rings_on_working_to_waiting(self):
+    async def test_rings_on_working_to_needs_approval(self):
         s = make_session(session_id="s1", title="t", status="working")
         with patch("claude_monitor.parse_sessions", side_effect=[[s], [s], [s]]):
             original = ClaudeMonitor.show_groups._default
@@ -928,8 +934,9 @@ class TestBell:
                 async with ClaudeMonitor().run_test() as pilot:
                     await pilot.pause()
                     assert pilot.app._bell == {}
-                    s.status = "waiting"
+                    s.status = "needs_approval"
                     pilot.app.refresh_sessions()
+                    await pilot.pause()
                     await pilot.pause()
                     assert "s1" in pilot.app._bell
                     assert pilot.app._bell["s1"]["acked"] is False
@@ -944,8 +951,9 @@ class TestBell:
             try:
                 async with ClaudeMonitor().run_test() as pilot:
                     await pilot.pause()
-                    s.status = "waiting"
+                    s.status = "needs_approval"
                     pilot.app.refresh_sessions()
+                    await pilot.pause()
                     await pilot.pause()
                     assert "s1" in pilot.app._bell
                     pilot.app._ack_bell("s1")
@@ -962,12 +970,14 @@ class TestBell:
             try:
                 async with ClaudeMonitor().run_test() as pilot:
                     await pilot.pause()
-                    s.status = "waiting"
+                    s.status = "needs_approval"
                     pilot.app.refresh_sessions()
+                    await pilot.pause()
                     await pilot.pause()
                     assert "s1" in pilot.app._bell
                     s.status = "working"
                     pilot.app.refresh_sessions()
+                    await pilot.pause()
                     await pilot.pause()
                     assert "s1" not in pilot.app._bell
             finally:
