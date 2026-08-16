@@ -79,7 +79,8 @@ Plain letters, typed in sequence, are a Finder-style type-ahead: they jump the c
 | `Ctrl+a` | Toggle subagent rows — see spawned agents nested under parents |
 | `Ctrl+z` | Show archived — include closed/old sessions with option to resume |
 | `Ctrl+n` | Send `/rename` to the selected session (patches unnamed sessions) |
-| `Ctrl+p` | Pin/unpin: a pinned session stays visible for a while after it closes (a step-down reminder to finish or unpin), then needs `Ctrl+z` like anything else old |
+| `Ctrl+p` | Pin/unpin: a pin never expires on its own |
+| `Ctrl+o` | Hide/show pinned-but-closed sessions in the default view (doesn't touch the pin itself) |
 | `P` | Broadcast `/proactive` to all sessions in the cursor's group |
 | `double-click` | Jump straight to the session's terminal (single-click highlights) |
 | `Shift+Up/Down`, `Shift+Click` | Extend multi-row selection |

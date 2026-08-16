@@ -493,6 +493,67 @@ class TestArchived:
                 assert "resume" in option_ids
 
 
+class TestHideInactivePins:
+    """Fixture from 2026-08-16: pins must never expire on their own (Max:
+    "pins should stay until I unpin them") — Ctrl+O is a separate on/off
+    view filter, not an age-based decay, and it must never touch the pin
+    itself, only whether a pinned-but-closed row currently renders."""
+
+    def _sessions(self):
+        active = make_session(session_id="active-1", title="Active", status="working")
+        pinned_closed = make_session(session_id="pinned-1", title="Pinned Closed",
+                                     status="closed")
+        return [active, pinned_closed]
+
+    async def test_off_by_default_shows_closed_pin(self):
+        sessions = self._sessions()
+        with patch("claude_monitor.parse_sessions", return_value=sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                assert pilot.app.hide_inactive_pins is False
+                pilot.app._pinned = {"pinned-1"}
+                pilot.app.refresh_sessions()
+                await pilot.pause()
+                await pilot.pause()
+                titles = [s.title for s in pilot.app._row_map if s]
+                assert "Pinned Closed" in titles
+
+    async def test_toggle_hides_and_restores_closed_pin(self):
+        sessions = self._sessions()
+        with patch("claude_monitor.parse_sessions", return_value=sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                pilot.app._pinned = {"pinned-1"}
+                pilot.app.refresh_sessions()
+                await pilot.pause()
+                await pilot.pause()
+
+                await pilot.press("ctrl+o")
+                await pilot.pause()
+                await pilot.pause()
+                assert pilot.app.hide_inactive_pins is True
+                titles = [s.title for s in pilot.app._row_map if s]
+                assert "Pinned Closed" not in titles
+                assert "Active" in titles  # never touches non-pinned rows
+
+                await pilot.press("ctrl+o")
+                await pilot.pause()
+                await pilot.pause()
+                assert pilot.app.hide_inactive_pins is False
+                titles = [s.title for s in pilot.app._row_map if s]
+                assert "Pinned Closed" in titles  # the pin itself never expired
+
+    async def test_toggle_never_unpins(self):
+        sessions = self._sessions()
+        with patch("claude_monitor.parse_sessions", return_value=sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                pilot.app._pinned = {"pinned-1"}
+                await pilot.press("ctrl+o")
+                await pilot.pause()
+                assert "pinned-1" in pilot.app._pinned
+
+
 class TestSubagents:
     async def test_subagents_shown_when_toggled(self):
         sub = make_session(session_id="sub-1", title="agent-1", is_subagent=True,

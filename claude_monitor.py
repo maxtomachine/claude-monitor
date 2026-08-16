@@ -726,21 +726,18 @@ def parse_sessions(include_archived: bool = False,
         session_id = jsonl_path.stem
         is_pinned = session_id in pinned
 
-        # A pin only keeps a closed session in the default (non-history) view
-        # while it's recent (within archive_cutoff): that's the "step down"
-        # tier reminding you to finish or unpin before it goes stale. Past
-        # that, a pin behaves like any other old session: history mode only.
-        # Without this, a pin was a permanent, one-way exemption from every
-        # age filter, so 101 pins accumulated with zero cleanup pressure.
-        pin_recent = is_pinned and mtime >= archive_cutoff
-
+        # A pin is a permanent exemption from every age filter here. It stays
+        # until you unpin it, full stop (Max: "pins should stay until I unpin
+        # them"). Whether an inactive pin actually SHOWS in the default view
+        # is a separate, simpler question: the hide_inactive_pins toggle in
+        # _refresh_compute() answers it without touching age at all.
         is_archived = mtime < active_cutoff
-        if is_archived and not include_archived and not pin_recent:
+        if is_archived and not include_archived and not is_pinned:
             if not _is_session_alive(session_id):
                 tg = time.perf_counter()
                 continue
             is_archived = False
-        if mtime < archive_cutoff and not _is_session_alive(session_id) and not pin_recent:
+        if mtime < archive_cutoff and not _is_session_alive(session_id) and not is_pinned:
             tg = time.perf_counter()
             continue
         idx = meta.get(session_id, {})
@@ -3633,6 +3630,7 @@ class ClaudeMonitor(App):
         Binding("home", "table_home", "Home", show=False, priority=True),
         Binding("end", "table_end", "End", show=False, priority=True),
         Binding("ctrl+p", "toggle_pin", "Pin", show=False),
+        Binding("ctrl+o", "toggle_hide_inactive_pins", "Pins", show=False),
         Binding("backspace", "hide_selected", "Hide", show=False),
         Binding("delete", "hide_selected", "Hide", show=False),
         Binding("shift+up", "extend_selection(-1)", "Select↑", show=False, priority=True),
@@ -3645,6 +3643,7 @@ class ClaudeMonitor(App):
     show_scheduled: reactive[bool] = reactive(False)
     show_groups: reactive[bool] = reactive(True)
     show_detail: reactive[bool] = reactive(True)
+    hide_inactive_pins: reactive[bool] = reactive(False)
     debug_logging: reactive[bool] = reactive(True)  # ON by default
     sessions: list[Session] = []
     _flat_rows: list[Session] = []
@@ -4042,8 +4041,11 @@ class ClaudeMonitor(App):
                 sessions = kept
 
             if not self.show_archived:
-                sessions = [s for s in sessions
-                            if s.status != "closed" or s.session_id in self._pinned]
+                sessions = [
+                    s for s in sessions
+                    if s.status != "closed"
+                    or (s.session_id in self._pinned and not self.hide_inactive_pins)
+                ]
 
             if self._hidden:
                 sessions = [s for s in sessions if s.session_id not in self._hidden]
@@ -4754,6 +4756,19 @@ class ClaudeMonitor(App):
         self.refresh_sessions()
         self.notify(f"All sessions {'shown' if self.show_archived else 'recent only'}", timeout=3)
 
+    def action_toggle_hide_inactive_pins(self) -> None:
+        """Pins never expire on their own (Max: 'pins should stay until I
+        unpin them'). This is the simpler ask instead: an on/off lens over
+        the default view, not a decay timer. Off shows every pin regardless
+        of age or status, same as before pins existed at all; on hides a
+        pinned-but-closed session until you unpin it or open history mode."""
+        self.hide_inactive_pins = not self.hide_inactive_pins
+        self.refresh_sessions()
+        self.notify(
+            f"Inactive pins {'hidden' if self.hide_inactive_pins else 'shown'}",
+            timeout=3,
+        )
+
     def action_toggle_groups(self) -> None:
         self.show_groups = not self.show_groups
         self.refresh_sessions()
@@ -4909,6 +4924,7 @@ class ClaudeMonitor(App):
             "show_archived": self.show_archived,
             "show_groups": self.show_groups,
             "show_detail": self.show_detail,
+            "hide_inactive_pins": self.hide_inactive_pins,
         }
         save_prefs(prefs)
 
@@ -4926,6 +4942,7 @@ class ClaudeMonitor(App):
         self.show_archived = bool(vs.get("show_archived", self.show_archived))
         self.show_groups = bool(vs.get("show_groups", self.show_groups))
         self.show_detail = bool(vs.get("show_detail", self.show_detail))
+        self.hide_inactive_pins = bool(vs.get("hide_inactive_pins", self.hide_inactive_pins))
         if not self.show_detail:
             try:
                 self.query_one("#detail-panel", Static).display = False
