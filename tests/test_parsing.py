@@ -132,16 +132,19 @@ class TestDetermineStatus:
         assert determine_status("test-id", time.time() - 5) == "working"
 
     @patch("claude_monitor._is_session_alive", return_value=True)
-    def test_moderate_elapsed_is_waiting(self, _mock):
-        assert determine_status("test-id", time.time() - 60) == "waiting"
+    def test_moderate_elapsed_is_done(self, _mock):
+        """No more waiting/idle split by elapsed time — it's just done;
+        how long ago is reported separately (format_ago on last_activity),
+        not bucketed into a status value."""
+        assert determine_status("test-id", time.time() - 60) == "done"
 
     @patch("claude_monitor._is_session_alive", return_value=True)
-    def test_old_activity_is_idle(self, _mock):
-        assert determine_status("test-id", time.time() - 600) == "idle"
+    def test_old_activity_is_done(self, _mock):
+        assert determine_status("test-id", time.time() - 600) == "done"
 
     @patch("claude_monitor._is_session_alive", return_value=True)
     def test_no_activity(self, _mock):
-        assert determine_status("test-id", 0) == "idle"
+        assert determine_status("test-id", 0) == "done"
 
     @patch("claude_monitor._is_session_alive", return_value=False)
     def test_dead_process_is_closed(self, _mock):
@@ -185,23 +188,25 @@ class TestStaleThinking:
              patch("claude_monitor.read_hook_state", return_value=self._hook(5)):
             assert determine_status("sid", 0, "", self._old_transcript(tmp_path)) == "working"
 
-    def test_stale_thinking_all_witnesses_quiet_decays_to_idle(self, tmp_path):
+    def test_stale_thinking_all_witnesses_quiet_decays_to_done(self, tmp_path):
         sessions_dir = self._pid_file(tmp_path, "idle")
         with patch("claude_monitor._is_session_alive", return_value=True), \
              patch("claude_monitor.read_hook_state",
                    return_value=self._hook(4 * 3600)), \
              patch("claude_monitor._pid_map", {"sid": 63697}), \
              patch("claude_monitor.SESSIONS_DIR", sessions_dir):
-            assert determine_status("sid", 0, "", self._old_transcript(tmp_path)) == "idle"
+            assert determine_status("sid", 0, "", self._old_transcript(tmp_path)) == "done"
 
-    def test_stale_thinking_recent_entry_is_waiting(self, tmp_path):
+    def test_stale_thinking_recent_entry_is_also_done(self, tmp_path):
+        """No more waiting-vs-idle split by how recently 'thinking' froze —
+        stale is stale, reported as done either way."""
         sessions_dir = self._pid_file(tmp_path, "idle")
         with patch("claude_monitor._is_session_alive", return_value=True), \
              patch("claude_monitor.read_hook_state",
                    return_value=self._hook(600, entered_age_s=200)), \
              patch("claude_monitor._pid_map", {"sid": 63697}), \
              patch("claude_monitor.SESSIONS_DIR", sessions_dir):
-            assert determine_status("sid", 0, "", self._old_transcript(tmp_path)) == "waiting"
+            assert determine_status("sid", 0, "", self._old_transcript(tmp_path)) == "done"
 
     def test_old_hook_but_pid_busy_stays_working(self, tmp_path):
         sessions_dir = self._pid_file(tmp_path, "busy")
@@ -388,6 +393,26 @@ class TestSessionLiveness:
             assert resume_session(s) is True
         assert claude_monitor._pid_map_ts == 0
 
+    def test_resume_session_never_sends_synthetic_keystroke(self, tmp_path):
+        """Fixture from 2026-08-15: any System Events keystroke/keyCode sent
+        to open a new window/tab, real key or fake modifier, any combo,
+        fires Claude Nest's push-to-talk hotkey as a side effect (confirmed
+        live from a bare terminal osascript with no claude-monitor involved
+        at all — it reacts to synthetic input generically, not to a specific
+        key). resume_session() must open the window through Ghostty's own
+        newWindow scripting, never se.keystroke/se.keyCode."""
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text("{}\n")
+        s = make_session(session_id="sid-1", transcript_path=str(transcript))
+        with patch("claude_monitor.subprocess.run") as run, \
+             patch("claude_monitor._derive_cwd_from_transcript", return_value=None):
+            run.return_value = type("R", (), {"stdout": "Ghostty", "returncode": 0})()
+            resume_session(s)
+            jxa = run.call_args[0][0][-1]
+        assert "se.keystroke" not in jxa
+        assert "se.keyCode" not in jxa
+        assert "newWindow" in jxa
+
 
 class TestBackgroundActivity:
     def _layout(self, tmp_path, fresh: dict[str, list[str]], stale: dict[str, list[str]] | None = None):
@@ -446,22 +471,26 @@ class TestBackgroundActivity:
         import os as _os
         _os.utime(p, (old, old))
 
-    def test_status_idle_becomes_background(self, tmp_path):
+    def test_status_idle_with_background_activity_is_working(self, tmp_path):
+        """Background activity (a live subagent/workflow dir) folds into
+        'working' rather than a separate status — it's still busy, just not
+        the foreground turn. generate_activity() reports the count via
+        s.background_count, not the status value."""
         t = self._layout(tmp_path, {"subagents": ["a.jsonl"]})
         self._backdate(t)
         with patch("claude_monitor._is_session_alive", return_value=True), \
              patch("claude_monitor.read_hook_state",
                    return_value={"state": "idle", "state_entered_at": ""}):
-            assert determine_status("sid", 0, "", t) == "background"
+            assert determine_status("sid", 0, "", t) == "working"
 
-    def test_status_idle_stays_idle_without_activity(self, tmp_path):
+    def test_status_idle_without_activity_is_done(self, tmp_path):
         transcript = tmp_path / "sid.jsonl"
         transcript.touch()
         self._backdate(transcript)
         with patch("claude_monitor._is_session_alive", return_value=True), \
              patch("claude_monitor.read_hook_state",
                    return_value={"state": "idle", "state_entered_at": ""}):
-            assert determine_status("sid", 0, "", str(transcript)) == "waiting"
+            assert determine_status("sid", 0, "", str(transcript)) == "done"
 
     def test_status_idle_but_transcript_fresh_becomes_working(self, tmp_path):
         transcript = tmp_path / "sid.jsonl"

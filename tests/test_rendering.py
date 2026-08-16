@@ -25,10 +25,10 @@ class TestRenderRow:
         assert "WORKING" in cells[0]
         assert "green" in cells[0]
 
-    def test_idle_status(self):
-        s = make_session(status="idle")
+    def test_done_status(self):
+        s = make_session(status="done")
         cells = render_row(s, ["status"])
-        assert "IDLE" in cells[0]
+        assert "done" in cells[0]
 
     def test_session_title(self):
         s = make_session(title="My Session")
@@ -76,8 +76,8 @@ class TestRenderRow:
         plain = re.sub(r'\[.*?\]', '', cells[0]).replace("\\[", "[").replace("\\]", "]")
         assert len(plain) <= DOING_MAX_WIDTH
 
-    def test_doing_idle_is_dim(self):
-        s = make_session(status="idle", last_tool="Read",
+    def test_doing_done_is_dim(self):
+        s = make_session(status="done", last_tool="Read",
                          last_tool_input={"file_path": "/tmp/x.py"})
         cells = render_row(s, ["doing"])
         assert "[dim]" in cells[0]

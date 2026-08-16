@@ -48,6 +48,43 @@ Single file: `claude_monitor.py`. Key sections:
 5. **Screens** — `SessionMenu` (action menu on Enter), `ColumnPicker` (column toggle + reorder)
 6. **Main app** — `ClaudeMonitor(App)` with keybindings, refresh loop, search, sort
 
+## Status is two states, deliberately
+
+`determine_status()` used to try to distinguish working/waiting/idle/background
+via a four-tier fallback stack with 5-minute decay timers reconstructed from
+polled hook files. A real incident held a closed session "working" for 4.5
+hours on a stale hook (EBC-Shell, 2026-06-04), and in practice the finer
+distinctions didn't tell Max anything he'd act on: he'd stopped watching the
+monitor for that and used macOS's own native notifications instead, fired
+directly from inside the running Claude process rather than reconstructed.
+
+Collapsed (2026-08-15) to what's actually reliable: `needs_approval` (set the
+instant the `PermissionRequest` hook fires, real and event-driven, no decay)
+and everything else, reported as `done <elapsed>` via `format_ago` on
+`last_activity` rather than bucketed into idle/waiting/background categories.
+Background subagent/workflow activity folds into `working` (a session running
+something in the background is still busy) rather than its own status; the
+count still surfaces via `s.background_count` in the Doing column. The bell
+(`self._bell`, the pulsing `●` that flags a row) now rings on `needs_approval`
+transitions only, not the old noisy "waiting" transition every session passed
+through constantly.
+
+Column defaults changed to match: `duration` moved from on to off (`session`,
+`status`, `doing` are the only defaults now). `doing` is fact-derived from
+the transcript's last real tool call, not a guess, so it earns its default
+slot in a way the old inferred sub-statuses never did.
+
+## Pins step down, they don't last forever
+
+A pin used to be a permanent, unconditional exemption from every age filter.
+101 pins accumulated with zero cleanup pressure, since nothing ever pushed one
+out of view. A pin now only survives past the normal 7-day `archive_cutoff`
+while it's within that window (`pin_recent` in `parse_sessions()`); past that
+it needs `Ctrl+z` like any other old session. Within the window it still shows
+unconditionally, rendered dim once its status is `closed` (existing bold/dim
+logic, unchanged), a visible "step down" that reminds you to finish or unpin
+before it drops out.
+
 ## Current keybindings
 
 Plain letters (no modifier) are reserved for the type-ahead group jump below, so every command sits on `Ctrl+letter` instead. `K`/`R`/`P` are the three exceptions: they were already Shift-bound and don't collide with a bare letter.
@@ -70,7 +107,7 @@ Plain letters (no modifier) are reserved for the type-ahead group jump below, so
 | `R` | Restart monitor (picks up code changes) |
 | `Ctrl+j` | Cursor down |
 | `Ctrl+n` | Send `/rename` to selected session |
-| `Ctrl+p` | Pin/unpin session (pinned stays visible after close) |
+| `Ctrl+p` | Pin/unpin session (pinned stays visible for a while after close, then drops to `Ctrl+z` history like any old session) |
 | `P` | Broadcast `/proactive` to all sessions in cursor's group |
 | `PageUp` / `PageDown` | Jump to previous/next group header |
 | `Home` / `End` | Jump to first/last row |
@@ -104,6 +141,8 @@ This project layers multiple technologies in unusual ways: bash statusline scrip
 3. **The blast radius is invisible.** Editing the context bar section can break the quota bar section 100 lines away because they share the same responsive variable. Editing a JXA window-raise script can break tab switching because z-order changes between reads.
 
 **Before editing any section**, read the full surrounding context to understand what else depends on the same variables, ordering, or state. After making changes, visually verify ALL parts of the statusline or TUI — not just the part you changed.
+
+5. **Never send System Events keystroke/keyCode to open a new window/tab.** Confirmed live 2026-08-15: any Accessibility-injected keyboard event, real key or fake modifier, any combo (Cmd+T, Cmd+N tested), fires Claude Nest's push-to-talk hotkey as a side effect, even from a plain terminal `osascript` with no claude-monitor involved at all. It is not about which key is sent; it is about the event being synthetic. `resume_session()` opens the window through Ghostty's own `newWindow({withConfiguration: {command: ...}})` scripting instead, confirmed clean against the same live reproduction. If a future change needs to simulate typing into a terminal app again, retest against Nest first.
 
 4. **Any action that calls `refresh_sessions()` must preserve cursor position.** The refresh path restores the cursor by `_selected_key` (the sid under the cursor when refresh was scheduled). If your action removes/filters/re-sorts rows such that the cursor's sid is no longer in the new table, the cursor silently resets to row 0. Before calling `refresh_sessions()`, move the cursor to a row that will survive the refresh — or set `_selected_key` to a survivor's sid directly.
 
