@@ -115,7 +115,7 @@ Plain letters, typed in sequence, are a Finder-style type-ahead: they jump the c
 - **Debrief & close** — run `/debrief` then close the tab
 - **Kill process** — SIGTERM the Claude process
 
-If jump-to-terminal can't find the window (renamed tab, moved to a different space), it falls back to opening a new tab and resuming the session there.
+If jump-to-terminal can't find the window (renamed tab, moved to a different space), it falls back to opening a new Ghostty window and resuming the session there, launched through Ghostty's own scripting rather than a simulated keystroke (see CLAUDE.md).
 
 ### 2. The Statusline (HUD)
 

@@ -388,6 +388,26 @@ class TestSessionLiveness:
             assert resume_session(s) is True
         assert claude_monitor._pid_map_ts == 0
 
+    def test_resume_session_never_sends_synthetic_keystroke(self, tmp_path):
+        """Fixture from 2026-08-15: any System Events keystroke/keyCode sent
+        to open a new window/tab, real key or fake modifier, any combo,
+        fires Claude Nest's push-to-talk hotkey as a side effect (confirmed
+        live from a bare terminal osascript with no claude-monitor involved
+        at all — it reacts to synthetic input generically, not to a specific
+        key). resume_session() must open the window through Ghostty's own
+        newWindow scripting, never se.keystroke/se.keyCode."""
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text("{}\n")
+        s = make_session(session_id="sid-1", transcript_path=str(transcript))
+        with patch("claude_monitor.subprocess.run") as run, \
+             patch("claude_monitor._derive_cwd_from_transcript", return_value=None):
+            run.return_value = type("R", (), {"stdout": "Ghostty", "returncode": 0})()
+            resume_session(s)
+            jxa = run.call_args[0][0][-1]
+        assert "se.keystroke" not in jxa
+        assert "se.keyCode" not in jxa
+        assert "newWindow" in jxa
+
 
 class TestBackgroundActivity:
     def _layout(self, tmp_path, fresh: dict[str, list[str]], stale: dict[str, list[str]] | None = None):
