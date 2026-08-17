@@ -553,6 +553,37 @@ class TestHideInactivePins:
                 await pilot.pause()
                 assert "pinned-1" in pilot.app._pinned
 
+    async def test_hiding_inactive_pin_does_not_demote_active_groupmate(self):
+        """Fixture from 2026-08-16 (Max: "ctrl o is turning off some (only
+        some) of the active pins"). A 2-member group loses its only inactive
+        member to the hide filter; its still-visible active member must stay
+        under its own group header, not fold into 'ungrouped' just because
+        the hidden filter made the group LOOK like a singleton."""
+        active = make_session(session_id="active-pin", title="strategy-a", status="working")
+        closed_pinned = make_session(session_id="closed-pin", title="strategy-b",
+                                     status="closed")
+        with patch("claude_monitor.parse_sessions", return_value=[active, closed_pinned]):
+            original = ClaudeMonitor.show_groups._default
+            ClaudeMonitor.show_groups._default = True
+            try:
+                async with ClaudeMonitor().run_test(size=(200, 50)) as pilot:
+                    await pilot.pause()
+                    pilot.app._pinned = {"active-pin", "closed-pin"}
+                    pilot.app.refresh_sessions()
+                    await pilot.pause()
+                    await pilot.pause()
+                    assert pilot.app._group_counts.get("strategy") == 2
+
+                    await pilot.press("ctrl+o")
+                    await pilot.pause()
+                    await pilot.pause()
+                    assert pilot.app._group_counts.get("strategy") == 1
+                    assert "ungrouped" not in pilot.app._group_counts
+                    titles = [s.title for s in pilot.app._row_map if s]
+                    assert "strategy-a" in titles
+            finally:
+                ClaudeMonitor.show_groups._default = original
+
 
 class TestSubagents:
     async def test_subagents_shown_when_toggled(self):

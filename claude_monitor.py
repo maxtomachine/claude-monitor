@@ -4040,6 +4040,26 @@ class ClaudeMonitor(App):
                 kept.extend(latest.values())
                 sessions = kept
 
+            # True group sizes, from the set as if hide_inactive_pins were off:
+            # a group's real membership must never depend on which of its
+            # members happen to be hidden right now, or hiding an inactive
+            # pin silently demotes its still-visible, still-active groupmate
+            # from a named header down into "ungrouped" (observed live
+            # 2026-08-16: a 2-member group loses its inactive pin, its
+            # active member drops to ungrouped, reads as the active pin
+            # itself having vanished).
+            if not self.show_archived:
+                sessions_kept_regardless = [
+                    s for s in sessions
+                    if s.status != "closed" or s.session_id in self._pinned
+                ]
+                true_group_sizes: dict[str, int] = {}
+                for s in sessions_kept_regardless:
+                    key = _group_key(s.title)
+                    true_group_sizes[key] = true_group_sizes.get(key, 0) + 1
+            else:
+                true_group_sizes = {}
+
             if not self.show_archived:
                 sessions = [
                     s for s in sessions
@@ -4074,7 +4094,11 @@ class ClaudeMonitor(App):
                 groups: dict[str, list[Session]] = {}
                 for s in flat:
                     groups.setdefault(_group_key(s.title), []).append(s)
-                singles = [k for k, v in groups.items() if len(v) < 2]
+                # A key's TRUE size (true_group_sizes) decides the fold, not
+                # its currently-visible count: a group hiding_inactive_pins
+                # shrank to one member is still a real group, not a singleton.
+                singles = [k for k, v in groups.items()
+                           if true_group_sizes.get(k, len(v)) < 2]
                 if singles:
                     ungrouped = groups.setdefault("ungrouped", [])
                     for k in singles:
