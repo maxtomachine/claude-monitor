@@ -74,6 +74,27 @@ Column defaults changed to match: `duration` moved from on to off (`session`,
 the transcript's last real tool call, not a guess, so it earns its default
 slot in a way the old inferred sub-statuses never did.
 
+### READY has a read/unread state
+
+Jumping to a `done` session (via the menu, double-click, or `Ctrl+Shift+N`)
+without sending it anything acknowledges it: the status cell stays bold and
+still says READY, but moves off `bright_yellow` to a mint (`READY_SEEN_COLOR`,
+`#8FD9B6`), and the row title unbolds. It's the same distinction email gives
+read mail, applied to "have you already glanced at this one" rather than "is
+it actually still waiting on you" (Max, 2026-08-16: "a sort of read/unread
+filter"). First cut kept the status yellow and only unbolded the row, then
+Max asked for the color itself to change, then clarified it should stay bold
+doing so ("it can still be bold and ready but not yellow") — the version
+above is the one that shipped.
+
+The acknowledgment (`_mark_ready_seen()`) is persisted to `monitor-prefs.json`
+under `acked_ready`, not held in memory, because `Ctrl+Shift+N` runs as its
+own short-lived process outside the running monitor and can only tell it
+about a jump by writing it to disk; the running monitor rereads and prunes
+that list (to sessions still actually `done`) on every refresh. Only an
+*actual* jump marks a session seen. Plain `n` (below) never does, on purpose:
+it's pure cursor navigation, not a visit.
+
 ## Pins are permanent; hiding inactive ones is a separate toggle
 
 A pin is an unconditional exemption from every age filter in `parse_sessions()`,
@@ -106,7 +127,7 @@ status check the UI already uses, not a liveness check of its own.
 
 ## Current keybindings
 
-Plain letters (no modifier) are reserved for the type-ahead group jump below, so every command sits on `Ctrl+letter` instead. `K`/`R`/`P` are the three exceptions: they were already Shift-bound and don't collide with a bare letter.
+Plain letters (no modifier) are reserved for the type-ahead group jump below, so every command sits on `Ctrl+letter` instead. `K`/`R`/`P` were already Shift-bound and don't collide with a bare letter. `n` is a fourth, deliberate exception (Max, 2026-08-16), at the cost of no group name starting with "n" being reachable via type-ahead. It was first built to jump immediately, single-keystroke; Max caught and reversed that ("n in monitor should just move the highlighted row... n-Enter-Enter would also jump but not just naked n") — plain `n` only moves the cursor, `Ctrl+Shift+N` is the actual jump command, usable from inside the monitor or anywhere else on the machine.
 
 `Ctrl+h` and `Ctrl+i` are NOT usable bindings: the plain xterm input protocol Textual speaks encodes them identically to Backspace and Tab (no Kitty/enhanced-keyboard negotiation in `drivers/linux_driver.py`), so a binding on either is unreachable, not merely buggy. History and the preview panel sit on `z`/`v` instead. `Ctrl+s`/`Ctrl+q` were briefly suspected of the same problem (they're the classic XON/XOFF flow-control bytes) but `linux_driver.py` explicitly clears `IXON`/`IXOFF`, and both work; a failure to fire is a symptom of testing nested inside tmux, not a real collision.
 
@@ -128,6 +149,8 @@ Plain letters (no modifier) are reserved for the type-ahead group jump below, so
 | `Ctrl+n` | Send `/rename` to selected session |
 | `Ctrl+p` | Pin/unpin session (a pin never expires on its own) |
 | `Ctrl+o` | Hide/show pinned-but-inactive (archived or closed) sessions in the default view (the pin itself is untouched either way) |
+| `n` | Move the cursor to the next session that needs you (needs_approval, then done, oldest-waiting first), cycling from wherever the cursor is now. Doesn't jump: follow with `Enter` → pick Jump to actually go there |
+| `Ctrl+Shift+N` (global, via `skhd`) | Instantly jump to the next session that needs you, from anywhere on the machine, no monitor window shown — `claude-monitor --jump-next`. Shares a persisted queue position (`next_cursor` in `monitor-prefs.json`) so repeated presses walk the whole queue rather than repeating |
 | `P` | Broadcast `/proactive` to all sessions in cursor's group |
 | `PageUp` / `PageDown` | Jump to previous/next group header |
 | `Home` / `End` | Jump to first/last row |

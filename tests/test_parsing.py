@@ -19,6 +19,9 @@ from claude_monitor import (
     read_hook_state,
     read_session_memory_title,
     resume_session,
+    find_next_actionable,
+    dedupe_scheduled_sessions,
+    _mark_ready_seen,
     _resolve_match_candidates,
     _pid_is_claude,
     _is_session_alive,
@@ -779,3 +782,113 @@ class TestGroupKey:
         assert _group_key("general") == "general"
         assert _group_key("") == "ungrouped"
         assert _group_key("@") == "ungrouped"
+
+
+class TestFindNextActionable:
+    """Fixture from 2026-08-16: "n" (in-app) and Ctrl+Shift+N (from anywhere
+    on the machine) share this exact selection so they are one feature, not
+    two independent reimplementations of "what needs you"."""
+
+    def test_no_actionable_sessions_returns_none(self):
+        sessions = [make_session(session_id="a", status="working"),
+                    make_session(session_id="b", status="closed")]
+        assert find_next_actionable(sessions, None) is None
+
+    def test_first_call_returns_first_by_priority_then_age(self):
+        older_done = make_session(session_id="done-old", status="done", last_activity=100)
+        newer_done = make_session(session_id="done-new", status="done", last_activity=200)
+        approval = make_session(session_id="approve", status="needs_approval", last_activity=150)
+        sessions = [older_done, newer_done, approval]
+        # needs_approval outranks done regardless of age
+        assert find_next_actionable(sessions, None).session_id == "approve"
+
+    def test_done_sorted_oldest_first_when_no_approval(self):
+        older = make_session(session_id="older", status="done", last_activity=100)
+        newer = make_session(session_id="newer", status="done", last_activity=200)
+        assert find_next_actionable([newer, older], None).session_id == "older"
+
+    def test_cycles_from_after_sid(self):
+        a = make_session(session_id="a", status="done", last_activity=100)
+        b = make_session(session_id="b", status="done", last_activity=200)
+        c = make_session(session_id="c", status="done", last_activity=300)
+        sessions = [a, b, c]
+        assert find_next_actionable(sessions, "a").session_id == "b"
+        assert find_next_actionable(sessions, "b").session_id == "c"
+
+    def test_wraps_around_after_last(self):
+        a = make_session(session_id="a", status="done", last_activity=100)
+        b = make_session(session_id="b", status="done", last_activity=200)
+        assert find_next_actionable([a, b], "b").session_id == "a"
+
+    def test_unknown_after_sid_starts_from_first(self):
+        a = make_session(session_id="a", status="done", last_activity=100)
+        b = make_session(session_id="b", status="done", last_activity=200)
+        # e.g. the previously-cursored session closed and dropped off the
+        # actionable list entirely between one call and the next
+        assert find_next_actionable([a, b], "stale-sid-no-longer-actionable").session_id == "a"
+
+    def test_ignores_subagents(self):
+        parent = make_session(session_id="p", status="working")
+        sub = make_session(session_id="s", status="done", is_subagent=True)
+        assert find_next_actionable([parent, sub], None) is None
+
+
+class TestMarkReadySeen:
+    """The write half of the READY read/unread feature: jumping to a done
+    session persists that it's been seen; jumping to anything else is a
+    no-op, since the seen mark only ever means anything for status done."""
+
+    def test_marks_done_session_seen(self):
+        with patch("claude_monitor.load_prefs", return_value={}), \
+             patch("claude_monitor.save_prefs") as save:
+            _mark_ready_seen("sid-1", "done")
+            save.assert_called_once()
+            assert save.call_args[0][0]["acked_ready"] == ["sid-1"]
+
+    def test_ignores_non_done_status(self):
+        with patch("claude_monitor.load_prefs", return_value={}), \
+             patch("claude_monitor.save_prefs") as save:
+            _mark_ready_seen("sid-1", "working")
+            save.assert_not_called()
+
+    def test_already_seen_does_not_rewrite(self):
+        with patch("claude_monitor.load_prefs", return_value={"acked_ready": ["sid-1"]}), \
+             patch("claude_monitor.save_prefs") as save:
+            _mark_ready_seen("sid-1", "done")
+            save.assert_not_called()
+
+    def test_preserves_other_seen_sessions(self):
+        with patch("claude_monitor.load_prefs", return_value={"acked_ready": ["sid-1"]}), \
+             patch("claude_monitor.save_prefs") as save:
+            _mark_ready_seen("sid-2", "done")
+            saved = set(save.call_args[0][0]["acked_ready"])
+            assert saved == {"sid-1", "sid-2"}
+
+
+class TestDedupeScheduledSessions:
+    """Shared by the TUI's own refresh and jump_to_next_actionable() so the
+    headless --jump-next CLI sees the exact same candidate set the in-app
+    "n" key does — they diverged once before this was pulled out into one
+    function (2026-08-16), letting the two disagree on a shared cursor."""
+
+    def test_keeps_only_latest_per_cwd_title(self):
+        old = make_session(session_id="old", is_scheduled=True, cwd="/p", title="scout",
+                           last_activity=100)
+        new = make_session(session_id="new", is_scheduled=True, cwd="/p", title="scout",
+                           last_activity=200)
+        result = dedupe_scheduled_sessions([old, new], set())
+        ids = {s.session_id for s in result}
+        assert ids == {"new"}
+
+    def test_pinned_scheduled_session_always_kept(self):
+        old = make_session(session_id="old", is_scheduled=True, cwd="/p", title="scout",
+                           last_activity=100)
+        new = make_session(session_id="new", is_scheduled=True, cwd="/p", title="scout",
+                           last_activity=200)
+        result = dedupe_scheduled_sessions([old, new], {"old"})
+        ids = {s.session_id for s in result}
+        assert ids == {"old", "new"}
+
+    def test_non_scheduled_sessions_untouched(self):
+        s = make_session(session_id="s", is_scheduled=False)
+        assert dedupe_scheduled_sessions([s], set()) == [s]
