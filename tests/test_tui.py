@@ -499,12 +499,16 @@ class TestHideInactivePins:
     filter, not an age-based decay, and it must never touch the pin itself,
     only whether a pinned-but-inactive row currently renders. "Inactive" is
     exactly the existing bold/dim test render_row() already uses (Max: "the
-    same that makes a row not bold"), i.e. status in (archived, closed), not
-    "process not running right now": a pin whose terminal happens to be
-    closed at this instant (e.g. config-MCPs, resumed routinely) is still
-    active work and must not disappear, while "archived" (dim, same as
-    closed) was the actual majority case this filter first shipped missing
-    entirely, since it only checked for status == "closed"."""
+    same that makes a row not bold"): status in INACTIVE_STATUSES
+    (archived, closed). That's a snapshot of current render state, not
+    process liveness or usage history: a pin whose terminal happens to be
+    closed at this instant (e.g. config-MCPs, resumed routinely rather than
+    kept running) reads as inactive by this rule and IS hidden when the
+    toggle is on, same as it renders dim right now — the accepted tradeoff
+    of the simple rule Max asked for over a separate liveness check.
+    "archived" (dim, same as closed) was the actual majority case the
+    filter first shipped missing entirely, since it only checked for
+    status == "closed"."""
 
     def _sessions(self):
         active = make_session(session_id="active-1", title="Active", status="working")
@@ -583,6 +587,27 @@ class TestHideInactivePins:
                 await pilot.pause()
                 titles = [s.title for s in pilot.app._row_map if s]
                 assert "Archived Pin" not in titles
+
+    async def test_unpinned_archived_session_ignores_the_toggle(self):
+        """The near-regression this filter almost shipped with: widening
+        the toggle to catch "archived" pins by broadening the BASE "hide
+        closed sessions" filter would also start excluding archived,
+        UNPINNED sessions from the default view, which were never hidden
+        by default at all, toggle on or off. That base filter must be a
+        separate, untouched step from the hide_inactive_pins exclusion."""
+        unpinned_archived = make_session(session_id="unpinned-archived", title="Old Unpinned",
+                                         status="archived")
+        with patch("claude_monitor.parse_sessions", return_value=[unpinned_archived]):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                titles = [s.title for s in pilot.app._row_map if s]
+                assert "Old Unpinned" in titles
+
+                await pilot.press("ctrl+o")
+                await pilot.pause()
+                await pilot.pause()
+                titles = [s.title for s in pilot.app._row_map if s]
+                assert "Old Unpinned" in titles  # never pinned, toggle is irrelevant to it
 
     async def test_recently_done_pin_never_hidden(self):
         """A pin that just finished a turn ('done Xm ago') renders bold, the
