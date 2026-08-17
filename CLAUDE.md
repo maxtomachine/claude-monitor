@@ -81,10 +81,28 @@ by design: it stays until you unpin it, full stop (Max: "pins should stay
 until I unpin them"). An earlier version of this made pins auto-expire after
 7 days instead, which Max corrected: he wanted the simpler thing, an on/off
 filter, not an age-based decay he'd have to reason about. `Ctrl+O`
-(`hide_inactive_pins`, off by default) hides a pinned-but-closed session from
-the default view without touching the underlying pin at all; unpin it or flip
-the toggle back to see it again. `Ctrl+z` history mode still shows everything
-regardless of this toggle.
+(`hide_inactive_pins`, off by default) hides a pinned-but-inactive session
+from the default view without touching the underlying pin at all; unpin it
+or flip the toggle back to see it again. `Ctrl+z` history mode still shows
+everything regardless of this toggle.
+
+"Inactive" is exactly `render_row()`'s own bold/dim test (`status in
+("archived", "closed")`, Max: "the same that makes a row not bold"), not
+"process not running right now": two real bugs came from getting this
+narrower. First cut only matched `status == "closed"`, missing `"archived"`
+entirely, which is what most real pins age into (`is_archived` in
+`parse_sessions()` relabels anything not touched in the last day, completely
+independent of whether the pin is otherwise fine), so the toggle only ever
+caught a handful of the actual clutter. Fixing that by widening the *base*
+"hide closed sessions" filter to also exclude unpinned archived sessions was
+its own regression: archived sessions were never hidden by default at all,
+pinned or not, and that filter must stay untouched for anyone unpinned. The
+`hide_inactive_pins` exclusion has to be a separate clause layered on top of
+the original filter, not a rewrite of it. And a session pinned across many
+short-lived terminal sessions (e.g. config-MCPs, closed at any given moment
+but resumed routinely) is still active work even while its process happens
+to not be running right now, which is exactly why the criterion is the same
+status check the UI already uses, not a liveness check of its own.
 
 ## Current keybindings
 
@@ -109,7 +127,7 @@ Plain letters (no modifier) are reserved for the type-ahead group jump below, so
 | `Ctrl+j` | Cursor down |
 | `Ctrl+n` | Send `/rename` to selected session |
 | `Ctrl+p` | Pin/unpin session (a pin never expires on its own) |
-| `Ctrl+o` | Hide/show pinned-but-closed sessions in the default view (the pin itself is untouched either way) |
+| `Ctrl+o` | Hide/show pinned-but-inactive (archived or closed) sessions in the default view (the pin itself is untouched either way) |
 | `P` | Broadcast `/proactive` to all sessions in cursor's group |
 | `PageUp` / `PageDown` | Jump to previous/next group header |
 | `Home` / `End` | Jump to first/last row |

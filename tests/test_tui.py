@@ -495,9 +495,16 @@ class TestArchived:
 
 class TestHideInactivePins:
     """Fixture from 2026-08-16: pins must never expire on their own (Max:
-    "pins should stay until I unpin them") — Ctrl+O is a separate on/off
-    view filter, not an age-based decay, and it must never touch the pin
-    itself, only whether a pinned-but-closed row currently renders."""
+    "pins should stay until I unpin them"). Ctrl+O is a separate on/off view
+    filter, not an age-based decay, and it must never touch the pin itself,
+    only whether a pinned-but-inactive row currently renders. "Inactive" is
+    exactly the existing bold/dim test render_row() already uses (Max: "the
+    same that makes a row not bold"), i.e. status in (archived, closed), not
+    "process not running right now": a pin whose terminal happens to be
+    closed at this instant (e.g. config-MCPs, resumed routinely) is still
+    active work and must not disappear, while "archived" (dim, same as
+    closed) was the actual majority case this filter first shipped missing
+    entirely, since it only checked for status == "closed"."""
 
     def _sessions(self):
         active = make_session(session_id="active-1", title="Active", status="working")
@@ -552,6 +559,50 @@ class TestHideInactivePins:
                 await pilot.press("ctrl+o")
                 await pilot.pause()
                 assert "pinned-1" in pilot.app._pinned
+
+    async def test_hides_archived_pin_not_just_closed(self):
+        """The bug actually reported: most real pins age past active_cutoff
+        and get relabeled 'archived' (a separate, dimmer status than
+        'closed', same rendering), and the filter's first version only ever
+        checked for 'closed', so it left the vast majority of a real pin
+        list untouched no matter the toggle."""
+        archived_pinned = make_session(session_id="pinned-archived", title="Archived Pin",
+                                       status="archived")
+        with patch("claude_monitor.parse_sessions", return_value=[archived_pinned]):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                pilot.app._pinned = {"pinned-archived"}
+                pilot.app.refresh_sessions()
+                await pilot.pause()
+                await pilot.pause()
+                titles = [s.title for s in pilot.app._row_map if s]
+                assert "Archived Pin" in titles
+
+                await pilot.press("ctrl+o")
+                await pilot.pause()
+                await pilot.pause()
+                titles = [s.title for s in pilot.app._row_map if s]
+                assert "Archived Pin" not in titles
+
+    async def test_recently_done_pin_never_hidden(self):
+        """A pin that just finished a turn ('done Xm ago') renders bold, the
+        same as working, and must count as active no matter how long it's
+        been since 'Xm ago' grows: this filter reads status, it never adds
+        its own separate staleness clock."""
+        done_pinned = make_session(session_id="pinned-done", title="Done Pin", status="done")
+        with patch("claude_monitor.parse_sessions", return_value=[done_pinned]):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                pilot.app._pinned = {"pinned-done"}
+                pilot.app.refresh_sessions()
+                await pilot.pause()
+                await pilot.pause()
+
+                await pilot.press("ctrl+o")
+                await pilot.pause()
+                await pilot.pause()
+                titles = [s.title for s in pilot.app._row_map if s]
+                assert "Done Pin" in titles
 
     async def test_hiding_inactive_pin_does_not_demote_active_groupmate(self):
         """Fixture from 2026-08-16 (Max: "ctrl o is turning off some (only

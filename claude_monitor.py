@@ -4061,10 +4061,24 @@ class ClaudeMonitor(App):
                 true_group_sizes = {}
 
             if not self.show_archived:
+                # "Inactive" is exactly the test render_row() already uses to
+                # decide bold vs dim (Max: "the same that makes a row not
+                # bold"): status in (archived, closed). But that test only
+                # governs whether hide_inactive_pins may hide a PINNED row.
+                # An unpinned, non-closed session (including "archived",
+                # which unlike "closed" was never hidden by default at all)
+                # must keep showing exactly as it always did; a session
+                # pinned across many short-lived terminal sessions (e.g.
+                # config-MCPs) is still active work even while its process
+                # happens to be closed at this exact moment.
                 sessions = [
                     s for s in sessions
-                    if s.status != "closed"
-                    or (s.session_id in self._pinned and not self.hide_inactive_pins)
+                    if not (
+                        self.hide_inactive_pins
+                        and s.status in ("archived", "closed")
+                        and s.session_id in self._pinned
+                    )
+                    and (s.status != "closed" or s.session_id in self._pinned)
                 ]
 
             if self._hidden:
