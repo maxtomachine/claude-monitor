@@ -276,6 +276,14 @@ STATUS_DISPLAY = {
     "archived": ("◇ ARCHIVED", "dim"),
 }
 
+# The one test for "this row is inactive": rendered dim instead of bold
+# (render_row), excluded from menus meant for live sessions, and what
+# hide_inactive_pins hides. Getting this tuple wrong at just one of its
+# call sites is exactly what caused two real bugs in the pin-hiding
+# feature (2026-08-16) — a single shared constant instead of the literal
+# repeated at each site.
+INACTIVE_STATUSES = ("archived", "closed")
+
 
 @dataclass
 class Session:
@@ -2181,7 +2189,7 @@ def render_row(s: Session, visible_cols: list[str], spin_idx: int = 0) -> list[s
             else:
                 # Live sessions render bold so they pop against the dim
                 # (archived) and dark-gray (closed) rows.
-                t = s.title if s.status in ("archived", "closed") else f"[bold]{s.title}[/bold]"
+                t = s.title if s.status in INACTIVE_STATUSES else f"[bold]{s.title}[/bold]"
                 if s.subagents:
                     t += f" [dim](+{len(s.subagents)})[/]"
                 cells.append(t)
@@ -3235,7 +3243,7 @@ class SessionMenu(ModalScreen[str]):
     def compose(self) -> ComposeResult:
         s = self.session
         options = []
-        if s.status in ("archived", "closed"):
+        if s.status in INACTIVE_STATUSES:
             options.append(Option("▶   Resume session", id="resume"))
         else:
             options.append(Option("🖥   Jump to terminal", id="jump"))
@@ -3247,7 +3255,7 @@ class SessionMenu(ModalScreen[str]):
         if s.remote_url:
             options.append(Option("🔗  Open remote control", id="remote"))
         options.append(Option("📂  Open transcript", id="transcript"))
-        if s.status not in ("archived", "closed"):
+        if s.status not in INACTIVE_STATUSES:
             options.append(Option("❌  Kill process", id="kill"))
         options.append(Option("─" * 26, id="sep", disabled=True))
         options.append(Option("◀   Back", id="close"))
@@ -4061,25 +4069,34 @@ class ClaudeMonitor(App):
                 true_group_sizes = {}
 
             if not self.show_archived:
-                # "Inactive" is exactly the test render_row() already uses to
-                # decide bold vs dim (Max: "the same that makes a row not
-                # bold"): status in (archived, closed). But that test only
-                # governs whether hide_inactive_pins may hide a PINNED row.
-                # An unpinned, non-closed session (including "archived",
-                # which unlike "closed" was never hidden by default at all)
-                # must keep showing exactly as it always did; a session
-                # pinned across many short-lived terminal sessions (e.g.
-                # config-MCPs) is still active work even while its process
-                # happens to be closed at this exact moment.
+                # Step 1: the base filter, unchanged from before
+                # hide_inactive_pins existed. "archived" was never hidden
+                # here, only "closed" (and only when unpinned) — that must
+                # stay true no matter what the toggle below does, or an
+                # unpinned archived session starts vanishing by default (a
+                # real regression this shipped with once already, caught
+                # before merge by widening this exact line instead of
+                # layering step 2 on top of it).
                 sessions = [
                     s for s in sessions
-                    if not (
-                        self.hide_inactive_pins
-                        and s.status in ("archived", "closed")
-                        and s.session_id in self._pinned
-                    )
-                    and (s.status != "closed" or s.session_id in self._pinned)
+                    if s.status != "closed" or s.session_id in self._pinned
                 ]
+                # Step 2: hide_inactive_pins, layered on top, never replacing
+                # step 1. "Inactive" is exactly render_row()'s own bold/dim
+                # test (Max: "the same that makes a row not bold"): status in
+                # INACTIVE_STATUSES. That's a snapshot of CURRENT render
+                # state, not usage history — a pin resumed routinely (e.g.
+                # config-MCPs) whose terminal happens to be closed at this
+                # exact moment reads as inactive by this rule and gets
+                # hidden when the toggle is on, the same as it renders dim
+                # in the table right now. That is the literal, accepted
+                # tradeoff of reusing the existing bold/dim test rather than
+                # a separate liveness or usage-history check.
+                if self.hide_inactive_pins:
+                    sessions = [
+                        s for s in sessions
+                        if not (s.status in INACTIVE_STATUSES and s.session_id in self._pinned)
+                    ]
 
             if self._hidden:
                 sessions = [s for s in sessions if s.session_id not in self._hidden]
@@ -4537,7 +4554,7 @@ class ClaudeMonitor(App):
         # Build detail content: archived summary, plan, or last assistant text
         detail_parts = [header]
 
-        if s.status in ("archived", "closed"):
+        if s.status in INACTIVE_STATUSES:
             detail_parts.append(
                 f"[dim]Project:[/] {s.project}  "
                 f"[dim]Cost:[/] ${s.cost:.2f}  "
@@ -4727,7 +4744,7 @@ class ClaudeMonitor(App):
         # Restrict to archived/closed — never hide a live session by accident
         eligible = {
             s.session_id for s in self._flat_rows
-            if s.session_id in target and s.status in ("archived", "closed")
+            if s.session_id in target and s.status in INACTIVE_STATUSES
         }
         if not eligible:
             self.notify("Nothing hideable under cursor (archived/closed only)",
@@ -4826,7 +4843,7 @@ class ClaudeMonitor(App):
             return
         s = self._row_map[cr]
         if (s is None
-                or s.status in ("archived", "closed")
+                or s.status in INACTIVE_STATUSES
                 or not _is_session_alive(s.session_id)):
             self.notify("Rename requires a running session", timeout=3)
             return
@@ -4899,7 +4916,7 @@ class ClaudeMonitor(App):
         members = [
             s for s in self._flat_rows
             if not s.is_subagent
-            and s.status not in ("archived", "closed")
+            and s.status not in INACTIVE_STATUSES
             and (_group_key(s.title) == gk
                  or (gk == "ungrouped" and _group_key(s.title) not in self._group_counts))
             and _is_session_alive(s.session_id)
@@ -4947,7 +4964,7 @@ class ClaudeMonitor(App):
         s = self._row_map[cr]
         if s is None:
             return
-        if s.status in ("archived", "closed"):
+        if s.status in INACTIVE_STATUSES:
             self.notify("Session not running", timeout=3)
             return
         self._do_rename(s, "action")
