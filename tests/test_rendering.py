@@ -23,12 +23,26 @@ class TestRenderRow:
         s = make_session(status="working")
         cells = render_row(s, ["status"])
         assert "WORKING" in cells[0]
-        assert "green" in cells[0]
+
+    def test_working_is_dim_not_shouting(self):
+        """A working session is self-sufficient and will surface itself the
+        moment it stops; the loud color belongs to what's actually waiting
+        on you (Max, 2026-08-16: "I need to pay attention to the ones that
+        are ready for me more than the ones that don't need me because they
+        are already whirring")."""
+        s = make_session(status="working")
+        cells = render_row(s, ["status"])
+        assert "dim" in cells[0]
 
     def test_done_status(self):
         s = make_session(status="done")
         cells = render_row(s, ["status"])
         assert "done" in cells[0]
+
+    def test_done_is_the_bright_one(self):
+        s = make_session(status="done")
+        cells = render_row(s, ["status"])
+        assert "bright_white" in cells[0]
 
     def test_session_title(self):
         s = make_session(title="My Session")

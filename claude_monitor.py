@@ -269,18 +269,25 @@ STATUS_PRIORITY = {
 }
 STATUS_DISPLAY = {
     "needs_approval": ("◉ APPROVE", "yellow"),
-    "working": ("● WORKING", "green"),
+    "working": ("● WORKING", "dim"),
     "debriefing": ("⏳ DEBRIEFING", "magenta"),
-    "done": ("○ done", "dim"),
+    "done": ("○ done", "bright_white"),
     "closed": ("⊘ CLOSED", "rgb(100,100,100)"),
     "archived": ("◇ ARCHIVED", "dim"),
 }
+# Brightness here tracks "does this need you", not "is something happening":
+# a working session is self-sufficient and will surface itself the moment it
+# stops, so it doesn't earn the loud color; a done session is exactly the one
+# sitting there waiting on you, so it does (Max, 2026-08-16: "I actually need
+# to pay attention to the ones that are ready for me more than the ones that
+# don't need me because they are already whirring"). needs_approval stays
+# yellow, the one state that's actually blocking, above both.
 
 # The one test for "this row is inactive": rendered dim instead of bold
 # (render_row), excluded from menus meant for live sessions, and what
 # hide_inactive_pins hides. Getting this tuple wrong at just one of its
 # call sites is exactly what caused two real bugs in the pin-hiding
-# feature (2026-08-16) — a single shared constant instead of the literal
+# feature (2026-08-16): a single shared constant instead of the literal
 # repeated at each site.
 INACTIVE_STATUSES = ("archived", "closed")
 
