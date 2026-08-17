@@ -1,6 +1,7 @@
 """Tests for transcript parsing and session building."""
 
 import json
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -20,12 +21,15 @@ from claude_monitor import (
     read_session_memory_title,
     resume_session,
     find_next_actionable,
+    _next_actionable_in_table_order,
     dedupe_scheduled_sessions,
     _mark_ready_seen,
     _resolve_match_candidates,
     _pid_is_claude,
+    _refresh_process_comm_cache,
     _is_session_alive,
     count_background_activity,
+    _drop_request_and_await_consumption,
 )
 from tests.helpers import make_session, make_transcript_jsonl
 
@@ -310,26 +314,69 @@ class TestHookState:
 
 
 class TestSessionLiveness:
-    def _ps_result(self, comm: str):
-        m = type("R", (), {"stdout": comm, "returncode": 0})()
+    """_pid_is_claude() used to spawn its own `ps -p <pid>` subprocess per
+    call; profiled 2026-08-16 against 136 real sessions, 236 such spawns
+    cost ~1.5s of a ~6.5s cold parse_sessions() (the "Ctrl+Shift+N feels
+    slow" complaint's second-biggest fixable chunk). Now backed by one
+    `ps -Ao pid=,comm=` snapshot per 2s (_refresh_process_comm_cache),
+    hence forcing _process_comm_ts to 0 in every test here: without it, a
+    cache warmed by an earlier test in the same run makes the mock below
+    never get called at all, and the test would pass by cache-hit accident
+    rather than by actually exercising the parsing."""
+
+    def _ps_result(self, pid: int, comm: str):
+        m = type("R", (), {"stdout": f"{pid} {comm}\n", "returncode": 0})()
         return m
 
+    def _force_cache_refresh(self):
+        import claude_monitor as cm
+        cm._process_comm_ts = 0
+
     def test_pid_is_claude_matches_cli(self):
-        with patch("claude_monitor.subprocess.run", return_value=self._ps_result("claude")):
+        self._force_cache_refresh()
+        with patch("claude_monitor.subprocess.run", return_value=self._ps_result(12345, "claude")):
             assert _pid_is_claude(12345) is True
 
     def test_pid_is_claude_rejects_recycled(self):
-        with patch("claude_monitor.subprocess.run", return_value=self._ps_result("mdworker_shared")):
+        self._force_cache_refresh()
+        with patch("claude_monitor.subprocess.run",
+                    return_value=self._ps_result(12345, "mdworker_shared")):
             assert _pid_is_claude(12345) is False
 
     def test_pid_is_claude_rejects_helpers(self):
         for comm in ("Claude Helper", "claude_crashpad_handler", "Claude.app", "claude-monitor"):
-            with patch("claude_monitor.subprocess.run", return_value=self._ps_result(comm)):
+            self._force_cache_refresh()
+            with patch("claude_monitor.subprocess.run", return_value=self._ps_result(12345, comm)):
                 assert _pid_is_claude(12345) is False, comm
 
     def test_pid_is_claude_dead_pid(self):
-        with patch("claude_monitor.subprocess.run", return_value=self._ps_result("")):
+        self._force_cache_refresh()
+        with patch("claude_monitor.subprocess.run",
+                    return_value=self._ps_result(1, "launchd")):
             assert _pid_is_claude(99999) is False
+
+    def test_pid_is_claude_falls_back_to_stale_cache_on_transient_failure(self):
+        """A momentary `ps` failure (timeout, resource limits) must not
+        wipe out an otherwise-good cache and make every session look dead."""
+        import claude_monitor as cm
+        self._force_cache_refresh()
+        with patch("claude_monitor.subprocess.run",
+                    return_value=self._ps_result(12345, "claude")):
+            assert _pid_is_claude(12345) is True
+        cm._process_comm_ts = 0
+        with patch("claude_monitor.subprocess.run", side_effect=OSError("boom")):
+            assert _pid_is_claude(12345) is True  # stale cache, not wiped
+
+    def test_refresh_process_comm_cache_parses_multiple_pids(self):
+        import claude_monitor as cm
+        self._force_cache_refresh()
+        out = "  1 /sbin/launchd\n12345 /opt/homebrew/bin/claude\n99999 mdworker_shared\n"
+        result = type("R", (), {"stdout": out, "returncode": 0})()
+        with patch("claude_monitor.subprocess.run", return_value=result):
+            _refresh_process_comm_cache()
+        assert cm._process_comm_cache[1] == "/sbin/launchd"
+        assert cm._process_comm_cache[12345] == "/opt/homebrew/bin/claude"
+        assert cm._process_comm_cache[99999] == "mdworker_shared"
 
     def test_alive_rejects_recycled_hook_pid(self):
         """Hook state has a PID, the PID is alive, but it's not a claude process
@@ -833,6 +880,62 @@ class TestFindNextActionable:
         assert find_next_actionable([parent, sub], None) is None
 
 
+class TestNextActionableInTableOrder:
+    """The "n" key's own selection, distinct from find_next_actionable()'s
+    urgency-priority cycling (used only by Ctrl+Shift+N, which has no
+    visible cursor to reason about). Walks flat_rows in its own order
+    (whatever the table is currently sorted/grouped by) so "n" never
+    passes over a row you can see is actionable to reach a more "urgent"
+    one further down (Max, 2026-08-17: "naked n just skipped a READY
+    claude row")."""
+
+    def test_no_current_index_starts_from_first_actionable(self):
+        a = make_session(session_id="a", status="working")
+        b = make_session(session_id="b", status="done")
+        assert _next_actionable_in_table_order([a, b], None).session_id == "b"
+
+    def test_walks_forward_from_current_index(self):
+        a = make_session(session_id="a", status="done")
+        b = make_session(session_id="b", status="done")
+        c = make_session(session_id="c", status="done")
+        assert _next_actionable_in_table_order([a, b, c], 0).session_id == "b"
+
+    def test_skips_non_actionable_rows_in_between(self):
+        a = make_session(session_id="a", status="done")
+        working = make_session(session_id="w", status="working")
+        c = make_session(session_id="c", status="done")
+        assert _next_actionable_in_table_order([a, working, c], 0).session_id == "c"
+
+    def test_never_jumps_past_an_earlier_actionable_row_for_a_later_one(self):
+        """The exact scenario the bug report matched: an old-code priority
+        cycle would land on a further, "more urgent" row and skip a
+        visually-adjacent READY one; table order must not do that."""
+        a = make_session(session_id="a", status="done", last_activity=400)
+        b = make_session(session_id="b", status="done", last_activity=100)  # "oldest"
+        c = make_session(session_id="c", status="done", last_activity=300)
+        d = make_session(session_id="d", status="done", last_activity=200)
+        # From b (index 1), table order says c is next; a priority-cycle
+        # sorted by last_activity (b, d, c, a) would have said d instead.
+        assert _next_actionable_in_table_order([a, b, c, d], 1).session_id == "c"
+
+    def test_wraps_around(self):
+        a = make_session(session_id="a", status="done")
+        b = make_session(session_id="b", status="done")
+        assert _next_actionable_in_table_order([a, b], 1).session_id == "a"
+
+    def test_empty_returns_none(self):
+        assert _next_actionable_in_table_order([], None) is None
+
+    def test_no_actionable_rows_returns_none(self):
+        a = make_session(session_id="a", status="working")
+        assert _next_actionable_in_table_order([a], 0) is None
+
+    def test_ignores_subagents(self):
+        parent = make_session(session_id="p", status="working")
+        sub = make_session(session_id="s", status="done", is_subagent=True)
+        assert _next_actionable_in_table_order([parent, sub], None) is None
+
+
 class TestMarkReadySeen:
     """The write half of the READY read/unread feature: jumping to a done
     session persists that it's been seen; jumping to anything else is a
@@ -892,3 +995,62 @@ class TestDedupeScheduledSessions:
     def test_non_scheduled_sessions_untouched(self):
         s = make_session(session_id="s", is_scheduled=False)
         assert dedupe_scheduled_sessions([s], set()) == [s]
+
+
+class TestDropRequestAndAwaitConsumption:
+    """The write half of Ctrl+Shift+N / --restart's fast path: drop a
+    unique token into the shared jump-request file and wait for a live
+    monitor's poller to consume it. Two bugs a review caught here
+    (2026-08-16): reporting success when a second overlapping request's
+    write was consumed instead of ours, and burning a full timeout before
+    falling back when no monitor is running at all."""
+
+    def _use_scratch_path(self, tmp_path, monkeypatch):
+        import claude_monitor as cm
+        scratch = tmp_path / "jump-request"
+        monkeypatch.setattr(cm, "JUMP_REQUEST_PATH", scratch)
+        return scratch
+
+    def test_returns_false_immediately_when_no_monitor_running(self, tmp_path, monkeypatch):
+        scratch = self._use_scratch_path(tmp_path, monkeypatch)
+        with patch("claude_monitor._a_monitor_is_running", return_value=False):
+            start = time.time()
+            result = _drop_request_and_await_consumption("__test__", timeout=1.0)
+            elapsed = time.time() - start
+        assert result is False
+        assert elapsed < 0.2  # must not burn the full timeout
+        assert not scratch.exists()  # never even wrote the request
+
+    def test_returns_true_when_consumed_unmodified(self, tmp_path, monkeypatch):
+        scratch = self._use_scratch_path(tmp_path, monkeypatch)
+
+        def consume():
+            time.sleep(0.05)
+            scratch.unlink(missing_ok=True)
+
+        with patch("claude_monitor._a_monitor_is_running", return_value=True):
+            threading.Thread(target=consume).start()
+            result = _drop_request_and_await_consumption("__test__", timeout=1.0, poll=0.01)
+        assert result is True
+
+    def test_returns_false_when_overwritten_by_another_request(self, tmp_path, monkeypatch):
+        """Two overlapping --jump-next presses (or one racing an unrelated
+        click-to-jump link) must not both report success when only one of
+        their writes was ever actually read by the poller."""
+        scratch = self._use_scratch_path(tmp_path, monkeypatch)
+
+        def clobber():
+            time.sleep(0.05)
+            scratch.write_text("__test__:someone-else:999")
+
+        with patch("claude_monitor._a_monitor_is_running", return_value=True):
+            threading.Thread(target=clobber).start()
+            result = _drop_request_and_await_consumption("__test__", timeout=1.0, poll=0.01)
+        assert result is False
+
+    def test_times_out_and_cleans_up_when_nothing_consumes_it(self, tmp_path, monkeypatch):
+        scratch = self._use_scratch_path(tmp_path, monkeypatch)
+        with patch("claude_monitor._a_monitor_is_running", return_value=True):
+            result = _drop_request_and_await_consumption("__test__", timeout=0.1, poll=0.02)
+        assert result is False
+        assert not scratch.exists()

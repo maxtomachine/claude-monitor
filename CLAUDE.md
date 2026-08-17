@@ -84,16 +84,30 @@ read mail, applied to "have you already glanced at this one" rather than "is
 it actually still waiting on you" (Max, 2026-08-16: "a sort of read/unread
 filter"). First cut kept the status yellow and only unbolded the row, then
 Max asked for the color itself to change, then clarified it should stay bold
-doing so ("it can still be bold and ready but not yellow") — the version
+doing so ("it can still be bold and ready but not yellow"); the version
 above is the one that shipped.
 
 The acknowledgment (`_mark_ready_seen()`) is persisted to `monitor-prefs.json`
 under `acked_ready`, not held in memory, because `Ctrl+Shift+N` runs as its
 own short-lived process outside the running monitor and can only tell it
-about a jump by writing it to disk; the running monitor rereads and prunes
-that list (to sessions still actually `done`) on every refresh. Only an
-*actual* jump marks a session seen. Plain `n` (below) never does, on purpose:
-it's pure cursor navigation, not a visit.
+about a jump by writing it to disk. Only an *actual* jump marks a session
+seen (every jump call site checks the jump/resume actually succeeded before
+calling `_mark_ready_seen()`, not just attempted it). Plain `n` (below)
+never does, on purpose: it's pure cursor navigation, not a visit.
+
+`_mark_ready_seen()` is the ONLY writer of `acked_ready`. The refresh cycle
+reads it fresh each pass (so a jump from a separate `--jump-next` process is
+picked up) and filters it to currently-`done` sessions for rendering, but
+that filtering must stay purely in-memory. An earlier version also wrote the
+filtered copy back to disk on every ~3s refresh, and that write raced
+`_mark_ready_seen()`'s own read-modify-write: a jump landing mid-refresh-cycle
+set the seen mark, and the refresh cycle's write (holding a prefs snapshot
+read before that jump) clobbered it back to unseen a moment later, repeating
+on every following cycle (Max, 2026-08-16: "my 'marked as read' doesn't seem
+to stay that way... they are turning yellow on me" / "turned yellow multiple
+times after a brief time as mint green"). If you ever need the refresh path
+to write this field again, don't: give it its own single-writer discipline
+instead of reintroducing a second read-modify-write on the same key.
 
 ## Pins are permanent; hiding inactive ones is a separate toggle
 
@@ -124,6 +138,34 @@ short-lived terminal sessions (e.g. config-MCPs, closed at any given moment
 but resumed routinely) is still active work even while its process happens
 to not be running right now, which is exactly why the criterion is the same
 status check the UI already uses, not a liveness check of its own.
+
+## Ctrl+Shift+N hands off to the running monitor instead of cold-scanning
+
+`claude-monitor --jump-next` used to call `parse_sessions()` itself, cold, in
+a brand-new process. Profiled 2026-08-16 against 136 real sessions: ~6.5s,
+almost entirely `scan_full_file()` re-parsing every transcript's JSONL from
+scratch with no cache warm from a prior run. That is the actual cause of
+"the hotkey is working but it's slow" (Max, 2026-08-16), not `focus_terminal_
+session()` (~0.3s) or anything else downstream.
+
+Fix: hand the request off to whichever monitor is already running instead.
+`_try_fast_jump_next()` drops the sentinel `__jump_next__` into the same
+`/tmp/claude-jump-request` file the click-to-jump HTTP listener already
+uses, which the running monitor's existing 200ms poller
+(`_check_jump_request`) picks up and serves from `self.sessions`, already
+warm from that instance's own 3-second refresh loop. Measured live: ~0.24s
+end to end. The cold `jump_to_next_actionable()` scan is now only a
+fallback for the case no monitor is running at all (rare in practice, since
+the whole point of this app is to have one open); a `--restart` flag drops
+a matching `__restart__` sentinel so a live monitor can be told to pick up
+code changes without a synthetic keystroke into its window (see the Nest
+warning below).
+
+`_pid_is_claude()` used to spawn its own `ps -p <pid>` subprocess per call;
+236 such calls cost ~1.5s of that same cold scan. Now backed by one
+`ps -Ao pid=,comm=` snapshot per 2 seconds (`_refresh_process_comm_cache()`,
+mirroring the existing `_refresh_pid_map()` pattern), looked up in memory
+per PID instead.
 
 ## Current keybindings
 

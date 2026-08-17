@@ -2,12 +2,15 @@
 
 from claude_monitor import (
     render_row,
+    render_status_cell,
     ALL_COLUMNS,
     get_visible_columns,
     get_column_order,
     DOING_MAX_WIDTH,
     Task,
     format_plan,
+    READY_COLOR_DARK,
+    READY_COLOR_LIGHT,
 )
 from tests.helpers import make_session
 
@@ -191,6 +194,40 @@ class TestFormatPlan:
         ]
         result = format_plan(tasks)
         assert "Working on it" in result
+
+
+class TestReadyColorFollowsTheme:
+    """Bug reported by Max (2026-08-17): "in light mode we need another
+    color than yellow since that's our default" — Gruvbox light's own
+    background is cream, so bright_yellow doesn't pop the way it does
+    against a dark background. dark=True (the default) keeps the existing
+    bright_yellow; dark=False swaps the unseen READY color to a popping
+    blue. The seen (mint) color is unaffected either way."""
+
+    def test_dark_theme_is_yellow(self):
+        cell = render_status_cell("done", dark=True)
+        assert READY_COLOR_DARK in cell
+
+    def test_light_theme_is_blue(self):
+        cell = render_status_cell("done", dark=False)
+        assert READY_COLOR_LIGHT in cell
+        assert READY_COLOR_DARK not in cell
+
+    def test_default_is_dark_for_backward_compatibility(self):
+        cell = render_status_cell("done")
+        assert READY_COLOR_DARK in cell
+
+    def test_seen_mint_color_unaffected_by_theme(self):
+        dark_seen = render_status_cell("done", seen=True, dark=True)
+        light_seen = render_status_cell("done", seen=True, dark=False)
+        assert dark_seen == light_seen
+
+    def test_render_row_threads_dark_through_to_status_cell(self):
+        s = make_session(session_id="a", title="Ready", status="done")
+        light_cells = render_row(s, ["status"], dark=False)
+        dark_cells = render_row(s, ["status"], dark=True)
+        assert READY_COLOR_LIGHT in light_cells[0]
+        assert READY_COLOR_DARK in dark_cells[0]
 
 
 class TestReadyReadUnread:

@@ -86,6 +86,21 @@ HOOK_STATE_DIR = Path.home() / ".claude" / "session-states"
 TASKS_DIR = Path.home() / ".claude" / "tasks"
 # Local HTTP listener for click-to-jump links (http://localhost:48624/jump/<sid8>)
 JUMP_HTTP_PORT = 48624
+# Dropped into the jump-request file by `claude-monitor --jump-next`
+# (Ctrl+Shift+N) instead of a real sid/title, so an already-running monitor
+# picks it up and jumps using its own warm session list.
+JUMP_NEXT_SENTINEL = "__jump_next__"
+# Dropped into the same request file by `claude-monitor --restart`, so an
+# already-running monitor can be told to pick up code changes (the same
+# thing Shift+R does) without a synthetic keystroke, which fires Claude
+# Nest's push-to-talk regardless of which key is sent (see CLAUDE.md).
+RESTART_SENTINEL = "__restart__"
+# The one request file both directions of this protocol use: the running
+# monitor's 200ms poller (_check_jump_request) reads it; --jump-next and
+# --restart write it. One module-level constant (not three separate
+# literals) so tests can monkeypatch a single name instead of three, and
+# never touch this real shared path on a machine with a live monitor.
+JUMP_REQUEST_PATH = Path("/tmp/claude-jump-request")
 SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 # Monitor-OWNED writable state (pins, hidden, prefs; log + instance records derive
 # from the same home). Overridable via MONITOR_STATE_HOME so a staging instance
@@ -283,10 +298,23 @@ STATUS_DISPLAY = {
 # don't need me because they are already whirring"). needs_approval stays
 # yellow, the one state that's actually blocking, above both.
 
+# STATUS_DISPLAY["done"]'s bright_yellow is the dark-theme color only. In
+# light mode (Gruvbox light's cream #fbf1c7 background), yellow is already
+# the theme's own dominant tone, so it doesn't pop the way it does against
+# a dark background (Max, 2026-08-17: "in light mode we need another color
+# than yellow since that's our default"); a vivid blue reads clearly
+# against cream instead. render_status_cell()/render_row() take a `dark`
+# flag and swap to this; StatsBar.update_stats() reads self.app.theme to
+# match. The mint "seen" color is unaffected: soft green reads fine on
+# both backgrounds, this is only about the loud, unseen READY color.
+READY_COLOR_DARK = "bright_yellow"
+READY_COLOR_LIGHT = "#007AFF"
+
 # READY read/unread (Max, 2026-08-16): jumping to a done session without
 # sending it anything acknowledges it. Still bold, still says READY, the
-# color just moves off yellow to mint so a glance tells you "already
-# looked at this one" without it reading as closed or any less real.
+# color just moves off yellow (or, in light mode, off blue) to mint so a
+# glance tells you "already looked at this one" without it reading as
+# closed or any less real.
 READY_SEEN_COLOR = "#8FD9B6"
 
 # The one test for "this row is inactive": rendered dim instead of bold
@@ -1180,17 +1208,45 @@ def _refresh_pid_map() -> None:
 _recently_resumed: dict[str, float] = {}  # sid -> timestamp (set by resume_session)
 _RESUME_GRACE = 60  # seconds to treat a resumed session as alive without a PID
 
+# One "ps -Ao pid,comm=" snapshot per refresh cycle instead of a "ps -p <pid>"
+# subprocess per session: profiled 2026-08-16 against 136 real sessions,
+# 236 individual spawns cost ~1.5s of parse_sessions()'s ~6.5s cold-scan
+# total, the single biggest fixable chunk after the JSONL parse itself.
+_process_comm_cache: dict[int, str] = {}
+_process_comm_ts: float = 0
+
+
+def _refresh_process_comm_cache() -> None:
+    global _process_comm_cache, _process_comm_ts
+    now = time.time()
+    if now - _process_comm_ts < 2:
+        return
+    cache: dict[int, str] = {}
+    try:
+        out = subprocess.run(
+            ["ps", "-Ao", "pid=,comm="],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            pid_str, _, comm = line.partition(" ")
+            try:
+                cache[int(pid_str)] = comm.strip().lower()
+            except ValueError:
+                continue
+    except (subprocess.SubprocessError, OSError):
+        return  # Keep the stale cache rather than wiping it on a transient failure.
+    _process_comm_cache = cache
+    _process_comm_ts = now
+
 
 def _pid_is_claude(pid: int) -> bool:
     """True iff PID is alive AND is a claude CLI process — guards against
     recycled PIDs where an old session's PID now belongs to e.g. mdworker."""
-    try:
-        comm = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "comm="],
-            capture_output=True, text=True, timeout=2,
-        ).stdout.strip().lower()
-    except (subprocess.SubprocessError, OSError):
-        return False
+    _refresh_process_comm_cache()
+    comm = _process_comm_cache.get(pid, "")
     return ("claude" in comm and "monitor" not in comm
             and "helper" not in comm and "crashpad" not in comm
             and ".app" not in comm)
@@ -2166,14 +2222,13 @@ def sort_sessions(sessions: list[Session], mode: SortMode) -> list[Session]:
 
 
 def render_status_cell(status: str, spin_idx: int = 0, last_activity: float = 0.0,
-                       seen: bool = False) -> str:
+                       seen: bool = False, dark: bool = True) -> str:
     icon, color = STATUS_DISPLAY.get(status, ("?", "white"))
     if status == "working":
         frame = SPINNER_FRAMES[spin_idx % len(SPINNER_FRAMES)]
         return f"[#D97757]{frame}[/] [{color}]WORKING[/]"
     if status == "done":
-        if seen:
-            color = READY_SEEN_COLOR
+        color = READY_SEEN_COLOR if seen else (READY_COLOR_DARK if dark else READY_COLOR_LIGHT)
         text = f"{icon} {format_ago(last_activity)}" if last_activity > 0 else icon
         return f"[bold {color}]{text}[/]"
     return f"[{color}]{icon}[/]"
@@ -2196,17 +2251,19 @@ def _group_key(name: str) -> str:
 
 
 def render_row(s: Session, visible_cols: list[str], spin_idx: int = 0,
-               acked_ready: "set[str] | None" = None) -> list[str]:
+               acked_ready: "set[str] | None" = None, dark: bool = True) -> list[str]:
     # READY read/unread (Max, 2026-08-16): jumping to a done session without
     # sending it anything acknowledges it. Still bold, still says READY,
-    # just off yellow to mint (render_status_cell) — the row title unbolds
-    # too, the same "seen" distinction email gives read mail: the color
-    # says what's true, the weight says whether you've already looked.
+    # just off the unseen color to mint (render_status_cell); the row title
+    # unbolds too, the same "seen" distinction email gives read mail: the
+    # color says what's true, the weight says whether you've already
+    # looked.
     seen_ready = bool(s.status == "done" and acked_ready and s.session_id in acked_ready)
     cells = []
     for col in visible_cols:
         if col == "status":
-            cells.append(render_status_cell(s.status, spin_idx, s.last_activity, seen=seen_ready))
+            cells.append(render_status_cell(s.status, spin_idx, s.last_activity,
+                                            seen=seen_ready, dark=dark))
         elif col == "session":
             if s.is_subagent:
                 cells.append(f"[dim]└─ {s.title}[/]")
@@ -2586,6 +2643,16 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
     return False
 
 
+# Read-time filtering (the refresh cycle intersects this against sessions
+# still actually "done") makes a stale entry inert, not wrong, so this cap
+# exists only to keep monitor-prefs.json from growing by one entry every
+# time a session is ever jumped to while READY, across the tool's whole
+# life on this machine, forever. Generous: nobody has this many sessions
+# genuinely READY and unseen at once, so evicting the oldest never drops
+# one that still matters.
+_ACKED_READY_CAP = 200
+
+
 def _mark_ready_seen(session_id: str, status: str) -> None:
     """Read/unread for READY rows (Max, 2026-08-16): jumping to a session
     while it's done acknowledges it, so its row unbolds without touching
@@ -2594,15 +2661,23 @@ def _mark_ready_seen(session_id: str, status: str) -> None:
     "n" key, and the headless --jump-next CLI) so all of them count as
     "you looked at it," not just one. Persisted rather than held in memory:
     --jump-next runs as its own short-lived process, so the running
-    monitor can only learn about that jump by reading it back from disk."""
+    monitor can only learn about that jump by reading it back from disk.
+    The single writer of acked_ready: the refresh cycle only ever reads and
+    filters it in memory (see _refresh_compute), never writes it back,
+    after an earlier version's write-back raced this function's own
+    read-modify-write and clobbered a just-added seen mark (Max, 2026-08-16:
+    "my 'marked as read' doesn't seem to stay that way")."""
     if status != "done":
         return
     prefs = load_prefs()
-    acked = set(prefs.get("acked_ready", []))
-    if session_id not in acked:
-        acked.add(session_id)
-        prefs["acked_ready"] = list(acked)
-        save_prefs(prefs)
+    acked = prefs.get("acked_ready", [])
+    if session_id in acked:
+        return
+    acked = acked + [session_id]
+    if len(acked) > _ACKED_READY_CAP:
+        acked = acked[-_ACKED_READY_CAP:]
+    prefs["acked_ready"] = acked
+    save_prefs(prefs)
 
 
 def focus_terminal_session(session: Session) -> bool:
@@ -3575,16 +3650,24 @@ class StatsBar(Horizontal):
         yield Input(placeholder="🔍 filter...", id="search-bar")
         yield Label("[dim]/ search[/]", id="search-hint")
 
-    def update_stats(self, sessions: list[Session], sort_mode: SortMode) -> None:
+    def update_stats(self, sessions: list[Session], sort_mode: SortMode,
+                     dark: bool = True) -> None:
         working = sum(1 for s in sessions if s.status == "working")
         approve = sum(1 for s in sessions if s.status == "needs_approval")
         done = sum(1 for s in sessions if s.status == "done")
         closed = sum(1 for s in sessions if s.status == "closed")
         total_cost = sum(s.cost for s in sessions)
 
+        # `dark` is the caller's job to supply (from _refresh_apply's own
+        # sys_dark, the same value render_row()/render_status_cell() use),
+        # not this method's to independently derive from self.app.theme:
+        # two separately-computed light/dark checks are only coincidentally
+        # in sync today via _sync_system_theme, and would silently diverge
+        # the moment either path changes (caught by review, 2026-08-17).
+        ready_color = READY_COLOR_DARK if dark else READY_COLOR_LIGHT
         self.query_one("#stats-working", Label).update(f" [green]● {working} working[/]  ")
         self.query_one("#stats-approve", Label).update(f" [yellow]◉ {approve} approve[/]  " if approve else "")
-        self.query_one("#stats-done", Label).update(f" [bright_yellow]○ {done} ready[/]  ")
+        self.query_one("#stats-done", Label).update(f" [{ready_color}]○ {done} ready[/]  ")
         self.query_one("#stats-closed", Label).update(f" [rgb(100,100,100)]⊘ {closed} closed[/]  " if closed else "")
         self.query_one("#stats-total-cost", Label).update(f" [cyan]Σ ${total_cost:.2f}[/]  ")
         self.query_one("#stats-sort", Label).update(f" [magenta]sort: {sort_mode.label}[/]")
@@ -3814,8 +3897,6 @@ class ClaudeMonitor(App):
             )
         _perf("on_mount: launch_count save_prefs + notify", t0)
 
-    _JUMP_REQUEST = Path("/tmp/claude-jump-request")
-
     def _start_jump_server(self) -> None:
         """Serve http://localhost:48624/jump/<sid8-or-name> so cross-session
         mentions in any Claude's output can be cmd+clicked. Ghostty's URL
@@ -3824,7 +3905,7 @@ class ClaudeMonitor(App):
         the raised terminal window covers the browser a beat later. Bound to
         127.0.0.1 only. Silently skipped if the port is already taken (another
         monitor instance owns it)."""
-        request_path = self._JUMP_REQUEST
+        request_path = JUMP_REQUEST_PATH
 
         class _JumpHandler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *a):  # noqa: N802 - silence stderr
@@ -3868,16 +3949,33 @@ class ClaudeMonitor(App):
 
     def _check_jump_request(self) -> None:
         """Poll for a jump request dropped by claude-jump (e.g. from the
-        ClaudeJump Shortcut, whose sandbox can't send Apple Events itself).
-        Runs every 200ms; the file-exists check is the only cost."""
+        ClaudeJump Shortcut, whose sandbox can't send Apple Events itself)
+        or by `claude-monitor --jump-next` (Ctrl+Shift+N). Runs every 200ms;
+        the file-exists check is the only cost. --jump-next drops this
+        instead of scanning sessions itself because a cold parse_sessions()
+        in a brand-new process took ~6.5s against this machine's real
+        session count (measured 2026-08-16) versus near-zero here, where
+        self.sessions is already warm from the running monitor's own
+        3-second refresh loop."""
         try:
-            if not self._JUMP_REQUEST.exists():
+            if not JUMP_REQUEST_PATH.exists():
                 return
-            target = self._JUMP_REQUEST.read_text().strip()
-            self._JUMP_REQUEST.unlink()
+            target = JUMP_REQUEST_PATH.read_text().strip()
+            JUMP_REQUEST_PATH.unlink()
         except OSError:
             return
         if not target:
+            return
+        # startswith, not ==: --jump-next/--restart append a unique
+        # ":<pid>:<monotonic-ns>" token so a caller can tell its own
+        # request from one dropped by a second overlapping invocation
+        # (see _drop_request_and_await_consumption).
+        if target.startswith(JUMP_NEXT_SENTINEL):
+            self._handle_jump_next_request()
+            return
+        if target.startswith(RESTART_SENTINEL):
+            mlog("jump", "restart_request")
+            self.action_restart()
             return
         mlog("jump", "request_file", target=target)
         # Match by sid8 prefix first, then by exact title.
@@ -3896,6 +3994,29 @@ class ClaudeMonitor(App):
                 _mark_ready_seen(s.session_id, s.status)
 
         self.run_worker(_jump_and_mark, thread=True)
+
+    def _handle_jump_next_request(self) -> None:
+        """The fast path for Ctrl+Shift+N: same selection and outcome as
+        the headless jump_to_next_actionable(), but against self.sessions
+        (already warm, already deduped by dedupe_scheduled_sessions() in
+        this instance's own refresh) instead of a fresh parse_sessions()."""
+        prefs = load_prefs()
+        target = find_next_actionable(self.sessions, prefs.get("next_cursor"))
+        if target is None:
+            mlog("jump", "next_request_none")
+            self.notify("Nothing needs you right now", timeout=3)
+            return
+        prefs["next_cursor"] = target.session_id
+        save_prefs(prefs)
+        self._ack_bell(target.session_id)
+        mlog("jump", "next_request", sid=target.session_id[:12], title=target.title)
+
+        def _jump_and_notify(s=target):
+            ok, message = _focus_or_resume_target(s)
+            if not ok:
+                self.notify(message, timeout=6, severity="warning")
+
+        self.run_worker(_jump_and_notify, thread=True)
 
     def _periodic_reconcile(self) -> None:
         """Run the reconciliation sweep in a background thread every 30s."""
@@ -4188,24 +4309,30 @@ class ClaudeMonitor(App):
             # "Seen" READY rows (Max, 2026-08-16): read fresh from prefs each
             # cycle, not held in memory, since a jump from Ctrl+Shift+N runs
             # as a separate short-lived process and must be picked up here.
-            # Pruned to sessions currently done — once a session cycles away
-            # from done (you sent it something, or it closed) its old ack is
-            # meaningless, and dropping it here keeps the prefs file from
-            # accumulating every session that was ever briefly READY.
+            # Read-only and in-memory from here: an earlier version also
+            # pruned stale entries and wrote the result back, which raced
+            # the read-modify-write in _mark_ready_seen() (called from a
+            # jump that can land mid-refresh-cycle) and clobbered a
+            # just-added seen mark back to unseen (Max, 2026-08-16: "my
+            # 'marked as read' doesn't seem to stay that way"). _mark_ready_
+            # seen() is now the only writer of acked_ready; a stale entry
+            # for a session no longer done is simply never matched below
+            # (done_now excludes it), so it's inert, not wrong, and costs
+            # nothing worth a second writer to avoid.
             done_now = {s.session_id for s in flat if s.status == "done"}
-            _next_prefs = load_prefs()
-            acked_ready = set(_next_prefs.get("acked_ready", [])) & done_now
-            if acked_ready != set(_next_prefs.get("acked_ready", [])):
-                _next_prefs["acked_ready"] = list(acked_ready)
-                save_prefs(_next_prefs)
+            acked_ready = set(load_prefs().get("acked_ready", [])) & done_now
+
+            # Check system appearance in background thread (avoids
+            # subprocess.run on Textual's main thread). Computed before the
+            # render loop below: the unseen-READY color depends on it
+            # (Max, 2026-08-17: yellow doesn't pop against light mode's
+            # own cream background, needs its own popping blue there).
+            sys_dark = _system_is_dark()
 
             # Pre-render rows in background thread (Rich markup generation)
             visible_cols = self._visible_cols
-            rendered = [(s, render_row(s, visible_cols, acked_ready=acked_ready)) for s in flat]
-
-            # Check system appearance in background thread (avoids
-            # subprocess.run on Textual's main thread)
-            sys_dark = _system_is_dark()
+            rendered = [(s, render_row(s, visible_cols, acked_ready=acked_ready, dark=sys_dark))
+                       for s in flat]
 
             # Post to main thread for UI update
             self.call_from_thread(
@@ -4346,7 +4473,7 @@ class ClaudeMonitor(App):
         self.call_after_refresh(
             lambda: table.scroll_to(saved_scroll_x, saved_scroll_y, animate=False)
         )
-        self.query_one(StatsBar).update_stats(self.sessions, self.sort_mode)
+        self.query_one(StatsBar).update_stats(self.sessions, self.sort_mode, dark=sys_dark)
 
     def _make_menu_handler(self, s: Session):
         """Build the SessionMenu dismiss callback for a session."""
@@ -4859,22 +4986,33 @@ class ClaudeMonitor(App):
         table.move_cursor(row=event.row_index)
 
     def action_jump_next_actionable(self) -> None:
-        """Plain "n": move the cursor to the next session that needs you
-        (needs_approval, then done, cycling from wherever the cursor is
-        now), nothing more. It does NOT jump — Ctrl+Shift+N is the actual
-        jump command, from inside the monitor or anywhere else on the
-        machine. n-Enter-Enter (move, open the menu, pick Jump) jumps too,
-        naked n does not (Max, 2026-08-16: "n in monitor should just move
-        the highlighted row"). Doesn't touch next_cursor (that's the
-        headless path's own walk-the-queue position, and pure browsing
-        shouldn't silently advance it) or the READY read/unread mark
-        (that's earned by actually jumping, not by looking). Picks from
-        self._flat_rows (the search-filtered, currently-displayed set), not
-        self.sessions (unfiltered): candidates hidden by an active search
-        aren't reachable rows to move to, and self.sessions has no bearing
-        on what's actually in the table right now."""
+        """Plain "n": move the cursor to the next session that needs you,
+        walking down the table in the order you're actually looking at it,
+        nothing more. It does NOT jump: Ctrl+Shift+N is the actual jump
+        command, from inside the monitor or anywhere else on the machine.
+        n-Enter-Enter (move, open the menu, pick Jump) jumps too, naked n
+        does not (Max, 2026-08-16: "n in monitor should just move the
+        highlighted row"). Doesn't touch next_cursor (that's the headless
+        path's own walk-the-queue position, and pure browsing shouldn't
+        silently advance it) or the READY read/unread mark (that's earned
+        by actually jumping, not by looking). Uses
+        _next_actionable_in_table_order, not find_next_actionable: the
+        latter cycles by urgency (needs_approval, then oldest-waiting),
+        which can jump past a row you can see is READY to reach an older
+        one further down the table (Max, 2026-08-17: "naked n just skipped
+        a READY claude row"). Picks from self._flat_rows (the
+        search-filtered, currently-displayed set), not self.sessions
+        (unfiltered): candidates hidden by an active search aren't
+        reachable rows to move to, and self.sessions has no bearing on
+        what's actually in the table right now."""
         current = self._cursor_session()
-        target = find_next_actionable(self._flat_rows, current.session_id if current else None)
+        current_index = None
+        if current is not None:
+            current_index = next(
+                (i for i, s in enumerate(self._flat_rows) if s.session_id == current.session_id),
+                None,
+            )
+        target = _next_actionable_in_table_order(self._flat_rows, current_index)
         if target is None:
             self.notify("Nothing needs you right now", timeout=3)
             return
@@ -5287,7 +5425,11 @@ def find_next_actionable(sessions: list["Session"], after_sid: str | None) -> "S
     """The next session that needs you, cycling from after_sid so repeated
     calls walk the whole queue instead of landing on the same one every
     time. needs_approval sorts before done (it's the one actually blocking);
-    within each, the longest-waiting session comes first."""
+    within each, the longest-waiting session comes first. For Ctrl+Shift+N
+    (jump_to_next_actionable / _handle_jump_next_request): there's no
+    visible cursor to reason about there, so priority-by-urgency is exactly
+    right. NOT used for the "n" key inside the monitor; see
+    _next_actionable_in_table_order for why that needs a different order."""
     actionable = [s for s in sessions if s.status in ACTIONABLE_STATUSES and not s.is_subagent]
     if not actionable:
         return None
@@ -5299,16 +5441,131 @@ def find_next_actionable(sessions: list["Session"], after_sid: str | None) -> "S
     return actionable[0]
 
 
+def _next_actionable_in_table_order(
+    flat_rows: list["Session"], current_index: int | None
+) -> "Session | None":
+    """Cursor-order counterpart to find_next_actionable(), for the "n" key
+    specifically. find_next_actionable() cycles by urgency (needs_approval
+    first, then oldest-waiting), which is right when there's no visible
+    cursor to reason about (Ctrl+Shift+N), but wrong for a key whose whole
+    point is moving your eye down a list you're looking at: walking in
+    priority order instead of table order could leap over a row you can
+    see is READY to reach an older one further down, which reads as the
+    key skipping a row (Max, 2026-08-17: "naked n just skipped a READY
+    claude row"). This walks flat_rows (the table's own current order,
+    whatever sort/grouping is active) starting just after current_index,
+    wrapping around, and returns the first actionable row it reaches, so
+    "n" never passes over a row you can see needs you."""
+    n = len(flat_rows)
+    if n == 0:
+        return None
+    start = (current_index + 1) if current_index is not None else 0
+    for offset in range(n):
+        s = flat_rows[(start + offset) % n]
+        if s.status in ACTIONABLE_STATUSES and not s.is_subagent:
+            return s
+    return None
+
+
+def _a_monitor_is_running() -> bool:
+    """Fast (<10ms) liveness check: is anything holding the click-to-jump
+    HTTP port. on_mount() binds it unconditionally outside pytest and
+    schedules the request-file poller in the same call, so a bound port is
+    a reliable proxy for "a poller is alive to consume what we're about to
+    write." Used to skip the request/poll dance entirely when nothing is
+    listening, rather than burning a full timeout waiting on a request
+    nobody can ever consume."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.2)
+        return sock.connect_ex(("127.0.0.1", JUMP_HTTP_PORT)) == 0
+
+
+def _drop_request_and_await_consumption(sentinel: str, timeout: float = 1.0,
+                                         poll: float = 0.05) -> bool:
+    """Write `sentinel:<unique token>` into the shared jump-request file
+    click-to-jump links, --jump-next, and --restart all use, and wait for
+    a live monitor's poller (_check_jump_request, every 200ms) to consume
+    it. Shared by --jump-next's fast path and --restart so a future change
+    to the timeout/poll/liveness-check logic only has one copy to update.
+
+    Skips straight to failure if _a_monitor_is_running() says nothing is
+    listening: before this check, --jump-next with no monitor running
+    still burned a full extra second here before falling back to its own
+    cold scan, on top of that scan's several seconds, making the no-monitor
+    case slower than doing nothing here at all (caught by review,
+    2026-08-16).
+
+    Checks the file still holds OUR token before declaring success, not
+    just that it's gone: two overlapping requests (mashing the hotkey
+    faster than the 200ms poll, or racing an unrelated click-to-jump link)
+    would otherwise both see "file gone" and both report success even
+    though only whichever one the poller actually read produced a real
+    jump (also caught by review)."""
+    if not _a_monitor_is_running():
+        return False
+    token = f"{sentinel}:{os.getpid()}:{time.monotonic_ns()}"
+    try:
+        JUMP_REQUEST_PATH.write_text(token)
+    except OSError:
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            current = JUMP_REQUEST_PATH.read_text()
+        except OSError:
+            return True  # gone: consumed, and it was still ours a moment ago
+        if current != token:
+            return False  # overwritten before being read; not our consumption
+        time.sleep(poll)
+    JUMP_REQUEST_PATH.unlink(missing_ok=True)
+    return False
+
+
+def _try_fast_jump_next() -> bool:
+    """Ask an already-running monitor to jump, via the shared request-file
+    protocol. Near-instant because that monitor's session list is already
+    warm in memory. The alternative, jump_to_next_actionable() below, calls
+    parse_sessions() cold in a brand-new process, which took ~6.5s against
+    this machine's real session count (measured 2026-08-16), the actual
+    cause of Ctrl+Shift+N feeling slow. Returns False (so the caller falls
+    back to that cold path) if no monitor is running, or if the request
+    couldn't be confirmed consumed."""
+    return _drop_request_and_await_consumption(JUMP_NEXT_SENTINEL)
+
+
+def _focus_or_resume_target(target: "Session") -> tuple[bool, str]:
+    """Shared by every jump path that lands on one specific target session:
+    focus its window, resume it in a new one if the window can't be found
+    and the process isn't alive, and mark it seen (READY read/unread) only
+    once one of those two actually lands, never on a bare attempt. Pulled
+    out 2026-08-16 after the mark-before-verify bug (caught by review) had
+    to be fixed at two near-identical copies of this exact sequence; a
+    third was about to become a fourth."""
+    if focus_terminal_session(target):
+        _mark_ready_seen(target.session_id, target.status)
+        return True, target.title
+    if _is_session_alive(target.session_id):
+        mlog("DIVERGE", "alive_but_unfound", sid=target.session_id[:12], title=target.title,
+             candidates=_resolve_match_candidates(target))
+        _heal_hook_state(target.session_id)
+        return False, f"Window not found for {target.title[:20]}. Press Enter → Resume."
+    if resume_session(target):
+        _mark_ready_seen(target.session_id, target.status)
+        return True, f"Resuming {target.title[:20]} in new window"
+    return False, f"Could not find or resume {target.title[:20]}"
+
+
 def jump_to_next_actionable() -> tuple[bool, str, "Session | None"]:
-    """Find and jump to the next session that needs you, resuming it if its
-    window can't be found and it isn't alive. Persists which session it
-    landed on (in monitor-prefs.json) so the NEXT call, whether that's
-    pressing n again inside the app or Ctrl+Shift+N from anywhere else,
-    continues the same walk through the queue rather than repeating. Runs
-    the same dedupe_scheduled_sessions() pass the TUI's own refresh does:
-    without it this candidate set can quietly disagree with the in-app "n"
-    key's (self.sessions is already deduped), so the two "shared cursor"
-    entry points could advance next_cursor to different targets."""
+    """Find and jump to the next session that needs you. Persists which
+    session it landed on (in monitor-prefs.json) so the NEXT call, whether
+    that's pressing n again inside the app or Ctrl+Shift+N from anywhere
+    else, continues the same walk through the queue rather than repeating.
+    Runs the same dedupe_scheduled_sessions() pass the TUI's own refresh
+    does: without it this candidate set can quietly disagree with the
+    in-app "n" key's (self.sessions is already deduped), so the two
+    "shared cursor" entry points could advance next_cursor to different
+    targets."""
     pinned = load_pinned_sessions()
     sessions = parse_sessions(include_archived=False, include_subagents=False, pinned=pinned)
     sessions = dedupe_scheduled_sessions(sessions, pinned)
@@ -5319,21 +5576,8 @@ def jump_to_next_actionable() -> tuple[bool, str, "Session | None"]:
 
     prefs["next_cursor"] = target.session_id
     save_prefs(prefs)
-
-    ok = focus_terminal_session(target)
-    if ok:
-        _mark_ready_seen(target.session_id, target.status)
-        return True, target.title, target
-    if _is_session_alive(target.session_id):
-        mlog("DIVERGE", "alive_but_unfound", sid=target.session_id[:12], title=target.title,
-             candidates=_resolve_match_candidates(target))
-        _heal_hook_state(target.session_id)
-        return False, f"Window not found for {target.title[:20]}. Press Enter → Resume.", target
-    ok = resume_session(target)
-    if ok:
-        _mark_ready_seen(target.session_id, target.status)
-        return True, f"Resuming {target.title[:20]} in new window", target
-    return False, f"Could not find or resume {target.title[:20]}", target
+    ok, message = _focus_or_resume_target(target)
+    return ok, message, target
 
 
 def main():
@@ -5343,10 +5587,21 @@ def main():
         tail_log(category=cat_filter)
     elif len(sys.argv) > 1 and sys.argv[1] == "--reconcile":
         sys.exit(min(run_reconcile_report(), 1))
+    elif len(sys.argv) > 1 and sys.argv[1] == "--restart":
+        # Tells an already-running monitor to restart in place (same
+        # window, same PID, os.execv) and pick up code changes, the same
+        # thing Shift+R does, without a synthetic keystroke into that
+        # window (which fires Claude Nest's push-to-talk regardless of
+        # which key is sent). No-op if nothing is running to pick it up.
+        sys.exit(0 if _drop_request_and_await_consumption(RESTART_SENTINEL) else 1)
     elif len(sys.argv) > 1 and sys.argv[1] == "--jump-next":
-        # Ephemeral: no TUI, no visible window of its own. Reuses the exact
-        # same selection the in-app "n" key uses so Ctrl+Shift+N from
-        # anywhere on the machine is that key, not a second reimplementation.
+        # Ephemeral: no TUI, no visible window of its own. Fast path first:
+        # hand off to an already-running monitor's warm session list
+        # (near-instant); only cold-scan this process's own parse_sessions()
+        # if nothing picked that up, which means no monitor is running.
+        if _try_fast_jump_next():
+            mlog("jump", "cli_next", ok=True, message="handed off to running monitor")
+            sys.exit(0)
         ok, message, _target = jump_to_next_actionable()
         mlog("jump", "cli_next", ok=ok, message=message)
         sys.exit(0 if ok else 1)
