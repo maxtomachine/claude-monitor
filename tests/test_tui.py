@@ -1414,6 +1414,8 @@ class TestJumpNextRequestFailureFeedback:
     async def test_notifies_on_failed_jump(self):
         target = make_session(session_id="ready-1", title="Ready", status="done")
         with patch("claude_monitor.parse_sessions", return_value=[target]), \
+             patch("claude_monitor.load_prefs", return_value={}), \
+             patch("claude_monitor.save_prefs"), \
              patch("claude_monitor.focus_terminal_session", return_value=False), \
              patch("claude_monitor._is_session_alive", return_value=False), \
              patch("claude_monitor.resume_session", return_value=False):
@@ -1428,6 +1430,9 @@ class TestJumpNextRequestFailureFeedback:
     async def test_does_not_notify_on_success(self):
         target = make_session(session_id="ready-1", title="Ready", status="done")
         with patch("claude_monitor.parse_sessions", return_value=[target]), \
+             patch("claude_monitor.load_prefs", return_value={}), \
+             patch("claude_monitor.save_prefs"), \
+             patch("claude_monitor._mark_ready_seen"), \
              patch("claude_monitor.focus_terminal_session", return_value=True):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
@@ -1435,6 +1440,44 @@ class TestJumpNextRequestFailureFeedback:
                     pilot.app._handle_jump_next_request()
                     await pilot.pause()
                     notify.assert_not_called()
+
+
+class TestJumpNextSkipsAlreadySeen:
+    """Bug reported by Max (2026-08-17): "I don't want ctrl-shift-n to jump
+    me to an already read, redundantly... it keeps jumping me to X and I
+    don't need it, I already jumped and took no action" / "since the
+    unread isn't working the READY state is sticking and I am wasting
+    time checking things I already decided to deal with later." The fast
+    path (Ctrl+Shift+N with a monitor running) must read acked_ready from
+    prefs and exclude those sessions from its candidates."""
+
+    async def test_skips_seen_session_lands_on_unseen_one(self):
+        seen = make_session(session_id="seen", title="Seen", status="done", last_activity=100)
+        unseen = make_session(session_id="unseen", title="Unseen", status="done", last_activity=50)
+        with patch("claude_monitor.parse_sessions", return_value=[seen, unseen]), \
+             patch("claude_monitor.load_prefs", return_value={"acked_ready": ["seen"]}), \
+             patch("claude_monitor.save_prefs"), \
+             patch("claude_monitor.focus_terminal_session", return_value=True) as jump:
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                pilot.app._handle_jump_next_request()
+                await pilot.pause()
+                jump.assert_called_once()
+                assert jump.call_args[0][0].session_id == "unseen"
+
+    async def test_all_seen_notifies_nothing_needs_you_without_jumping(self):
+        seen = make_session(session_id="seen", title="Seen", status="done")
+        with patch("claude_monitor.parse_sessions", return_value=[seen]), \
+             patch("claude_monitor.load_prefs", return_value={"acked_ready": ["seen"]}), \
+             patch("claude_monitor.save_prefs"), \
+             patch("claude_monitor.focus_terminal_session") as jump:
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                with patch.object(pilot.app, "notify") as notify:
+                    pilot.app._handle_jump_next_request()
+                    await pilot.pause()
+                    jump.assert_not_called()
+                    notify.assert_called_once_with("Nothing needs you right now", timeout=3)
 
 
 class TestBell:

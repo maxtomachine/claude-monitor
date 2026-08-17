@@ -109,6 +109,38 @@ times after a brief time as mint green"). If you ever need the refresh path
 to write this field again, don't: give it its own single-writer discipline
 instead of reintroducing a second read-modify-write on the same key.
 
+Seen also means "don't make me look at this again": `find_next_actionable()`
+(the shared selection behind `Ctrl+Shift+N`, not the `n` key, which has its
+own table-order selection) takes an `acked_ready` set and excludes any
+already-seen `done` session from its candidates entirely, not just from
+sort priority. Without this, the hotkey kept landing back on a session Max
+had already jumped to and decided to defer, on every press, which defeated
+the whole point of tracking seen state (Max, 2026-08-17: "I don't want
+ctrl-shift-n to jump me to an already read, redundantly... I already
+jumped and took no action" / "I am wasting time checking things I already
+decided to deal with later"). `needs_approval` is never excluded this way:
+`acked_ready` only ever holds `done` sessions, and a blocking approval
+request stays urgent regardless of whether it's been looked at. If every
+actionable session happens to already be seen, this correctly returns
+`None` ("nothing needs you") rather than re-visiting one anyway.
+
+**Test isolation for anything under `monitor-prefs.json` (or any other
+on-disk state this file owns) is not optional.** `tests/conftest.py`'s
+`_isolate_monitor_state_files` autouse fixture points `PREFS_PATH`,
+`HIDDEN_PATH`, `PINNED_PATH`, `SCAN_CACHE_PATH`, and `JUMP_REQUEST_PATH` at
+per-test scratch files for every test, specifically because a test that
+mocks `load_prefs()` to return a stub dict but forgets to also mock
+`save_prefs()` will otherwise write that stub back to Max's real file for
+real: `on_mount()`'s launch-count tracking calls both on every app
+mount, so ANY test that spins up `ClaudeMonitor()` and mocks one without
+the other clobbers real state, not just the field the test cares about.
+This happened for real on 2026-08-17: one test mocking `load_prefs` to
+return `{"acked_ready": [...]}` without also mocking `save_prefs` wiped
+Max's saved `columns`/`column_order`/`view_state` down to just that
+stub. Do not remove or narrow the autouse fixture to "fix" a test that
+seems to want the real files; give it its own explicit scratch path
+instead.
+
 ## Pins are permanent; hiding inactive ones is a separate toggle
 
 A pin is an unconditional exemption from every age filter in `parse_sessions()`,
@@ -166,6 +198,19 @@ warning below).
 `ps -Ao pid=,comm=` snapshot per 2 seconds (`_refresh_process_comm_cache()`,
 mirroring the existing `_refresh_pid_map()` pattern), looked up in memory
 per PID instead.
+
+The fast-path handoff above only helps when a monitor is already running.
+The remaining ~5s of that cold scan (mostly `scan_full_file()`'s per-line
+`json.loads`) still hit on a fresh launch or a `Shift+R` restart, since
+`_scan_cache` starts empty in every new process regardless. Fixed
+2026-08-17 (Max: "performance improve") by persisting `_scan_cache` to
+`monitor-scan-cache.json`, loaded once per process
+(`_load_scan_cache_from_disk()`) and flushed once per `parse_sessions()`
+call when anything actually changed (`_scan_cache_dirty`), not per
+session. Measured live: a fresh process's `parse_sessions()` against
+mostly-unchanged transcripts dropped from ~4.5s to ~0.3s once a prior run
+had already scanned them, roughly the same order of magnitude as the
+Ctrl+Shift+N fix above, for the case that fix doesn't cover.
 
 ## Current keybindings
 
