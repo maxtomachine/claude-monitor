@@ -37,12 +37,14 @@ class TestRenderRow:
     def test_done_status(self):
         s = make_session(status="done")
         cells = render_row(s, ["status"])
-        assert "done" in cells[0]
+        assert "READY" in cells[0]
 
     def test_done_is_the_bright_one(self):
+        """Reported 2026-08-16: "make the Done status READY and pop it
+        further in a yellow so my eye is drawn to it during multitasking."""
         s = make_session(status="done")
         cells = render_row(s, ["status"])
-        assert "bright_white" in cells[0]
+        assert "bright_yellow" in cells[0]
 
     def test_session_title(self):
         s = make_session(title="My Session")
