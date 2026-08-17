@@ -271,7 +271,7 @@ STATUS_DISPLAY = {
     "needs_approval": ("◉ APPROVE", "yellow"),
     "working": ("● WORKING", "dim"),
     "debriefing": ("⏳ DEBRIEFING", "magenta"),
-    "done": ("○ done", "bright_white"),
+    "done": ("○ READY", "bright_yellow"),
     "closed": ("⊘ CLOSED", "rgb(100,100,100)"),
     "archived": ("◇ ARCHIVED", "dim"),
 }
@@ -3545,7 +3545,7 @@ class StatsBar(Horizontal):
 
         self.query_one("#stats-working", Label).update(f" [green]● {working} working[/]  ")
         self.query_one("#stats-approve", Label).update(f" [yellow]◉ {approve} approve[/]  " if approve else "")
-        self.query_one("#stats-done", Label).update(f" [dim]○ {done} done[/]  ")
+        self.query_one("#stats-done", Label).update(f" [bright_yellow]○ {done} ready[/]  ")
         self.query_one("#stats-closed", Label).update(f" [rgb(100,100,100)]⊘ {closed} closed[/]  " if closed else "")
         self.query_one("#stats-total-cost", Label).update(f" [cyan]Σ ${total_cost:.2f}[/]  ")
         self.query_one("#stats-sort", Label).update(f" [magenta]sort: {sort_mode.label}[/]")
