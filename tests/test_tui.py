@@ -72,6 +72,28 @@ class TestAppMounts:
                 stats = pilot.app.query_one(StatsBar)
                 assert stats is not None
 
+    async def test_stats_bar_ready_color_follows_theme(self, sample_sessions):
+        """Bug reported by Max (2026-08-17): yellow doesn't pop against
+        light mode's own cream background. The stats bar's "N ready" count
+        must match whatever color the individual READY rows use for the
+        current theme, not stay hardcoded to bright_yellow."""
+        from claude_monitor import SortMode, READY_COLOR_DARK, READY_COLOR_LIGHT
+        with _mock_sessions(sample_sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                stats = pilot.app.query_one(StatsBar)
+                label = stats.query_one("#stats-done")
+
+                pilot.app.theme = "gruvbox-dark"
+                stats.update_stats(sample_sessions, SortMode.ALPHA)
+                styles = [span.style for span in label.render().spans]
+                assert READY_COLOR_DARK in styles
+
+                pilot.app.theme = "gruvbox-light"
+                stats.update_stats(sample_sessions, SortMode.ALPHA)
+                styles = [span.style for span in label.render().spans]
+                assert READY_COLOR_LIGHT in styles
+
     async def test_detail_panel_exists(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
@@ -1164,6 +1186,32 @@ class TestNextActionableMovesCursorOnly:
                 await pilot.pause()
                 assert pilot.app._row_map[table.cursor_row].session_id == "a"
 
+    async def test_n_walks_table_order_not_priority_order(self):
+        """Bug reported by Max (2026-08-17): "naked n just skipped a READY
+        claude row." Cause: n used to reuse find_next_actionable(), which
+        cycles by urgency (oldest-waiting-first) rather than by what's
+        visually next in the table, so it could leap over a row you can
+        see is READY to reach an older one further down. Table order here
+        (alphabetical, matching what's on screen) is A, B, C, D; last_
+        activity order (what the old code cycled by) is B, D, C, A (B
+        oldest). Starting from B: table order says next is C; the old
+        priority order would have said D, skipping over the visible,
+        actionable C entirely."""
+        a = make_session(session_id="a", title="A", status="done", last_activity=400)
+        b = make_session(session_id="b", title="B", status="done", last_activity=100)
+        c = make_session(session_id="c", title="C", status="done", last_activity=300)
+        d = make_session(session_id="d", title="D", status="done", last_activity=200)
+        with patch("claude_monitor.parse_sessions", return_value=[a, b, c, d]):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                b_row = pilot.app._row_index_of("b")
+                table.move_cursor(row=b_row)
+
+                await pilot.press("n")
+                await pilot.pause()
+                assert pilot.app._row_map[table.cursor_row].session_id == "c"
+
     async def test_n_enter_enter_still_jumps(self):
         """n moves the cursor; Enter then opens the menu on that row, and a
         second Enter picks its default (Jump for a live session), the
@@ -1267,6 +1315,85 @@ class TestReadyOnlyMarkedSeenOnActualJump:
                 handler("jump")
                 await pilot.pause()
                 mark_seen.assert_called_once_with("ready-1", "done")
+
+    async def test_refresh_never_writes_acked_ready(self):
+        """Bug reported by Max (2026-08-16): a session he'd just marked seen
+        turned back to yellow on its own. Cause: the refresh cycle used to
+        read acked_ready, prune it to currently-done sessions, and write
+        the pruned copy back every ~3s; a jump landing mid-cycle wrote its
+        new seen mark, and the next refresh cycle (holding a prefs snapshot
+        read BEFORE that jump) clobbered it back out on its own save. Fixed
+        by making the refresh path read-only for this field: only
+        _mark_ready_seen() writes acked_ready now. This drives several full
+        refresh cycles with a session already marked seen (the exact
+        precondition the old code would have pruned-and-written back) and
+        asserts no save_prefs call ever narrows or drops that value (an
+        unrelated save, e.g. launch_count, legitimately carries the same
+        dict's other keys along, so the check is on the value, not on
+        whether the key appears at all)."""
+        target = make_session(session_id="ready-1", title="Ready", status="done")
+        with patch("claude_monitor.parse_sessions", return_value=[target]), \
+             patch("claude_monitor.load_prefs", return_value={"acked_ready": ["ready-1"]}), \
+             patch("claude_monitor.save_prefs") as save:
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                for _ in range(3):
+                    pilot.app.refresh_sessions()
+                    await pilot.pause()
+                    await pilot.pause()
+                for call in save.call_args_list:
+                    saved = call[0][0]
+                    if "acked_ready" in saved:
+                        assert saved["acked_ready"] == ["ready-1"]
+
+
+class TestJumpRequestSentinelDispatch:
+    """--jump-next/--restart append a unique ":<pid>:<ns>" token to their
+    sentinel so a caller can tell its own request apart from an
+    overlapping one (see _drop_request_and_await_consumption). The
+    monitor's own request-file poller has to match on startswith, not ==,
+    to still recognize a token-suffixed sentinel as the same command.
+
+    Every test here points _JUMP_REQUEST at a scratch path (tmp_path), not
+    the real /tmp/claude-jump-request: that file is shared with any
+    monitor actually running on this machine, and writing a real sentinel
+    to it from a test would fire an unintended restart or jump on it."""
+
+    async def test_jump_next_sentinel_with_token_dispatches_to_fast_path(self, tmp_path):
+        target = make_session(session_id="ready-1", title="Ready", status="done")
+        with patch("claude_monitor.parse_sessions", return_value=[target]):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                pilot.app._JUMP_REQUEST = tmp_path / "jump-request"
+                with patch.object(pilot.app, "_handle_jump_next_request") as handler:
+                    pilot.app._JUMP_REQUEST.write_text("__jump_next__:12345:999")
+                    pilot.app._check_jump_request()
+                    handler.assert_called_once()
+
+    async def test_restart_sentinel_with_token_dispatches_to_restart(self, tmp_path):
+        target = make_session(session_id="ready-1", title="Ready", status="done")
+        with patch("claude_monitor.parse_sessions", return_value=[target]):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                pilot.app._JUMP_REQUEST = tmp_path / "jump-request"
+                with patch.object(pilot.app, "action_restart") as restart:
+                    pilot.app._JUMP_REQUEST.write_text("__restart__:12345:999")
+                    pilot.app._check_jump_request()
+                    restart.assert_called_once()
+
+    async def test_unrelated_sid_request_is_not_treated_as_a_sentinel(self, tmp_path):
+        """A real sid/title request must still take the generic match path,
+        not get accidentally swallowed by a startswith() sentinel check."""
+        target = make_session(session_id="ready-1", title="Ready", status="done")
+        with patch("claude_monitor.parse_sessions", return_value=[target]), \
+             patch("claude_monitor.focus_terminal_session", return_value=True) as jump:
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                pilot.app._JUMP_REQUEST = tmp_path / "jump-request"
+                pilot.app._JUMP_REQUEST.write_text("ready-1")
+                pilot.app._check_jump_request()
+                await pilot.pause()
+                jump.assert_called_once()
 
 
 class TestBell:

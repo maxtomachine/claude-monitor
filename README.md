@@ -179,17 +179,20 @@ differently (Shortcuts.app, Karabiner, etc.).
 
 Press `Ctrl+Shift+N` from anywhere to instantly jump to the next session
 that needs you (blocked on your approval, or finished and waiting on your
-next move), without opening the monitor at all — `claude-monitor
---jump-next` runs headless: it parses sessions, picks the target, jumps or
-resumes, and exits. Press repeatedly to walk through everything that needs
-you, oldest-waiting first, needs-approval before done. A READY session you
-land on this way is marked seen: its status stays bold and still says
-READY, but the color moves off yellow to mint, and its row title unbolds,
-until it cycles through another state and becomes READY again.
+next move), without opening the monitor at all. `claude-monitor --jump-next`
+runs headless: if a monitor is already running, it hands the request off to
+that instance (near-instant, since that monitor's session list is already
+warm) rather than re-scanning every transcript cold; only falls back to a
+full scan if nothing is running to hand off to. Press repeatedly to walk
+through everything that needs you, oldest-waiting first, needs-approval
+before done. A READY session you land on this way is marked seen: its
+status stays bold and still says READY, but the color moves off yellow to
+mint, and its row title unbolds, until it cycles through another state and
+becomes READY again.
 
 Inside the monitor, plain `n` (no modifier) only moves the cursor to the
 next session that needs you; it does not jump. `n` then `Enter` then
-`Enter` (move, open the menu, pick Jump) does jump — naked `n` alone
+`Enter` (move, open the menu, pick Jump) does jump; naked `n` alone
 doesn't. `n` is a deliberate exception to "every hotkey needs Ctrl"
 (alongside `K`/`R`/`P`): it's meant to be a single unmodified keystroke, at
 the cost of `n` no longer being available for type-ahead group jump.
