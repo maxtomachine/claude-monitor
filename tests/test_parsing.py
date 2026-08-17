@@ -30,6 +30,8 @@ from claude_monitor import (
     _is_session_alive,
     count_background_activity,
     _drop_request_and_await_consumption,
+    _load_scan_cache_from_disk,
+    _save_scan_cache_to_disk,
 )
 from tests.helpers import make_session, make_transcript_jsonl
 
@@ -879,6 +881,39 @@ class TestFindNextActionable:
         sub = make_session(session_id="s", status="done", is_subagent=True)
         assert find_next_actionable([parent, sub], None) is None
 
+    def test_excludes_already_seen_done_sessions(self):
+        """Bug reported by Max (2026-08-17): "I don't want ctrl-shift-n to
+        jump me to an already read, redundantly... it keeps jumping me to
+        X and I don't need it, I already jumped and took no action" /
+        "since the unread isn't working the READY state is sticking and I
+        am wasting time checking things I already decided to deal with
+        later." A session already in acked_ready must not be a candidate
+        at all, not just sorted last."""
+        seen = make_session(session_id="seen", status="done", last_activity=100)
+        unseen = make_session(session_id="unseen", status="done", last_activity=50)
+        result = find_next_actionable([seen, unseen], None, acked_ready={"seen"})
+        assert result.session_id == "unseen"
+
+    def test_returns_none_when_all_actionable_are_seen(self):
+        """No re-visiting a seen session just because it's the only one
+        left; nothing new means nothing to jump to."""
+        seen = make_session(session_id="seen", status="done")
+        assert find_next_actionable([seen], None, acked_ready={"seen"}) is None
+
+    def test_needs_approval_never_excluded_by_acked_ready(self):
+        """acked_ready only ever holds done sessions in real usage, but
+        even if a stale/bogus entry matched a needs_approval sid, a
+        blocking approval request must still surface: it's the one status
+        that's actually blocking, seen or not."""
+        approval = make_session(session_id="a", status="needs_approval")
+        result = find_next_actionable([approval], None, acked_ready={"a"})
+        assert result.session_id == "a"
+
+    def test_acked_ready_none_matches_default_behavior(self):
+        s = make_session(session_id="s", status="done")
+        assert find_next_actionable([s], None, acked_ready=None) is not None
+        assert find_next_actionable([s], None) is not None
+
 
 class TestNextActionableInTableOrder:
     """The "n" key's own selection, distinct from find_next_actionable()'s
@@ -1054,3 +1089,112 @@ class TestDropRequestAndAwaitConsumption:
             result = _drop_request_and_await_consumption("__test__", timeout=0.1, poll=0.02)
         assert result is False
         assert not scratch.exists()
+
+
+class TestScanCacheDiskPersistence:
+    """Fixture from 2026-08-17 (Max: "performance improve"): a cold monitor
+    launch or Shift+R restart used to re-parse every transcript's JSONL
+    from scratch every single time, ~4.5s against real session counts
+    measured that day, because the in-memory scan cache started empty in
+    every new process. Persisting it to disk (keyed by path+mtime, same
+    as the in-memory cache) cut a fresh process's parse_sessions() to
+    ~0.3s once a prior run had already scanned the same, unchanged files."""
+
+    def _reset_load_guard(self, monkeypatch):
+        import claude_monitor as cm
+        monkeypatch.setattr(cm, "_scan_cache_loaded_from_disk", False)
+
+    def test_save_then_load_round_trips(self, tmp_path, monkeypatch):
+        import claude_monitor as cm
+        cache_path = tmp_path / "scan-cache.json"
+        transcript = tmp_path / "real.jsonl"
+        transcript.write_text("{}")  # must exist: _save_scan_cache_to_disk prunes dead paths
+        monkeypatch.setattr(cm, "SCAN_CACHE_PATH", cache_path)
+        monkeypatch.setattr(cm, "_scan_cache", {str(transcript): (123.0, {"tokens_in": 500})})
+        _save_scan_cache_to_disk()
+        assert cache_path.exists()
+
+        monkeypatch.setattr(cm, "_scan_cache", {})
+        self._reset_load_guard(monkeypatch)
+        _load_scan_cache_from_disk()
+        assert cm._scan_cache[str(transcript)] == (123.0, {"tokens_in": 500})
+
+    def test_prunes_entries_for_deleted_transcripts(self, tmp_path, monkeypatch):
+        """Bug caught by review (2026-08-17): without pruning,
+        monitor-scan-cache.json only ever grows across every restart for
+        as long as the tool is used, retaining scan results (including
+        last_assistant_text snippets) for transcripts long since deleted."""
+        import claude_monitor as cm
+        cache_path = tmp_path / "scan-cache.json"
+        alive = tmp_path / "alive.jsonl"
+        alive.write_text("{}")
+        monkeypatch.setattr(cm, "SCAN_CACHE_PATH", cache_path)
+        monkeypatch.setattr(cm, "_scan_cache", {
+            str(alive): (1.0, {"x": 1}),
+            "/deleted/no-longer-exists.jsonl": (2.0, {"y": 2}),
+        })
+        _save_scan_cache_to_disk()
+        saved = json.loads(cache_path.read_text())
+        assert str(alive) in saved
+        assert "/deleted/no-longer-exists.jsonl" not in saved
+
+    def test_missing_file_is_a_silent_noop(self, tmp_path, monkeypatch):
+        import claude_monitor as cm
+        monkeypatch.setattr(cm, "SCAN_CACHE_PATH", tmp_path / "does-not-exist.json")
+        monkeypatch.setattr(cm, "_scan_cache", {"keep": (1.0, {})})
+        self._reset_load_guard(monkeypatch)
+        _load_scan_cache_from_disk()  # must not raise or wipe the existing cache
+        assert cm._scan_cache == {"keep": (1.0, {})}
+
+    def test_corrupt_file_is_a_silent_noop(self, tmp_path, monkeypatch):
+        import claude_monitor as cm
+        cache_path = tmp_path / "scan-cache.json"
+        cache_path.write_text("not valid json {{{")
+        monkeypatch.setattr(cm, "SCAN_CACHE_PATH", cache_path)
+        monkeypatch.setattr(cm, "_scan_cache", {"keep": (1.0, {})})
+        self._reset_load_guard(monkeypatch)
+        _load_scan_cache_from_disk()
+        assert cm._scan_cache == {"keep": (1.0, {})}
+
+    def test_loads_only_once_per_process(self, tmp_path, monkeypatch):
+        """A second call must not re-read the file (and, more importantly,
+        must not clobber cache entries written since the first load by an
+        in-process scan_full_file() call)."""
+        import claude_monitor as cm
+        cache_path = tmp_path / "scan-cache.json"
+        cache_path.write_text('{"/a": [1.0, {"x": 1}]}')
+        monkeypatch.setattr(cm, "SCAN_CACHE_PATH", cache_path)
+        monkeypatch.setattr(cm, "_scan_cache", {})
+        self._reset_load_guard(monkeypatch)
+
+        _load_scan_cache_from_disk()
+        assert "/a" in cm._scan_cache
+
+        # A fresh in-process scan adds a new entry...
+        cm._scan_cache["/b"] = (2.0, {"y": 2})
+        # ...and the file changes underneath (simulating another process)...
+        cache_path.write_text('{"/a": [1.0, {"x": 1}], "/c": [3.0, {"z": 3}]}')
+        # ...but the second call is a no-op: it must not reload and wipe "/b".
+        _load_scan_cache_from_disk()
+        assert cm._scan_cache == {"/a": (1.0, {"x": 1}), "/b": (2.0, {"y": 2})}
+
+    def test_scan_full_file_loads_disk_cache_on_first_call(self, tmp_path, monkeypatch):
+        """The actual integration point: a cold scan_full_file() call for a
+        transcript another process already scanned (same path, same
+        mtime) must return the disk-cached result instead of re-reading
+        and re-parsing the file."""
+        import claude_monitor as cm
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text('{"type": "user"}\n')
+        real_mtime = transcript.stat().st_mtime
+
+        cache_path = tmp_path / "scan-cache.json"
+        cached_result = {"tokens_in": 99999, "model_id": "from-disk-cache"}
+        cache_path.write_text(json.dumps({str(transcript): [real_mtime, cached_result]}))
+        monkeypatch.setattr(cm, "SCAN_CACHE_PATH", cache_path)
+        monkeypatch.setattr(cm, "_scan_cache", {})
+        self._reset_load_guard(monkeypatch)
+
+        result = scan_full_file(str(transcript))
+        assert result["model_id"] == "from-disk-cache"
+        assert result["tokens_in"] == 99999

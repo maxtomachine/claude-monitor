@@ -111,6 +111,7 @@ _STATE_HOME.mkdir(parents=True, exist_ok=True)
 PREFS_PATH = _STATE_HOME / "monitor-prefs.json"
 HIDDEN_PATH = _STATE_HOME / "monitor-hidden.json"
 PINNED_PATH = _STATE_HOME / "monitor-pinned.json"
+SCAN_CACHE_PATH = _STATE_HOME / "monitor-scan-cache.json"
 BELL_DECAY_S = 300
 
 
@@ -412,15 +413,58 @@ def parse_timestamp(ts: str) -> float:
 
 
 _scan_cache: dict[str, tuple[float, dict]] = {}  # path -> (mtime, result)
+_scan_cache_loaded_from_disk = False
+_scan_cache_dirty = False  # set on any miss; parse_sessions() flushes once per cycle
+
+
+def _load_scan_cache_from_disk() -> None:
+    """One-time load of a prior process's scan results, keyed by (path,
+    mtime) same as the in-memory cache: a cold monitor launch or restart
+    otherwise re-parses every transcript's JSONL from scratch even when
+    nothing on disk has changed since the last run. Measured 2026-08-16
+    at ~5s of a ~6.5s cold parse_sessions() against real session counts,
+    the dominant remaining cost after Ctrl+Shift+N's fast-path handoff
+    made the "monitor already running" case fast; this is what's left for
+    the "no monitor running yet" case (a fresh launch or restart)."""
+    global _scan_cache, _scan_cache_loaded_from_disk
+    if _scan_cache_loaded_from_disk:
+        return
+    _scan_cache_loaded_from_disk = True
+    try:
+        raw = json.loads(SCAN_CACHE_PATH.read_text())
+        _scan_cache = {path: (entry[0], entry[1]) for path, entry in raw.items()}
+    except (OSError, json.JSONDecodeError, KeyError, IndexError, TypeError):
+        pass
+
+
+def _save_scan_cache_to_disk() -> None:
+    """Pruned to transcripts that still exist on disk before writing:
+    without this, monitor-scan-cache.json only ever grows, across every
+    restart, for as long as the tool is used, retaining scan results
+    (including last_assistant_text snippets) for transcripts long since
+    deleted. os.path.exists() is a cheap stat, negligible next to the
+    json.loads() cost this cache exists to avoid (caught by review,
+    2026-08-17)."""
+    try:
+        SCAN_CACHE_PATH.write_text(json.dumps(
+            {path: [mtime, result] for path, (mtime, result) in _scan_cache.items()
+             if os.path.exists(path)}
+        ))
+    except OSError:
+        pass
 
 
 def scan_full_file(path: str, stale_ok: bool = False) -> dict:
     """Single-pass full file scan: tokens, MCP, title, slug, created, last activity.
 
-    Results are cached by (path, mtime) — unchanged files return instantly.
+    Results are cached by (path, mtime): unchanged files return instantly.
     When stale_ok=True, returns the last cached result even if mtime changed
     (hook state provides fresher status/tool data; tokens/model are slow-changing).
+    The cache itself is loaded from disk once per process (a prior run's
+    results), so a fresh launch or Shift+R restart doesn't re-parse every
+    transcript from scratch just because this is a new Python process.
     """
+    _load_scan_cache_from_disk()
     try:
         mtime = os.path.getmtime(path)
     except OSError:
@@ -551,6 +595,8 @@ def scan_full_file(path: str, stale_ok: bool = False) -> dict:
         pass
 
     _scan_cache[path] = (mtime, result)
+    global _scan_cache_dirty
+    _scan_cache_dirty = True
     return result
 
 
@@ -976,6 +1022,12 @@ def parse_sessions(include_archived: bool = False,
             print(f"[perf]   parse_sessions: PID-file orphans added: {n_orphans}", file=sys.stderr)
 
     sessions = filter_ignored(sessions)
+
+    global _scan_cache_dirty
+    if _scan_cache_dirty:
+        _save_scan_cache_to_disk()
+        _scan_cache_dirty = False
+
     return sessions
 
 
@@ -4001,7 +4053,8 @@ class ClaudeMonitor(App):
         (already warm, already deduped by dedupe_scheduled_sessions() in
         this instance's own refresh) instead of a fresh parse_sessions()."""
         prefs = load_prefs()
-        target = find_next_actionable(self.sessions, prefs.get("next_cursor"))
+        acked_ready = set(prefs.get("acked_ready", []))
+        target = find_next_actionable(self.sessions, prefs.get("next_cursor"), acked_ready)
         if target is None:
             mlog("jump", "next_request_none")
             self.notify("Nothing needs you right now", timeout=3)
@@ -5421,7 +5474,8 @@ def dedupe_scheduled_sessions(sessions: list["Session"], pinned: "set[str]") -> 
 ACTIONABLE_STATUSES = ("needs_approval", "done")
 
 
-def find_next_actionable(sessions: list["Session"], after_sid: str | None) -> "Session | None":
+def find_next_actionable(sessions: list["Session"], after_sid: str | None,
+                         acked_ready: "set[str] | None" = None) -> "Session | None":
     """The next session that needs you, cycling from after_sid so repeated
     calls walk the whole queue instead of landing on the same one every
     time. needs_approval sorts before done (it's the one actually blocking);
@@ -5429,8 +5483,22 @@ def find_next_actionable(sessions: list["Session"], after_sid: str | None) -> "S
     (jump_to_next_actionable / _handle_jump_next_request): there's no
     visible cursor to reason about there, so priority-by-urgency is exactly
     right. NOT used for the "n" key inside the monitor; see
-    _next_actionable_in_table_order for why that needs a different order."""
-    actionable = [s for s in sessions if s.status in ACTIONABLE_STATUSES and not s.is_subagent]
+    _next_actionable_in_table_order for why that needs a different order.
+
+    acked_ready excludes already-seen done sessions from the candidate
+    pool entirely (Max, 2026-08-17: "I don't want ctrl-shift-n to jump me
+    to an already read, redundantly... it keeps jumping me to X and I
+    don't need it, I already jumped and took no action"). needs_approval
+    is never excluded this way: acked_ready only ever holds done sessions
+    (_mark_ready_seen is a no-op for any other status), and a blocking
+    approval request stays urgent regardless of whether you've looked at
+    it. If everything actionable happens to be already-seen, this
+    correctly returns None rather than re-visiting one anyway."""
+    actionable = [
+        s for s in sessions
+        if s.status in ACTIONABLE_STATUSES and not s.is_subagent
+        and not (s.status == "done" and acked_ready and s.session_id in acked_ready)
+    ]
     if not actionable:
         return None
     actionable.sort(key=lambda s: (0 if s.status == "needs_approval" else 1, s.last_activity))
@@ -5570,7 +5638,8 @@ def jump_to_next_actionable() -> tuple[bool, str, "Session | None"]:
     sessions = parse_sessions(include_archived=False, include_subagents=False, pinned=pinned)
     sessions = dedupe_scheduled_sessions(sessions, pinned)
     prefs = load_prefs()
-    target = find_next_actionable(sessions, prefs.get("next_cursor"))
+    acked_ready = set(prefs.get("acked_ready", []))
+    target = find_next_actionable(sessions, prefs.get("next_cursor"), acked_ready)
     if target is None:
         return False, "Nothing needs you right now", None
 
