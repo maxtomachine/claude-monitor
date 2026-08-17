@@ -191,3 +191,42 @@ class TestFormatPlan:
         ]
         result = format_plan(tasks)
         assert "Working on it" in result
+
+
+class TestReadyReadUnread:
+    """Fixture from 2026-08-16: jumping to a READY session without sending
+    it anything acknowledges it (Max: "a sort of read/unread filter").
+    First cut kept the status yellow and only unbolded the row; Max then
+    asked for the status itself to move to mint, then clarified it should
+    stay bold doing so ("it can still be bold and ready but not yellow") —
+    still says READY, still bold, just off yellow once you've looked."""
+
+    def test_unseen_ready_is_yellow_and_bold_row(self):
+        s = make_session(session_id="a", title="Unseen", status="done")
+        status_cells = render_row(s, ["status"], acked_ready=set())
+        session_cells = render_row(s, ["session"], acked_ready=set())
+        assert "bright_yellow" in status_cells[0]
+        assert "[bold]" in session_cells[0]
+
+    def test_seen_ready_turns_mint_stays_bold_row_unbolds(self):
+        s = make_session(session_id="a", title="Seen", status="done")
+        status_cells = render_row(s, ["status"], acked_ready={"a"})
+        session_cells = render_row(s, ["session"], acked_ready={"a"})
+        assert "bright_yellow" not in status_cells[0]
+        assert "READY" in status_cells[0]
+        assert "[bold" in status_cells[0]  # the status badge stays bold
+        assert "[bold]" not in session_cells[0]  # only the row title unbolds
+
+    def test_acked_set_ignored_for_non_ready_statuses(self):
+        """Being in the acked set only matters while status is done; a
+        working or needs_approval row bolds regardless."""
+        s = make_session(session_id="a", title="Working", status="working")
+        cells = render_row(s, ["session"], acked_ready={"a"})
+        assert "[bold]" in cells[0]
+
+    def test_no_acked_set_defaults_to_unseen(self):
+        s = make_session(session_id="a", title="Ready", status="done")
+        session_cells = render_row(s, ["session"])
+        status_cells = render_row(s, ["status"])
+        assert "[bold]" in session_cells[0]
+        assert "bright_yellow" in status_cells[0]

@@ -283,6 +283,12 @@ STATUS_DISPLAY = {
 # don't need me because they are already whirring"). needs_approval stays
 # yellow, the one state that's actually blocking, above both.
 
+# READY read/unread (Max, 2026-08-16): jumping to a done session without
+# sending it anything acknowledges it. Still bold, still says READY, the
+# color just moves off yellow to mint so a glance tells you "already
+# looked at this one" without it reading as closed or any less real.
+READY_SEEN_COLOR = "#8FD9B6"
+
 # The one test for "this row is inactive": rendered dim instead of bold
 # (render_row), excluded from menus meant for live sessions, and what
 # hide_inactive_pins hides. Getting this tuple wrong at just one of its
@@ -2159,13 +2165,17 @@ def sort_sessions(sessions: list[Session], mode: SortMode) -> list[Session]:
 # ── Column rendering ──────────────────────────────────────────────────────────
 
 
-def render_status_cell(status: str, spin_idx: int = 0, last_activity: float = 0.0) -> str:
+def render_status_cell(status: str, spin_idx: int = 0, last_activity: float = 0.0,
+                       seen: bool = False) -> str:
     icon, color = STATUS_DISPLAY.get(status, ("?", "white"))
     if status == "working":
         frame = SPINNER_FRAMES[spin_idx % len(SPINNER_FRAMES)]
         return f"[#D97757]{frame}[/] [{color}]WORKING[/]"
-    if status == "done" and last_activity > 0:
-        return f"[{color}]{icon} {format_ago(last_activity)}[/]"
+    if status == "done":
+        if seen:
+            color = READY_SEEN_COLOR
+        text = f"{icon} {format_ago(last_activity)}" if last_activity > 0 else icon
+        return f"[bold {color}]{text}[/]"
     return f"[{color}]{icon}[/]"
 
 
@@ -2185,18 +2195,25 @@ def _group_key(name: str) -> str:
     return parts[0] if parts and parts[0] else "ungrouped"
 
 
-def render_row(s: Session, visible_cols: list[str], spin_idx: int = 0) -> list[str]:
+def render_row(s: Session, visible_cols: list[str], spin_idx: int = 0,
+               acked_ready: "set[str] | None" = None) -> list[str]:
+    # READY read/unread (Max, 2026-08-16): jumping to a done session without
+    # sending it anything acknowledges it. Still bold, still says READY,
+    # just off yellow to mint (render_status_cell) — the row title unbolds
+    # too, the same "seen" distinction email gives read mail: the color
+    # says what's true, the weight says whether you've already looked.
+    seen_ready = bool(s.status == "done" and acked_ready and s.session_id in acked_ready)
     cells = []
     for col in visible_cols:
         if col == "status":
-            cells.append(render_status_cell(s.status, spin_idx, s.last_activity))
+            cells.append(render_status_cell(s.status, spin_idx, s.last_activity, seen=seen_ready))
         elif col == "session":
             if s.is_subagent:
                 cells.append(f"[dim]└─ {s.title}[/]")
             else:
                 # Live sessions render bold so they pop against the dim
                 # (archived) and dark-gray (closed) rows.
-                t = s.title if s.status in INACTIVE_STATUSES else f"[bold]{s.title}[/bold]"
+                t = s.title if (s.status in INACTIVE_STATUSES or seen_ready) else f"[bold]{s.title}[/bold]"
                 if s.subagents:
                     t += f" [dim](+{len(s.subagents)})[/]"
                 cells.append(t)
@@ -2567,6 +2584,25 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         mlog("jump", "jxa_error", error=str(e), sid=session.session_id[:12])
     return False
+
+
+def _mark_ready_seen(session_id: str, status: str) -> None:
+    """Read/unread for READY rows (Max, 2026-08-16): jumping to a session
+    while it's done acknowledges it, so its row unbolds without touching
+    its yellow status, until it cycles through another state and becomes
+    done again. Called from every jump path (SessionMenu, double-click, the
+    "n" key, and the headless --jump-next CLI) so all of them count as
+    "you looked at it," not just one. Persisted rather than held in memory:
+    --jump-next runs as its own short-lived process, so the running
+    monitor can only learn about that jump by reading it back from disk."""
+    if status != "done":
+        return
+    prefs = load_prefs()
+    acked = set(prefs.get("acked_ready", []))
+    if session_id not in acked:
+        acked.add(session_id)
+        prefs["acked_ready"] = list(acked)
+        save_prefs(prefs)
 
 
 def focus_terminal_session(session: Session) -> bool:
@@ -3509,19 +3545,22 @@ class DosFooter(Static):
     """
 
     def __init__(self, items: list[tuple[str, str]], **kwargs) -> None:
-        # items: [(key, label), ...] where key is the highlighted letter.
-        # Every item here is Ctrl+<key> (plain letters are the type-ahead
-        # group jump), so each label is prefixed with the caret notation.
+        # items: [(key, label), ...], optionally [(key, label, prefix)] for
+        # a plain-letter exception (Max, 2026-08-16: "n" for jump-next).
+        # Default prefix "^" (Ctrl+<key>, plain letters are the type-ahead
+        # group jump); pass "" for a key that's deliberately unmodified.
         parts = []
-        for key, label in items:
+        for item in items:
+            key, label = item[0], item[1]
+            prefix = item[2] if len(item) > 2 else "^"
             idx = label.lower().find(key.lower())
             if idx >= 0:
                 before = label[:idx]
                 letter = label[idx]
                 after = label[idx + 1:]
-                parts.append(f"^{before}[bold #D97757]{letter}[/]{after}")
+                parts.append(f"{prefix}{before}[bold #D97757]{letter}[/]{after}")
             else:
-                parts.append(f"^[bold #D97757]{key}[/] {label}")
+                parts.append(f"{prefix}[bold #D97757]{key}[/] {label}")
         super().__init__("  ".join(parts), **kwargs)
 
 
@@ -3611,7 +3650,11 @@ class ClaudeMonitor(App):
     # Plain letters (no modifier) are reserved for the type-ahead group jump
     # (see on_key): every command that used to sit on a bare letter now
     # requires Ctrl, so typing a group's name never fires a hotkey mid-word.
-    # Shift-bound (K/R/P) and non-letter bindings are untouched.
+    # Shift-bound (K/R/P) and non-letter bindings are untouched. Plain "n" is
+    # a second deliberate exception (Max, 2026-08-16): jump-to-next-actionable
+    # is meant to be a single unmodified keystroke, so no group name starting
+    # with "n" can be reached via type-ahead — the same tradeoff K/R/P already
+    # accepted for their own letters.
     #
     # Ctrl+H and Ctrl+I are NOT ctrl+letter to Textual: the xterm input
     # protocol Textual speaks (drivers/linux_driver.py has no Kitty/enhanced
@@ -3635,6 +3678,7 @@ class ClaudeMonitor(App):
         Binding("escape", "clear_search", "Clear", show=False),
         Binding("down", "search_to_table", show=False),
         Binding("R", "restart", "Restart", show=False),
+        Binding("n", "jump_next_actionable", "Next"),
         Binding("ctrl+j", "cursor_down", "↓", show=False),
         Binding("ctrl+n", "edit_name", "Name"),
         Binding("P", "proactive_group", "/proactive→group", show=False),
@@ -3704,7 +3748,7 @@ class ClaudeMonitor(App):
         yield DosFooter([
             ("Q", "Quit"), ("R", "Refresh"), ("S", "Sort"), ("A", "Agents"),
             ("H", "History"), ("C", "Columns"), ("N", "Name"),
-            ("G", "Group"),
+            ("G", "Group"), ("n", "Next", ""),
         ])
 
     def on_mount(self) -> None:
@@ -3846,9 +3890,12 @@ class ClaudeMonitor(App):
             self.notify(f"Jump: no session matching {target[:20]}", timeout=3)
             return
         self._ack_bell(s.session_id)
-        self.run_worker(
-            lambda s=s: focus_terminal_session(s), thread=True,
-        )
+
+        def _jump_and_mark(s=s):
+            if focus_terminal_session(s):
+                _mark_ready_seen(s.session_id, s.status)
+
+        self.run_worker(_jump_and_mark, thread=True)
 
     def _periodic_reconcile(self) -> None:
         """Run the reconciliation sweep in a background thread every 30s."""
@@ -4039,21 +4086,7 @@ class ClaudeMonitor(App):
 
             # Hide closed sessions unless "All" is toggled
             if not self.show_scheduled:
-                # Scheduled runs (sdk-cli, headless): keep only the most-recent
-                # per (cwd, title) so daily scouts don't flood history. The
-                # latest still shows so you can read the most recent run.
-                latest: dict[tuple[str, str], Session] = {}
-                kept = []
-                for s in sessions:
-                    if not s.is_scheduled or s.session_id in self._pinned:
-                        kept.append(s)
-                        continue
-                    key = (s.cwd, s.title)
-                    cur = latest.get(key)
-                    if cur is None or s.last_activity > cur.last_activity:
-                        latest[key] = s
-                kept.extend(latest.values())
-                sessions = kept
+                sessions = dedupe_scheduled_sessions(sessions, self._pinned)
 
             # True group sizes, from the set as if hide_inactive_pins were off:
             # a group's real membership must never depend on which of its
@@ -4152,9 +4185,23 @@ class ClaudeMonitor(App):
 
             disambiguate_titles(flat)
 
+            # "Seen" READY rows (Max, 2026-08-16): read fresh from prefs each
+            # cycle, not held in memory, since a jump from Ctrl+Shift+N runs
+            # as a separate short-lived process and must be picked up here.
+            # Pruned to sessions currently done — once a session cycles away
+            # from done (you sent it something, or it closed) its old ack is
+            # meaningless, and dropping it here keeps the prefs file from
+            # accumulating every session that was ever briefly READY.
+            done_now = {s.session_id for s in flat if s.status == "done"}
+            _next_prefs = load_prefs()
+            acked_ready = set(_next_prefs.get("acked_ready", [])) & done_now
+            if acked_ready != set(_next_prefs.get("acked_ready", [])):
+                _next_prefs["acked_ready"] = list(acked_ready)
+                save_prefs(_next_prefs)
+
             # Pre-render rows in background thread (Rich markup generation)
             visible_cols = self._visible_cols
-            rendered = [(s, render_row(s, visible_cols)) for s in flat]
+            rendered = [(s, render_row(s, visible_cols, acked_ready=acked_ready)) for s in flat]
 
             # Check system appearance in background thread (avoids
             # subprocess.run on Textual's main thread)
@@ -4332,6 +4379,7 @@ class ClaudeMonitor(App):
                             self.notify("Could not find or resume session", timeout=4)
                 mlog("menu", "jump_result", sid=s.session_id[:12], success=ok)
                 if ok:
+                    _mark_ready_seen(s.session_id, s.status)
                     self.action_clear_search()
             elif action == "edit_name":
                 self.action_edit_name()
@@ -4810,6 +4858,30 @@ class ClaudeMonitor(App):
         self._set_selection(sids)
         table.move_cursor(row=event.row_index)
 
+    def action_jump_next_actionable(self) -> None:
+        """Plain "n": move the cursor to the next session that needs you
+        (needs_approval, then done, cycling from wherever the cursor is
+        now), nothing more. It does NOT jump — Ctrl+Shift+N is the actual
+        jump command, from inside the monitor or anywhere else on the
+        machine. n-Enter-Enter (move, open the menu, pick Jump) jumps too,
+        naked n does not (Max, 2026-08-16: "n in monitor should just move
+        the highlighted row"). Doesn't touch next_cursor (that's the
+        headless path's own walk-the-queue position, and pure browsing
+        shouldn't silently advance it) or the READY read/unread mark
+        (that's earned by actually jumping, not by looking). Picks from
+        self._flat_rows (the search-filtered, currently-displayed set), not
+        self.sessions (unfiltered): candidates hidden by an active search
+        aren't reachable rows to move to, and self.sessions has no bearing
+        on what's actually in the table right now."""
+        current = self._cursor_session()
+        target = find_next_actionable(self._flat_rows, current.session_id if current else None)
+        if target is None:
+            self.notify("Nothing needs you right now", timeout=3)
+            return
+        row = self._row_index_of(target.session_id)
+        if row is not None:
+            self.query_one("#session-table", DataTable).move_cursor(row=row)
+
     def action_toggle_archived(self) -> None:
         self._selection = set()
         self._selection_anchor = None
@@ -5182,6 +5254,88 @@ class ClaudeMonitor(App):
         self.query_one("#session-table", DataTable).action_cursor_up()
 
 
+def dedupe_scheduled_sessions(sessions: list["Session"], pinned: "set[str]") -> list["Session"]:
+    """Scheduled runs (sdk-cli, headless): keep only the most-recent per
+    (cwd, title) so daily scouts don't flood the view. The latest still
+    shows so you can read the most recent run. Shared by the TUI's own
+    refresh and jump_to_next_actionable() so the headless --jump-next CLI
+    sees the exact same candidate set as the in-app "n" key: they merged
+    into one reimplementation once, letting the two pick different targets
+    for a shared next_cursor (caught 2026-08-16, before it shipped)."""
+    latest: dict[tuple[str, str], Session] = {}
+    kept = []
+    for s in sessions:
+        if not s.is_scheduled or s.session_id in pinned:
+            kept.append(s)
+            continue
+        key = (s.cwd, s.title)
+        cur = latest.get(key)
+        if cur is None or s.last_activity > cur.last_activity:
+            latest[key] = s
+    kept.extend(latest.values())
+    return kept
+
+
+# "Needs you": needs_approval (blocking, explicit) and done (finished,
+# waiting on your next move). Shared by the in-app "n" key and the headless
+# --jump-next CLI path so pressing n inside the monitor and Ctrl+Shift+N from
+# anywhere else are the same feature, not two independent reimplementations.
+ACTIONABLE_STATUSES = ("needs_approval", "done")
+
+
+def find_next_actionable(sessions: list["Session"], after_sid: str | None) -> "Session | None":
+    """The next session that needs you, cycling from after_sid so repeated
+    calls walk the whole queue instead of landing on the same one every
+    time. needs_approval sorts before done (it's the one actually blocking);
+    within each, the longest-waiting session comes first."""
+    actionable = [s for s in sessions if s.status in ACTIONABLE_STATUSES and not s.is_subagent]
+    if not actionable:
+        return None
+    actionable.sort(key=lambda s: (0 if s.status == "needs_approval" else 1, s.last_activity))
+    if after_sid:
+        ids = [s.session_id for s in actionable]
+        if after_sid in ids:
+            return actionable[(ids.index(after_sid) + 1) % len(actionable)]
+    return actionable[0]
+
+
+def jump_to_next_actionable() -> tuple[bool, str, "Session | None"]:
+    """Find and jump to the next session that needs you, resuming it if its
+    window can't be found and it isn't alive. Persists which session it
+    landed on (in monitor-prefs.json) so the NEXT call, whether that's
+    pressing n again inside the app or Ctrl+Shift+N from anywhere else,
+    continues the same walk through the queue rather than repeating. Runs
+    the same dedupe_scheduled_sessions() pass the TUI's own refresh does:
+    without it this candidate set can quietly disagree with the in-app "n"
+    key's (self.sessions is already deduped), so the two "shared cursor"
+    entry points could advance next_cursor to different targets."""
+    pinned = load_pinned_sessions()
+    sessions = parse_sessions(include_archived=False, include_subagents=False, pinned=pinned)
+    sessions = dedupe_scheduled_sessions(sessions, pinned)
+    prefs = load_prefs()
+    target = find_next_actionable(sessions, prefs.get("next_cursor"))
+    if target is None:
+        return False, "Nothing needs you right now", None
+
+    prefs["next_cursor"] = target.session_id
+    save_prefs(prefs)
+
+    ok = focus_terminal_session(target)
+    if ok:
+        _mark_ready_seen(target.session_id, target.status)
+        return True, target.title, target
+    if _is_session_alive(target.session_id):
+        mlog("DIVERGE", "alive_but_unfound", sid=target.session_id[:12], title=target.title,
+             candidates=_resolve_match_candidates(target))
+        _heal_hook_state(target.session_id)
+        return False, f"Window not found for {target.title[:20]}. Press Enter → Resume.", target
+    ok = resume_session(target)
+    if ok:
+        _mark_ready_seen(target.session_id, target.status)
+        return True, f"Resuming {target.title[:20]} in new window", target
+    return False, f"Could not find or resume {target.title[:20]}", target
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--log":
         from monitor_log import tail_log
@@ -5189,6 +5343,13 @@ def main():
         tail_log(category=cat_filter)
     elif len(sys.argv) > 1 and sys.argv[1] == "--reconcile":
         sys.exit(min(run_reconcile_report(), 1))
+    elif len(sys.argv) > 1 and sys.argv[1] == "--jump-next":
+        # Ephemeral: no TUI, no visible window of its own. Reuses the exact
+        # same selection the in-app "n" key uses so Ctrl+Shift+N from
+        # anywhere on the machine is that key, not a second reimplementation.
+        ok, message, _target = jump_to_next_actionable()
+        mlog("jump", "cli_next", ok=ok, message=message)
+        sys.exit(0 if ok else 1)
     else:
         app = ClaudeMonitor()
         app.run()

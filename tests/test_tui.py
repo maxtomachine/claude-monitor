@@ -1085,6 +1085,190 @@ class TestHideAndMultiSelect:
             assert pilot.app._delete_armed_for is None
 
 
+class TestNextActionableMovesCursorOnly:
+    """Fixture from 2026-08-16, corrected same day: "n" was first built to
+    jump immediately, which Max caught and reversed: "n in monitor should
+    just move the highlighted row [...] n-Enter-Enter would also jump but
+    not just naked n." Ctrl+Shift+N (claude-monitor --jump-next) is the
+    actual jump command, usable from inside the monitor or anywhere else on
+    the machine; plain "n" only ever repositions the cursor."""
+
+    def _sessions(self):
+        return [
+            make_session(session_id="working-1", title="Working", status="working"),
+            make_session(session_id="ready-1", title="Ready One", status="done",
+                        last_activity=100),
+            make_session(session_id="approve-1", title="Needs Approval",
+                        status="needs_approval", last_activity=200),
+        ]
+
+    async def test_n_moves_cursor_without_jumping(self):
+        sessions = self._sessions()
+        with patch("claude_monitor.parse_sessions", return_value=sessions), \
+             patch("claude_monitor.focus_terminal_session") as jump, \
+             patch("claude_monitor.resume_session") as resume:
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("n")
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                cursor_session = pilot.app._row_map[table.cursor_row]
+                assert cursor_session.session_id == "approve-1"
+                jump.assert_not_called()
+                resume.assert_not_called()
+
+    async def test_n_does_not_touch_shared_next_cursor_or_read_mark(self):
+        """Browsing with n is not the same as visiting: it must not advance
+        the queue position Ctrl+Shift+N walks, or mark a READY row seen."""
+        sessions = self._sessions()
+        with patch("claude_monitor.parse_sessions", return_value=sessions), \
+             patch("claude_monitor.save_prefs") as save, \
+             patch("claude_monitor.focus_terminal_session"):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                save.reset_mock()  # drop the startup launch_count save
+                await pilot.press("n")
+                await pilot.pause()
+                for call in save.call_args_list:
+                    prefs_arg = call[0][0]
+                    assert "next_cursor" not in prefs_arg
+                    assert "acked_ready" not in prefs_arg
+
+    async def test_n_with_nothing_actionable_notifies(self):
+        sessions = [make_session(session_id="w", title="Working", status="working")]
+        with patch("claude_monitor.parse_sessions", return_value=sessions), \
+             patch("claude_monitor.focus_terminal_session") as jump:
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("n")
+                await pilot.pause()
+                jump.assert_not_called()
+
+    async def test_n_cycles_from_current_cursor_not_the_start(self):
+        a = make_session(session_id="a", title="A", status="done", last_activity=100)
+        b = make_session(session_id="b", title="B", status="done", last_activity=200)
+        with patch("claude_monitor.parse_sessions", return_value=[a, b]):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+
+                await pilot.press("n")
+                await pilot.pause()
+                assert pilot.app._row_map[table.cursor_row].session_id == "a"
+
+                await pilot.press("n")
+                await pilot.pause()
+                assert pilot.app._row_map[table.cursor_row].session_id == "b"
+
+                await pilot.press("n")  # wraps back around
+                await pilot.pause()
+                assert pilot.app._row_map[table.cursor_row].session_id == "a"
+
+    async def test_n_enter_enter_still_jumps(self):
+        """n moves the cursor; Enter then opens the menu on that row, and a
+        second Enter picks its default (Jump for a live session), the
+        combination Max named as the intended way to actually jump via n."""
+        sessions = self._sessions()
+        with patch("claude_monitor.parse_sessions", return_value=sessions), \
+             patch("claude_monitor.focus_terminal_session", return_value=True) as jump:
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("n")
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause()
+                jump.assert_called_once()
+                assert jump.call_args[0][0].session_id == "approve-1"
+
+    async def test_n_only_considers_search_filtered_visible_rows(self):
+        """Bug caught by review (2026-08-16): action_jump_next_actionable()
+        used to pick from self.sessions (unfiltered by the active search
+        box) but move the cursor via self._row_map (filtered), so a target
+        hidden by search silently no-opped: find_next_actionable found it,
+        but _row_index_of couldn't locate it in the visible table at all.
+        Must pick from self._flat_rows, the same filtered set the table
+        itself renders from."""
+        sessions = self._sessions()  # ready-1 and approve-1 are the actionable ones
+        with patch("claude_monitor.parse_sessions", return_value=sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                pilot.app._filter = "working"  # matches only working-1 (not actionable)
+                pilot.app.refresh_sessions()
+                await pilot.pause()
+                await pilot.pause()
+                table = pilot.app.query_one("#session-table", DataTable)
+                before = table.cursor_row
+                await pilot.press("n")
+                await pilot.pause()
+                # ready-1 and approve-1 are both hidden by the filter: nothing to move to.
+                assert table.cursor_row == before
+
+
+class TestReadyOnlyMarkedSeenOnActualJump:
+    """Bug caught by review (2026-08-16): _mark_ready_seen() ran before
+    checking whether the jump actually landed anywhere, so a failed jump
+    (window not found, not alive enough to resume) still persisted the
+    session as seen. CLAUDE.md's stated invariant is "only an actual jump
+    marks a session seen" — these confirm the fix holds at every call site
+    that jumps: the SessionMenu action and the headless --jump-next path."""
+
+    def test_headless_path_does_not_mark_seen_when_window_not_found(self):
+        target = make_session(session_id="ready-1", title="Ready", status="done")
+        with patch("claude_monitor.parse_sessions", return_value=[target]), \
+             patch("claude_monitor.load_pinned_sessions", return_value=set()), \
+             patch("claude_monitor.load_prefs", return_value={}), \
+             patch("claude_monitor.save_prefs"), \
+             patch("claude_monitor.focus_terminal_session", return_value=False), \
+             patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor._heal_hook_state"), \
+             patch("claude_monitor._mark_ready_seen") as mark_seen:
+            from claude_monitor import jump_to_next_actionable
+            ok, _msg, _s = jump_to_next_actionable()
+            assert ok is False
+            mark_seen.assert_not_called()
+
+    def test_headless_path_marks_seen_on_successful_jump(self):
+        target = make_session(session_id="ready-1", title="Ready", status="done")
+        with patch("claude_monitor.parse_sessions", return_value=[target]), \
+             patch("claude_monitor.load_pinned_sessions", return_value=set()), \
+             patch("claude_monitor.load_prefs", return_value={}), \
+             patch("claude_monitor.save_prefs"), \
+             patch("claude_monitor.focus_terminal_session", return_value=True), \
+             patch("claude_monitor._mark_ready_seen") as mark_seen:
+            from claude_monitor import jump_to_next_actionable
+            ok, _msg, _s = jump_to_next_actionable()
+            assert ok is True
+            mark_seen.assert_called_once_with("ready-1", "done")
+
+    async def test_session_menu_jump_does_not_mark_seen_when_window_not_found(self):
+        target = make_session(session_id="ready-1", title="Ready", status="done")
+        with patch("claude_monitor.parse_sessions", return_value=[target]), \
+             patch("claude_monitor.focus_terminal_session", return_value=False), \
+             patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor._heal_hook_state"), \
+             patch("claude_monitor._mark_ready_seen") as mark_seen:
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                handler = pilot.app._make_menu_handler(target)
+                handler("jump")
+                await pilot.pause()
+                mark_seen.assert_not_called()
+
+    async def test_session_menu_jump_marks_seen_on_success(self):
+        target = make_session(session_id="ready-1", title="Ready", status="done")
+        with patch("claude_monitor.parse_sessions", return_value=[target]), \
+             patch("claude_monitor.focus_terminal_session", return_value=True), \
+             patch("claude_monitor._mark_ready_seen") as mark_seen:
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                handler = pilot.app._make_menu_handler(target)
+                handler("jump")
+                await pilot.pause()
+                mark_seen.assert_called_once_with("ready-1", "done")
+
+
 class TestBell:
     async def test_no_bell_on_startup(self):
         sessions = [make_session(session_id="s1", title="t", status="needs_approval")]

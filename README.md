@@ -175,6 +175,32 @@ Security → Accessibility → enable `skhd`. One-time per machine.
 The script is at `~/.local/bin/jumpback` if you want to bind it
 differently (Shortcuts.app, Karabiner, etc.).
 
+### Jump to next (Ctrl+Shift+N, and "n" inside the monitor)
+
+Press `Ctrl+Shift+N` from anywhere to instantly jump to the next session
+that needs you (blocked on your approval, or finished and waiting on your
+next move), without opening the monitor at all — `claude-monitor
+--jump-next` runs headless: it parses sessions, picks the target, jumps or
+resumes, and exits. Press repeatedly to walk through everything that needs
+you, oldest-waiting first, needs-approval before done. A READY session you
+land on this way is marked seen: its status stays bold and still says
+READY, but the color moves off yellow to mint, and its row title unbolds,
+until it cycles through another state and becomes READY again.
+
+Inside the monitor, plain `n` (no modifier) only moves the cursor to the
+next session that needs you; it does not jump. `n` then `Enter` then
+`Enter` (move, open the menu, pick Jump) does jump — naked `n` alone
+doesn't. `n` is a deliberate exception to "every hotkey needs Ctrl"
+(alongside `K`/`R`/`P`): it's meant to be a single unmodified keystroke, at
+the cost of `n` no longer being available for type-ahead group jump.
+
+Add the `skhd` binding yourself (`install.sh` doesn't do this one
+automatically):
+
+```
+ctrl + shift - n : ~/.local/bin/claude-monitor --jump-next
+```
+
 ## Configuration
 
 Preferences persist at `~/.claude/monitor-prefs.json`:
