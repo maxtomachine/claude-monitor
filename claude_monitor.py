@@ -3650,14 +3650,21 @@ class StatsBar(Horizontal):
         yield Input(placeholder="🔍 filter...", id="search-bar")
         yield Label("[dim]/ search[/]", id="search-hint")
 
-    def update_stats(self, sessions: list[Session], sort_mode: SortMode) -> None:
+    def update_stats(self, sessions: list[Session], sort_mode: SortMode,
+                     dark: bool = True) -> None:
         working = sum(1 for s in sessions if s.status == "working")
         approve = sum(1 for s in sessions if s.status == "needs_approval")
         done = sum(1 for s in sessions if s.status == "done")
         closed = sum(1 for s in sessions if s.status == "closed")
         total_cost = sum(s.cost for s in sessions)
 
-        ready_color = READY_COLOR_LIGHT if self.app.theme == "gruvbox-light" else READY_COLOR_DARK
+        # `dark` is the caller's job to supply (from _refresh_apply's own
+        # sys_dark, the same value render_row()/render_status_cell() use),
+        # not this method's to independently derive from self.app.theme:
+        # two separately-computed light/dark checks are only coincidentally
+        # in sync today via _sync_system_theme, and would silently diverge
+        # the moment either path changes (caught by review, 2026-08-17).
+        ready_color = READY_COLOR_DARK if dark else READY_COLOR_LIGHT
         self.query_one("#stats-working", Label).update(f" [green]● {working} working[/]  ")
         self.query_one("#stats-approve", Label).update(f" [yellow]◉ {approve} approve[/]  " if approve else "")
         self.query_one("#stats-done", Label).update(f" [{ready_color}]○ {done} ready[/]  ")
@@ -3890,8 +3897,6 @@ class ClaudeMonitor(App):
             )
         _perf("on_mount: launch_count save_prefs + notify", t0)
 
-    _JUMP_REQUEST = JUMP_REQUEST_PATH
-
     def _start_jump_server(self) -> None:
         """Serve http://localhost:48624/jump/<sid8-or-name> so cross-session
         mentions in any Claude's output can be cmd+clicked. Ghostty's URL
@@ -3900,7 +3905,7 @@ class ClaudeMonitor(App):
         the raised terminal window covers the browser a beat later. Bound to
         127.0.0.1 only. Silently skipped if the port is already taken (another
         monitor instance owns it)."""
-        request_path = self._JUMP_REQUEST
+        request_path = JUMP_REQUEST_PATH
 
         class _JumpHandler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *a):  # noqa: N802 - silence stderr
@@ -3953,10 +3958,10 @@ class ClaudeMonitor(App):
         self.sessions is already warm from the running monitor's own
         3-second refresh loop."""
         try:
-            if not self._JUMP_REQUEST.exists():
+            if not JUMP_REQUEST_PATH.exists():
                 return
-            target = self._JUMP_REQUEST.read_text().strip()
-            self._JUMP_REQUEST.unlink()
+            target = JUMP_REQUEST_PATH.read_text().strip()
+            JUMP_REQUEST_PATH.unlink()
         except OSError:
             return
         if not target:
@@ -4005,7 +4010,13 @@ class ClaudeMonitor(App):
         save_prefs(prefs)
         self._ack_bell(target.session_id)
         mlog("jump", "next_request", sid=target.session_id[:12], title=target.title)
-        self.run_worker(lambda s=target: _focus_or_resume_target(s), thread=True)
+
+        def _jump_and_notify(s=target):
+            ok, message = _focus_or_resume_target(s)
+            if not ok:
+                self.notify(message, timeout=6, severity="warning")
+
+        self.run_worker(_jump_and_notify, thread=True)
 
     def _periodic_reconcile(self) -> None:
         """Run the reconciliation sweep in a background thread every 30s."""
@@ -4462,7 +4473,7 @@ class ClaudeMonitor(App):
         self.call_after_refresh(
             lambda: table.scroll_to(saved_scroll_x, saved_scroll_y, animate=False)
         )
-        self.query_one(StatsBar).update_stats(self.sessions, self.sort_mode)
+        self.query_one(StatsBar).update_stats(self.sessions, self.sort_mode, dark=sys_dark)
 
     def _make_menu_handler(self, s: Session):
         """Build the SessionMenu dismiss callback for a session."""
@@ -4977,7 +4988,7 @@ class ClaudeMonitor(App):
     def action_jump_next_actionable(self) -> None:
         """Plain "n": move the cursor to the next session that needs you,
         walking down the table in the order you're actually looking at it,
-        nothing more. It does NOT jump — Ctrl+Shift+N is the actual jump
+        nothing more. It does NOT jump: Ctrl+Shift+N is the actual jump
         command, from inside the monitor or anywhere else on the machine.
         n-Enter-Enter (move, open the menu, pick Jump) jumps too, naked n
         does not (Max, 2026-08-16: "n in monitor should just move the

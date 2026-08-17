@@ -76,7 +76,11 @@ class TestAppMounts:
         """Bug reported by Max (2026-08-17): yellow doesn't pop against
         light mode's own cream background. The stats bar's "N ready" count
         must match whatever color the individual READY rows use for the
-        current theme, not stay hardcoded to bright_yellow."""
+        current theme, not stay hardcoded to bright_yellow. update_stats()
+        takes `dark` explicitly (the same value _refresh_apply's own
+        sys_dark supplies to render_row()), not an independent self.app.
+        theme check: two separately-derived light/dark sources were only
+        coincidentally in sync (caught by review, 2026-08-17)."""
         from claude_monitor import SortMode, READY_COLOR_DARK, READY_COLOR_LIGHT
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
@@ -84,13 +88,11 @@ class TestAppMounts:
                 stats = pilot.app.query_one(StatsBar)
                 label = stats.query_one("#stats-done")
 
-                pilot.app.theme = "gruvbox-dark"
-                stats.update_stats(sample_sessions, SortMode.ALPHA)
+                stats.update_stats(sample_sessions, SortMode.ALPHA, dark=True)
                 styles = [span.style for span in label.render().spans]
                 assert READY_COLOR_DARK in styles
 
-                pilot.app.theme = "gruvbox-light"
-                stats.update_stats(sample_sessions, SortMode.ALPHA)
+                stats.update_stats(sample_sessions, SortMode.ALPHA, dark=False)
                 styles = [span.style for span in label.render().spans]
                 assert READY_COLOR_LIGHT in styles
 
@@ -1354,46 +1356,85 @@ class TestJumpRequestSentinelDispatch:
     monitor's own request-file poller has to match on startswith, not ==,
     to still recognize a token-suffixed sentinel as the same command.
 
-    Every test here points _JUMP_REQUEST at a scratch path (tmp_path), not
-    the real /tmp/claude-jump-request: that file is shared with any
-    monitor actually running on this machine, and writing a real sentinel
-    to it from a test would fire an unintended restart or jump on it."""
+    Every test here monkeypatches the module-level JUMP_REQUEST_PATH to a
+    scratch path (tmp_path), not the real /tmp/claude-jump-request: that
+    file is shared with any monitor actually running on this machine, and
+    writing a real sentinel to it from a test would fire an unintended
+    restart or jump on it. _check_jump_request()/_start_jump_server()
+    reference JUMP_REQUEST_PATH directly rather than caching it into a
+    class attribute at class-definition time, precisely so a monkeypatch
+    like this one takes effect (review, 2026-08-17)."""
 
-    async def test_jump_next_sentinel_with_token_dispatches_to_fast_path(self, tmp_path):
+    async def test_jump_next_sentinel_with_token_dispatches_to_fast_path(self, tmp_path, monkeypatch):
+        import claude_monitor as cm
+        monkeypatch.setattr(cm, "JUMP_REQUEST_PATH", tmp_path / "jump-request")
         target = make_session(session_id="ready-1", title="Ready", status="done")
         with patch("claude_monitor.parse_sessions", return_value=[target]):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                pilot.app._JUMP_REQUEST = tmp_path / "jump-request"
                 with patch.object(pilot.app, "_handle_jump_next_request") as handler:
-                    pilot.app._JUMP_REQUEST.write_text("__jump_next__:12345:999")
+                    cm.JUMP_REQUEST_PATH.write_text("__jump_next__:12345:999")
                     pilot.app._check_jump_request()
                     handler.assert_called_once()
 
-    async def test_restart_sentinel_with_token_dispatches_to_restart(self, tmp_path):
+    async def test_restart_sentinel_with_token_dispatches_to_restart(self, tmp_path, monkeypatch):
+        import claude_monitor as cm
+        monkeypatch.setattr(cm, "JUMP_REQUEST_PATH", tmp_path / "jump-request")
         target = make_session(session_id="ready-1", title="Ready", status="done")
         with patch("claude_monitor.parse_sessions", return_value=[target]):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                pilot.app._JUMP_REQUEST = tmp_path / "jump-request"
                 with patch.object(pilot.app, "action_restart") as restart:
-                    pilot.app._JUMP_REQUEST.write_text("__restart__:12345:999")
+                    cm.JUMP_REQUEST_PATH.write_text("__restart__:12345:999")
                     pilot.app._check_jump_request()
                     restart.assert_called_once()
 
-    async def test_unrelated_sid_request_is_not_treated_as_a_sentinel(self, tmp_path):
+    async def test_unrelated_sid_request_is_not_treated_as_a_sentinel(self, tmp_path, monkeypatch):
         """A real sid/title request must still take the generic match path,
         not get accidentally swallowed by a startswith() sentinel check."""
+        import claude_monitor as cm
+        monkeypatch.setattr(cm, "JUMP_REQUEST_PATH", tmp_path / "jump-request")
         target = make_session(session_id="ready-1", title="Ready", status="done")
         with patch("claude_monitor.parse_sessions", return_value=[target]), \
              patch("claude_monitor.focus_terminal_session", return_value=True) as jump:
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                pilot.app._JUMP_REQUEST = tmp_path / "jump-request"
-                pilot.app._JUMP_REQUEST.write_text("ready-1")
+                cm.JUMP_REQUEST_PATH.write_text("ready-1")
                 pilot.app._check_jump_request()
                 await pilot.pause()
                 jump.assert_called_once()
+
+
+class TestJumpNextRequestFailureFeedback:
+    """Bug caught by review (2026-08-17): _handle_jump_next_request's
+    background worker discarded _focus_or_resume_target()'s return value
+    entirely, so a failed Ctrl+Shift+N jump (window not found, can't
+    resume) left the user with no feedback at all, not even a toast."""
+
+    async def test_notifies_on_failed_jump(self):
+        target = make_session(session_id="ready-1", title="Ready", status="done")
+        with patch("claude_monitor.parse_sessions", return_value=[target]), \
+             patch("claude_monitor.focus_terminal_session", return_value=False), \
+             patch("claude_monitor._is_session_alive", return_value=False), \
+             patch("claude_monitor.resume_session", return_value=False):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                with patch.object(pilot.app, "notify") as notify:
+                    pilot.app._handle_jump_next_request()
+                    await pilot.pause()
+                    notify.assert_called_once()
+                    assert "Ready" in notify.call_args[0][0]
+
+    async def test_does_not_notify_on_success(self):
+        target = make_session(session_id="ready-1", title="Ready", status="done")
+        with patch("claude_monitor.parse_sessions", return_value=[target]), \
+             patch("claude_monitor.focus_terminal_session", return_value=True):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                with patch.object(pilot.app, "notify") as notify:
+                    pilot.app._handle_jump_next_request()
+                    await pilot.pause()
+                    notify.assert_not_called()
 
 
 class TestBell:
