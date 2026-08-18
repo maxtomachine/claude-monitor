@@ -30,8 +30,13 @@ from claude_monitor import (
     _is_session_alive,
     count_background_activity,
     _drop_request_and_await_consumption,
+    REQ_CONSUMED,
+    REQ_SUPERSEDED,
+    REQ_UNSERVED,
     _load_scan_cache_from_disk,
     _save_scan_cache_to_disk,
+    _apply_standby_status,
+    _apply_standby_to_all,
 )
 from tests.helpers import make_session, make_transcript_jsonl
 
@@ -974,33 +979,131 @@ class TestNextActionableInTableOrder:
 class TestMarkReadySeen:
     """The write half of the READY read/unread feature: jumping to a done
     session persists that it's been seen; jumping to anything else is a
-    no-op, since the seen mark only ever means anything for status done."""
+    no-op, since the seen mark only ever means anything for status done.
+    Since 2026-08-18 each ack is [visit_count, last_activity_at_mark]: the
+    count drives the second de-emphasis tier ("checked twice"), the stamp
+    lets the ack expire once the session does new work (see
+    TestSeenAckExpiresOnNewActivity)."""
 
     def test_marks_done_session_seen(self):
         with patch("claude_monitor.load_prefs", return_value={}), \
              patch("claude_monitor.save_prefs") as save:
-            _mark_ready_seen("sid-1", "done")
+            _mark_ready_seen("sid-1", "done", 100.0)
             save.assert_called_once()
-            assert save.call_args[0][0]["acked_ready"] == ["sid-1"]
+            assert save.call_args[0][0]["acked_ready"] == {"sid-1": [1, 100.0]}
 
     def test_ignores_non_done_status(self):
         with patch("claude_monitor.load_prefs", return_value={}), \
              patch("claude_monitor.save_prefs") as save:
-            _mark_ready_seen("sid-1", "working")
+            _mark_ready_seen("sid-1", "working", 100.0)
             save.assert_not_called()
 
-    def test_already_seen_does_not_rewrite(self):
+    def test_second_visit_increments_count(self):
+        """Max, 2026-08-18: "when something is checked twice without action
+        please unbold it in ready state." The count is what the renderer
+        keys the second de-emphasis tier off, so it must actually climb
+        when the session has NOT been active since the first mark."""
+        with patch("claude_monitor.load_prefs",
+                   return_value={"acked_ready": {"sid-1": [1, 100.0]}}), \
+             patch("claude_monitor.save_prefs") as save:
+            _mark_ready_seen("sid-1", "done", 100.0)
+            assert save.call_args[0][0]["acked_ready"] == {"sid-1": [2, 100.0]}
+
+    def test_count_restarts_when_session_was_active_since_last_mark(self):
+        """"Checked twice" must never span two separate done episodes: if
+        the session did work between visits, this visit is the FIRST look
+        at the new result, so the count resets to 1 and the stamp moves."""
+        with patch("claude_monitor.load_prefs",
+                   return_value={"acked_ready": {"sid-1": [1, 100.0]}}), \
+             patch("claude_monitor.save_prefs") as save:
+            _mark_ready_seen("sid-1", "done", 250.0)
+            assert save.call_args[0][0]["acked_ready"] == {"sid-1": [1, 250.0]}
+
+    def test_legacy_list_shape_is_upgraded_in_place(self):
+        """A prefs file written by the original build holds a plain list;
+        each entry reads as one visit with stamp 0.0 (never voids, matching
+        its old never-expiring semantics) and is rewritten stamped."""
         with patch("claude_monitor.load_prefs", return_value={"acked_ready": ["sid-1"]}), \
              patch("claude_monitor.save_prefs") as save:
-            _mark_ready_seen("sid-1", "done")
-            save.assert_not_called()
+            _mark_ready_seen("sid-2", "done", 50.0)
+            assert save.call_args[0][0]["acked_ready"] == {"sid-1": [1, 0.0], "sid-2": [1, 50.0]}
+
+    def test_legacy_count_only_shape_is_upgraded_in_place(self):
+        """The interim {sid: count} shape (one build, 2026-08-18 am)."""
+        with patch("claude_monitor.load_prefs", return_value={"acked_ready": {"sid-1": 3}}), \
+             patch("claude_monitor.save_prefs") as save:
+            _mark_ready_seen("sid-2", "done", 50.0)
+            assert save.call_args[0][0]["acked_ready"] == {"sid-1": [3, 0.0], "sid-2": [1, 50.0]}
 
     def test_preserves_other_seen_sessions(self):
-        with patch("claude_monitor.load_prefs", return_value={"acked_ready": ["sid-1"]}), \
+        with patch("claude_monitor.load_prefs",
+                   return_value={"acked_ready": {"sid-1": [3, 10.0]}}), \
              patch("claude_monitor.save_prefs") as save:
-            _mark_ready_seen("sid-2", "done")
-            saved = set(save.call_args[0][0]["acked_ready"])
-            assert saved == {"sid-1", "sid-2"}
+            _mark_ready_seen("sid-2", "done", 50.0)
+            assert save.call_args[0][0]["acked_ready"] == {"sid-1": [3, 10.0], "sid-2": [1, 50.0]}
+
+    def test_cap_evicts_least_recently_marked_not_first_ever_marked(self):
+        """Advisor review 2026-08-18: incrementing a dict key does not move
+        it, so a naive [-CAP:] slice evicted the longest-ago-FIRST-marked
+        session, which could be a still-done one you revisited yesterday,
+        while keeping dead sids. Re-marking must move the key to the end."""
+        import claude_monitor as cm
+        old = {f"old-{i}": [1, 1.0] for i in range(cm._ACKED_READY_CAP)}
+        # old-0 was marked first; re-marking it now must protect it.
+        with patch("claude_monitor.load_prefs", return_value={"acked_ready": dict(old)}), \
+             patch("claude_monitor.save_prefs") as save:
+            _mark_ready_seen("old-0", "done", 1.0)  # bump old-0 to most recent
+            saved = save.call_args[0][0]["acked_ready"]
+            assert list(saved)[-1] == "old-0"
+        with patch("claude_monitor.load_prefs", return_value={"acked_ready": saved}), \
+             patch("claude_monitor.save_prefs") as save:
+            _mark_ready_seen("brand-new", "done", 2.0)  # overflow by one
+            saved = save.call_args[0][0]["acked_ready"]
+            assert len(saved) == cm._ACKED_READY_CAP
+            assert "old-0" in saved          # recently re-marked: kept
+            assert "old-1" not in saved      # least recently marked: evicted
+            assert "brand-new" in saved
+
+
+class TestSeenAckExpiresOnNewActivity:
+    """BUG found by advisor review 2026-08-18 (introduced by #51): removing
+    the refresh cycle's prune-and-write-back fixed a race but also removed
+    the only thing that ever expired a seen-mark, so an ack survived
+    done -> working -> done forever. Jump to READY session A, give it new
+    work, A finishes 20 minutes later: A rendered as already-seen and
+    Ctrl+Shift+N skipped it, a freshly finished session you had never
+    looked at, invisible until Shift+R. Now every reader compares the
+    ack's activity stamp against the session's current last_activity."""
+
+    def test_ack_is_live_while_session_has_not_moved(self):
+        from claude_monitor import _effective_seen_count
+        s = make_session(session_id="a", status="done", last_activity=100.0)
+        assert _effective_seen_count({"a": [2, 100.0]}, s) == 2
+
+    def test_ack_is_void_once_session_has_new_activity(self):
+        from claude_monitor import _effective_seen_count
+        s = make_session(session_id="a", status="done", last_activity=250.0)
+        assert _effective_seen_count({"a": [2, 100.0]}, s) == 0
+
+    def test_non_done_is_never_seen(self):
+        from claude_monitor import _effective_seen_count
+        s = make_session(session_id="a", status="working", last_activity=100.0)
+        assert _effective_seen_count({"a": [1, 100.0]}, s) == 0
+
+    def test_legacy_set_shape_counts_once_and_never_expires(self):
+        from claude_monitor import _effective_seen_count
+        s = make_session(session_id="a", status="done", last_activity=999.0)
+        assert _effective_seen_count({"a"}, s) == 1
+
+    def test_ctrl_shift_n_revisits_a_session_that_finished_new_work(self):
+        """The user-visible half: after A does new work and becomes done
+        again, it must be a jump candidate again."""
+        a = make_session(session_id="a", status="done", last_activity=250.0)
+        assert find_next_actionable([a], None, acked_ready={"a": [1, 100.0]}) is not None
+
+    def test_ctrl_shift_n_still_skips_a_genuinely_seen_session(self):
+        a = make_session(session_id="a", status="done", last_activity=100.0)
+        assert find_next_actionable([a], None, acked_ready={"a": [1, 100.0]}) is None
 
 
 class TestDedupeScheduledSessions:
@@ -1046,17 +1149,17 @@ class TestDropRequestAndAwaitConsumption:
         monkeypatch.setattr(cm, "JUMP_REQUEST_PATH", scratch)
         return scratch
 
-    def test_returns_false_immediately_when_no_monitor_running(self, tmp_path, monkeypatch):
+    def test_unserved_immediately_when_no_monitor_running(self, tmp_path, monkeypatch):
         scratch = self._use_scratch_path(tmp_path, monkeypatch)
         with patch("claude_monitor._a_monitor_is_running", return_value=False):
             start = time.time()
             result = _drop_request_and_await_consumption("__test__", timeout=1.0)
             elapsed = time.time() - start
-        assert result is False
+        assert result == REQ_UNSERVED
         assert elapsed < 0.2  # must not burn the full timeout
         assert not scratch.exists()  # never even wrote the request
 
-    def test_returns_true_when_consumed_unmodified(self, tmp_path, monkeypatch):
+    def test_consumed_when_taken_unmodified(self, tmp_path, monkeypatch):
         scratch = self._use_scratch_path(tmp_path, monkeypatch)
 
         def consume():
@@ -1066,9 +1169,9 @@ class TestDropRequestAndAwaitConsumption:
         with patch("claude_monitor._a_monitor_is_running", return_value=True):
             threading.Thread(target=consume).start()
             result = _drop_request_and_await_consumption("__test__", timeout=1.0, poll=0.01)
-        assert result is True
+        assert result == REQ_CONSUMED
 
-    def test_returns_false_when_overwritten_by_another_request(self, tmp_path, monkeypatch):
+    def test_superseded_when_overwritten_by_another_request(self, tmp_path, monkeypatch):
         """Two overlapping --jump-next presses (or one racing an unrelated
         click-to-jump link) must not both report success when only one of
         their writes was ever actually read by the poller."""
@@ -1081,14 +1184,53 @@ class TestDropRequestAndAwaitConsumption:
         with patch("claude_monitor._a_monitor_is_running", return_value=True):
             threading.Thread(target=clobber).start()
             result = _drop_request_and_await_consumption("__test__", timeout=1.0, poll=0.01)
-        assert result is False
+        assert result == REQ_SUPERSEDED
 
     def test_times_out_and_cleans_up_when_nothing_consumes_it(self, tmp_path, monkeypatch):
         scratch = self._use_scratch_path(tmp_path, monkeypatch)
         with patch("claude_monitor._a_monitor_is_running", return_value=True):
             result = _drop_request_and_await_consumption("__test__", timeout=0.1, poll=0.02)
-        assert result is False
+        assert result == REQ_UNSERVED
         assert not scratch.exists()
+
+    def test_consumed_at_the_last_instant_is_not_reported_unserved(self, tmp_path, monkeypatch):
+        """RISK found by advisor review 2026-08-18: the monitor's main
+        thread can stall past the client's timeout (a menu jump runs
+        focus_terminal_session synchronously on it; Shift+R's git pull can
+        block ~15s), so the poller may take the token in the final instant.
+        The client used to blindly unlink and report unserved, sending
+        --jump-next down the cold path: two jumps, next_cursor advanced
+        twice. It must re-read at the deadline and report CONSUMED."""
+        scratch = self._use_scratch_path(tmp_path, monkeypatch)
+        real_monotonic = time.monotonic
+        # Consume the token exactly when the loop's deadline check trips:
+        # sleep is patched so the loop body runs once, then the "deadline"
+        # re-read must observe the file already gone.
+        state = {"polls": 0}
+
+        def fake_sleep(_):
+            state["polls"] += 1
+            scratch.unlink(missing_ok=True)  # poller takes it during our sleep
+
+        with patch("claude_monitor._a_monitor_is_running", return_value=True), \
+             patch("claude_monitor.time.sleep", side_effect=fake_sleep):
+            result = _drop_request_and_await_consumption("__test__", timeout=0.0001, poll=0.01)
+        assert result == REQ_CONSUMED
+
+    def test_superseded_at_the_deadline_is_not_reported_unserved(self, tmp_path, monkeypatch):
+        """Same deadline path, other branch: if a second request overwrote
+        ours by the deadline, the poller will serve THAT one, so a jump is
+        still coming; reporting unserved would double-jump."""
+        scratch = self._use_scratch_path(tmp_path, monkeypatch)
+
+        def fake_sleep(_):
+            scratch.write_text("__test__:someone-else:999")
+
+        with patch("claude_monitor._a_monitor_is_running", return_value=True), \
+             patch("claude_monitor.time.sleep", side_effect=fake_sleep):
+            result = _drop_request_and_await_consumption("__test__", timeout=0.0001, poll=0.01)
+        assert result == REQ_SUPERSEDED
+        assert scratch.exists()  # never unlink a token that is not ours
 
 
 class TestScanCacheDiskPersistence:
@@ -1198,3 +1340,76 @@ class TestScanCacheDiskPersistence:
         result = scan_full_file(str(transcript))
         assert result["model_id"] == "from-disk-cache"
         assert result["tokens_in"] == 99999
+
+
+class TestApplyStandbyStatus:
+    """Max, 2026-08-18: "anything with config- should go to STANDBY not
+    READY as a canonical customization for me." Only an idle (done)
+    config-* session is relabelled; a config desk that is actively working
+    or blocked on approval is exactly as urgent as any other session."""
+
+    def test_done_config_session_becomes_standby(self):
+        assert _apply_standby_status("done", "config-skills") == "standby"
+
+    def test_covers_every_desk_prefix_variant(self):
+        for title in ("config-LEAD", "config-MCPs", "config-claude.md", "config-hooks"):
+            assert _apply_standby_status("done", title) == "standby", title
+
+    def test_working_config_session_stays_working(self):
+        assert _apply_standby_status("working", "config-skills") == "working"
+
+    def test_needs_approval_config_session_stays_urgent(self):
+        assert _apply_standby_status("needs_approval", "config-skills") == "needs_approval"
+
+    def test_closed_and_archived_untouched(self):
+        assert _apply_standby_status("closed", "config-skills") == "closed"
+        assert _apply_standby_status("archived", "config-skills") == "archived"
+
+    def test_non_config_done_session_stays_done(self):
+        assert _apply_standby_status("done", "frontier-curve") == "done"
+
+    def test_prefix_is_exact_not_substring(self):
+        """'reconfig-x' or 'my-config-x' are not desk sessions."""
+        assert _apply_standby_status("done", "reconfig-tool") == "done"
+        assert _apply_standby_status("done", "my-config-notes") == "done"
+
+
+class TestStandbyAppliedOnEveryConstructionPath:
+    """BUG found by advisor review 2026-08-18: standby was first wired into
+    build_session() only, missing the PID-file orphan pass (hardcodes
+    "done") and the multi-PID sibling split (maps idle -> "done" over the
+    base row). A double-resumed config-MCPs, the exact case the sibling
+    pass exists for, still rendered bold READY and re-entered Ctrl+Shift+N's
+    candidates. Standby is now one final pass over the whole list, so no
+    construction path can miss it."""
+
+    def test_sibling_split_rows_get_standby(self):
+        sid = "b9bb8e2d-115f-4524-926d-28d0696d7fd0"
+        # Exactly what the sibling split produces: bare "done" on config rows.
+        rows = [make_session(session_id=f"{sid}@27852", title="config-MCPs", status="done"),
+                make_session(session_id=f"{sid}@92899", title="config-MCPs", status="done")]
+        _apply_standby_to_all(rows)
+        assert [r.status for r in rows] == ["standby", "standby"]
+
+    def test_orphan_pass_row_gets_standby(self):
+        # The orphan pass builds a session with no transcript and status "done".
+        row = make_session(title="config-hooks", status="done", transcript_path="")
+        _apply_standby_to_all([row])
+        assert row.status == "standby"
+
+    def test_busy_sibling_stays_working(self):
+        row = make_session(title="config-skills", status="working")
+        _apply_standby_to_all([row])
+        assert row.status == "working"
+
+    def test_non_config_rows_untouched(self):
+        rows = [make_session(session_id="a", title="frontier-curve", status="done"),
+                make_session(session_id="b", title="EBC-Visa", status="working")]
+        _apply_standby_to_all(rows)
+        assert [r.status for r in rows] == ["done", "working"]
+
+    def test_standby_desk_is_not_a_ctrl_shift_n_candidate(self):
+        """The user-visible consequence the bug produced."""
+        desk = make_session(session_id="d", title="config-MCPs", status="done")
+        _apply_standby_to_all([desk])
+        assert find_next_actionable([desk], None) is None

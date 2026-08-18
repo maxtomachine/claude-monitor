@@ -69,6 +69,14 @@ count still surfaces via `s.background_count` in the Doing column. The bell
 transitions only, not the old noisy "waiting" transition every session passed
 through constantly.
 
+The WORKING cell is dim in BOTH halves: label and the animated spinner
+glyph. The glyph was full-brightness coral for a while and, being the one
+thing on screen that moved, out-shouted the READY rows that actually need
+attention, the exact inversion the 2026-08-16 color rework was meant to end
+(Max, 2026-08-18: "the animating working ones are popping but the ones I
+need to look at are visually dimmer"). Motion is the "it's alive" cue;
+brightness stays reserved for what needs him.
+
 Column defaults changed to match: `duration` moved from on to off (`session`,
 `status`, `doing` are the only defaults now). `doing` is fact-derived from
 the transcript's last real tool call, not a guess, so it earns its default
@@ -111,7 +119,7 @@ instead of reintroducing a second read-modify-write on the same key.
 
 Seen also means "don't make me look at this again": `find_next_actionable()`
 (the shared selection behind `Ctrl+Shift+N`, not the `n` key, which has its
-own table-order selection) takes an `acked_ready` set and excludes any
+own table-order selection) takes `acked_ready` and excludes any
 already-seen `done` session from its candidates entirely, not just from
 sort priority. Without this, the hotkey kept landing back on a session Max
 had already jumped to and decided to defer, on every press, which defeated
@@ -123,6 +131,42 @@ decided to deal with later"). `needs_approval` is never excluded this way:
 request stays urgent regardless of whether it's been looked at. If every
 actionable session happens to already be seen, this correctly returns
 `None` ("nothing needs you") rather than re-visiting one anyway.
+
+**Ack shape and expiry.** `acked_ready` is `{sid: [visit_count,
+last_activity_at_mark]}`. `_normalize_acked_ready()` also accepts the two
+older shapes (a plain list of sids; `{sid: count}`) so an older prefs file
+keeps working; legacy entries get stamp `0.0`. Every reader (`render_row`,
+the refresh cycle, `find_next_actionable`) goes through
+`_effective_seen_count()`, which returns 0 (unseen) when the session's
+current `last_activity` is newer than the ack's stamp. That comparison IS
+the expiry: removing the refresh cycle's write-back (above) fixed the race
+but also removed the only thing that ever expired an ack, so for one day a
+seen-mark survived done -> working -> done forever, and a session you had
+given new work to came back pre-read and skipped by `Ctrl+Shift+N` until
+`Shift+R` (found by advisor review, 2026-08-18). Voiding at read time
+keeps the single-writer rule intact.
+
+The count drives a second de-emphasis tier: checked once, mint and bold;
+checked again with still no action, the badge itself unbolds (Max,
+2026-08-18: "when something is checked twice without action please
+unbold it in ready state"). `_mark_ready_seen()` restarts the count at 1
+whenever the session has been active since the previous mark, so "checked
+twice" never spans two separate done episodes. Cap eviction is
+least-recently-marked (re-marking pops and reinserts the key), not
+first-ever-marked. `Shift+R` clears every ack: a restart is a deliberate
+"start over", so whatever is still done comes back unseen (Max,
+2026-08-18: "shift r should reset ready claudes to the blue highlighted").
+
+**All prefs writers go through `_update_prefs(mutator)`**, which holds
+`_prefs_lock` around the load-modify-save. There are seven writers
+(`_mark_ready_seen` from jump worker threads, two `next_cursor` saves,
+`launch_count`, `_save_view_state`, the column picker, the statusline
+config, and `action_restart`'s ack clear), and any two interleaving lost
+one side's write since every save rewrites the whole file from its
+snapshot: two jump workers landing together (mashed `Ctrl+Shift+N`) or
+`Shift+R`'s clear racing an in-flight jump were the concrete survivors
+after the single-writer fix (advisor review, 2026-08-18). Never call
+`save_prefs()` directly from new code; write a mutator.
 
 **Test isolation for anything under `monitor-prefs.json` (or any other
 on-disk state this file owns) is not optional.** `tests/conftest.py`'s
@@ -140,6 +184,35 @@ Max's saved `columns`/`column_order`/`view_state` down to just that
 stub. Do not remove or narrow the autouse fixture to "fix" a test that
 seems to want the real files; give it its own explicit scratch path
 instead.
+
+## STANDBY: config-* desks are never READY
+
+`config-*` sessions (Max's standing desk sessions: config-LEAD, config-MCPs,
+config-skills, config-claude.md, config-hooks) are always-idle
+infrastructure that sits there by design, not a one-off task that finished
+and is waiting on him. Lumping them into READY polluted the "needs you"
+signal (Max, 2026-08-18: "anything with config- should go to STANDBY not
+READY as a canonical customization for me"). `_apply_standby_status()`
+relabels `done` -> `standby` on a `config-` title prefix; `working` and
+`needs_approval` are untouched, since a desk that is mid-task or blocked
+on approval is exactly as urgent as any other session.
+
+It is applied ONCE, in `_apply_standby_to_all()` at the very end of
+`parse_sessions()`, over every session regardless of which construction
+path built it. The first cut wired it into `build_session()` only and
+missed the PID-file orphan pass (hardcodes `"done"`) and the multi-PID
+sibling split (maps idle -> `"done"` over the base row), so a
+double-resumed config-MCPs, the exact case the sibling pass exists for,
+still rendered bold READY and re-entered `Ctrl+Shift+N`'s candidate pool
+(advisor review, 2026-08-18). One final pass cannot miss a path; do not
+move it back to a per-site wrap.
+
+`standby` renders like archived (dim badge `◌ STANDBY`, unbold title, dim
+Doing text) but is deliberately NOT in `INACTIVE_STATUSES`: it is an alive
+desk, not a not-currently-running session, so `hide_inactive_pins` must not
+sweep a pinned desk out of view, and the SessionMenu treats it as live
+(Jump/Rename/Kill). It is not in `ACTIONABLE_STATUSES`, so neither `n` nor
+`Ctrl+Shift+N` land on it, and `StatsBar` omits it from every counter.
 
 ## Pins are permanent; hiding inactive ones is a separate toggle
 
@@ -222,7 +295,7 @@ Plain letters (no modifier) are reserved for the type-ahead group jump below, so
 |-----|--------|
 | `letter` (typed in sequence) | Type-ahead jump to a group by name, like Finder/Explorer find (e.g. `s` `t` `r` `a` → strategy) |
 | `Ctrl+q` | Quit |
-| `Ctrl+r` | Refresh |
+| `R` (Shift+r) | Refresh: restarts the monitor in place (picks up code changes) and clears every READY seen-mark, so whatever is still done goes back to unseen/highlighted. The only refresh key; the old plain `Ctrl+r` refresh was removed as redundant |
 | `Ctrl+s` | Cycle sort mode |
 | `Ctrl+a` | Toggle subagent rows |
 | `Ctrl+z` | Toggle archived/resumable sessions (history mode) |

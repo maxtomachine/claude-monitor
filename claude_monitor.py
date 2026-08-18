@@ -281,7 +281,7 @@ class SortMode(Enum):
 
 STATUS_PRIORITY = {
     "needs_approval": 0, "working": 1, "debriefing": 2,
-    "done": 3, "closed": 4, "archived": 5,
+    "done": 3, "closed": 4, "archived": 5, "standby": 6,
 }
 STATUS_DISPLAY = {
     "needs_approval": ("◉ APPROVE", "yellow"),
@@ -290,6 +290,7 @@ STATUS_DISPLAY = {
     "done": ("○ READY", "bright_yellow"),
     "closed": ("⊘ CLOSED", "rgb(100,100,100)"),
     "archived": ("◇ ARCHIVED", "dim"),
+    "standby": ("◌ STANDBY", "dim"),
 }
 # Brightness here tracks "does this need you", not "is something happening":
 # a working session is self-sufficient and will surface itself the moment it
@@ -1023,6 +1024,18 @@ def parse_sessions(include_archived: bool = False,
 
     sessions = filter_ignored(sessions)
 
+    # STANDBY for config-* desks, applied ONCE here over every session
+    # regardless of which construction path produced it. It was first wired
+    # into build_session() only, which missed two other places that assign
+    # status: the PID-file orphan pass (hardcodes "done" for a session with
+    # no transcript yet) and the multi-PID sibling split (maps idle ->
+    # "done", overriding the base row). A double-resumed config-MCPs, the
+    # exact case the sibling pass exists for, therefore still rendered
+    # bold READY and re-entered Ctrl+Shift+N's candidate pool, which is
+    # precisely what the feature is meant to stop (advisor review,
+    # 2026-08-18). A single pass at the end cannot miss a path.
+    _apply_standby_to_all(sessions)
+
     global _scan_cache_dirty
     if _scan_cache_dirty:
         _save_scan_cache_to_disk()
@@ -1724,6 +1737,31 @@ def _thinking_is_stale(session_id: str, hook: dict, transcript_path: str) -> boo
     return True
 
 
+def _apply_standby_to_all(sessions: list["Session"]) -> None:
+    """The one place standby is assigned: a final pass over every session
+    parse_sessions() is about to return, whichever construction path built
+    it (build_session, the PID-file orphan pass, the multi-PID sibling
+    split). See _apply_standby_status for why config-* desks get it and
+    the sibling-split bug that motivated doing this in one final pass."""
+    for s in sessions:
+        s.status = _apply_standby_status(s.status, s.title)
+
+
+def _apply_standby_status(status: str, title: str) -> str:
+    """config-* sessions (Max's standing desk sessions: config-LEAD,
+    config-MCPs, config-skills, config-claude.md, config-hooks) are
+    always-idle infrastructure that sits there by design, not a one-off
+    task that finished and is waiting on him specifically. Lumping them
+    into READY pollutes the "needs you" signal with sessions that don't
+    actually need him (Max, 2026-08-18: "anything with config- should go
+    to STANDBY not READY as a canonical customization for me"). Only
+    "done" is affected: working (someone's actively asking it something)
+    and needs_approval stay exactly as urgent as they'd otherwise be."""
+    if status == "done" and title.startswith("config-"):
+        return "standby"
+    return status
+
+
 def determine_status(session_id: str, last_assistant_time: float,
                      display_title: str = "", transcript_path: str = "") -> str:
     """Two states actually matter: needs_approval (blocking on you, set by
@@ -2242,7 +2280,7 @@ def generate_activity(s: Session) -> str:
     # Apply status-based transformation
     if s.status == "needs_approval":
         return "Awaiting approval"
-    elif s.status in ("done", "closed"):
+    elif s.status in ("done", "closed", "standby"):
         return _to_past_tense(gerund)
     else:
         return gerund
@@ -2274,15 +2312,28 @@ def sort_sessions(sessions: list[Session], mode: SortMode) -> list[Session]:
 
 
 def render_status_cell(status: str, spin_idx: int = 0, last_activity: float = 0.0,
-                       seen: bool = False, dark: bool = True) -> str:
+                       seen_count: int = 0, dark: bool = True) -> str:
     icon, color = STATUS_DISPLAY.get(status, ("?", "white"))
     if status == "working":
         frame = SPINNER_FRAMES[spin_idx % len(SPINNER_FRAMES)]
-        return f"[#D97757]{frame}[/] [{color}]WORKING[/]"
+        # The glyph still animates (motion is the "it's alive" cue) but it
+        # is dim, not full-brightness coral: a saturated moving glyph on
+        # every WORKING row out-shouted the READY rows that actually need
+        # attention, the exact inversion the 2026-08-16 color rework was
+        # meant to end (Max, 2026-08-18: "the animating working ones are
+        # popping but the ones I need to look at are visually dimmer").
+        return f"[dim #D97757]{frame}[/] [{color}]WORKING[/]"
     if status == "done":
-        color = READY_SEEN_COLOR if seen else (READY_COLOR_DARK if dark else READY_COLOR_LIGHT)
+        color = READY_SEEN_COLOR if seen_count >= 1 else (READY_COLOR_DARK if dark else READY_COLOR_LIGHT)
         text = f"{icon} {format_ago(last_activity)}" if last_activity > 0 else icon
-        return f"[bold {color}]{text}[/]"
+        # Checked once: still bold, just off the unseen color, so it still
+        # pops a little (Max, 2026-08-16: "it can still be bold and ready
+        # but not yellow"). Checked again with still no action: the badge
+        # itself unbolds too, on top of the row title (Max, 2026-08-18:
+        # "when something is checked twice without action please unbold
+        # it in ready state").
+        weight = "" if seen_count >= 2 else "bold "
+        return f"[{weight}{color}]{text}[/]"
     return f"[{color}]{icon}[/]"
 
 
@@ -2303,26 +2354,35 @@ def _group_key(name: str) -> str:
 
 
 def render_row(s: Session, visible_cols: list[str], spin_idx: int = 0,
-               acked_ready: "set[str] | None" = None, dark: bool = True) -> list[str]:
+               acked_ready: "dict[str, list] | set[str] | None" = None,
+               dark: bool = True) -> list[str]:
     # READY read/unread (Max, 2026-08-16): jumping to a done session without
     # sending it anything acknowledges it. Still bold, still says READY,
     # just off the unseen color to mint (render_status_cell); the row title
     # unbolds too, the same "seen" distinction email gives read mail: the
     # color says what's true, the weight says whether you've already
-    # looked.
-    seen_ready = bool(s.status == "done" and acked_ready and s.session_id in acked_ready)
+    # looked. acked_ready is {sid: visit_count} (or a legacy set/list of
+    # sids, each counting as one visit); a second visit without action
+    # de-emphasizes the status badge a further notch (see
+    # render_status_cell).
+    seen_count = _effective_seen_count(acked_ready, s)
+    seen_ready = seen_count >= 1
     cells = []
     for col in visible_cols:
         if col == "status":
             cells.append(render_status_cell(s.status, spin_idx, s.last_activity,
-                                            seen=seen_ready, dark=dark))
+                                            seen_count=seen_count, dark=dark))
         elif col == "session":
             if s.is_subagent:
                 cells.append(f"[dim]└─ {s.title}[/]")
             else:
                 # Live sessions render bold so they pop against the dim
-                # (archived) and dark-gray (closed) rows.
-                t = s.title if (s.status in INACTIVE_STATUSES or seen_ready) else f"[bold]{s.title}[/bold]"
+                # (archived/standby) and dark-gray (closed) rows. standby
+                # isn't in INACTIVE_STATUSES (it's an alive desk session,
+                # not a not-currently-running one, so hide_inactive_pins
+                # shouldn't sweep it up), just checked here directly.
+                unbold = s.status in INACTIVE_STATUSES or s.status == "standby" or seen_ready
+                t = s.title if unbold else f"[bold]{s.title}[/bold]"
                 if s.subagents:
                     t += f" [dim](+{len(s.subagents)})[/]"
                 cells.append(t)
@@ -2353,7 +2413,7 @@ def render_row(s: Session, visible_cols: list[str], spin_idx: int = 0,
                 if len(activity) > DOING_MAX_WIDTH:
                     activity = activity[:DOING_MAX_WIDTH - 1] + "…"
                 activity_escaped = _escape_markup(activity)
-                if s.status == "done":
+                if s.status in ("done", "standby"):
                     cells.append(f"[dim]{activity_escaped}[/]")
                 elif s.status == "needs_approval":
                     cells.append(f"[yellow]{activity_escaped}[/]")
@@ -2705,7 +2765,81 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
 _ACKED_READY_CAP = 200
 
 
-def _mark_ready_seen(session_id: str, status: str) -> None:
+# Every read-modify-write of monitor-prefs.json in this process goes through
+# this lock. There are five writers (_mark_ready_seen from jump worker
+# threads, next_cursor saves from the main thread and the poller,
+# launch_count in on_mount, _save_view_state, and action_restart's seen-mark
+# clear), and any two of them interleaving load->save lose one side's
+# write: the whole file is rewritten from a snapshot every time. Two jump
+# workers landing together (mashed Ctrl+Shift+N) or Shift+R's clear racing
+# an in-flight jump were the concrete survivors after the 2026-08-16
+# single-writer fix for acked_ready (advisor review, 2026-08-18). The cold
+# --jump-next process is the only cross-process writer, and it only runs
+# when no monitor is up, so an in-process lock covers the real cases.
+_prefs_lock = threading.Lock()
+
+
+def _update_prefs(mutate) -> None:
+    """Atomic (in-process) read-modify-write: `mutate(prefs)` edits the dict
+    in place and returns True to save, False to skip the write."""
+    with _prefs_lock:
+        prefs = load_prefs()
+        if mutate(prefs):
+            save_prefs(prefs)
+
+
+def _normalize_acked_ready(raw) -> dict[str, list]:
+    """acked_ready's on-disk shape has changed twice. Originally a plain
+    list of seen session ids. Then (2026-08-18 am) {sid: visit_count}, to
+    support a second de-emphasis tier for a session checked more than once
+    without action (Max: "when something is checked twice without action
+    please unbold it in ready state"). Now {sid: [visit_count,
+    last_activity_at_mark]}: the activity stamp is what lets an ack expire
+    (see _effective_seen_count) once the session does new work. Normalizes
+    all three shapes so an older prefs file (or a test using an older
+    literal) reads correctly: legacy entries get stamp 0.0, which never
+    voids (nothing has last_activity < 0), matching their old semantics."""
+    if not isinstance(raw, dict):
+        return {sid: [1, 0.0] for sid in raw}
+    out: dict[str, list] = {}
+    for sid, v in raw.items():
+        if isinstance(v, (list, tuple)):
+            count = int(v[0]) if len(v) >= 1 else 1
+            stamp = float(v[1]) if len(v) >= 2 else 0.0
+            out[sid] = [count, stamp]
+        else:
+            out[sid] = [int(v), 0.0]
+    return out
+
+
+def _effective_seen_count(acked: "dict[str, list] | set[str] | None", s: "Session") -> int:
+    """How many times this done session has been checked SINCE it last did
+    any work. 0 means unseen (or not done). An ack whose stamp is older
+    than the session's current last_activity is void: you jumped to it,
+    then gave it work (or it finished something else), and it has now
+    become done AGAIN, which is exactly "until it cycles through another
+    state and becomes done again" from _mark_ready_seen's contract.
+
+    Bug this closes (advisor review, 2026-08-18, introduced by #51): the
+    refresh cycle's old prune-and-write-back was removed to fix a race,
+    but it was also the only thing that ever expired an ack, so after that
+    change a seen-mark survived done->working->done forever. Concretely:
+    jump to READY session A, give it new work, A finishes 20 minutes
+    later, and A renders as already-seen and Ctrl+Shift+N skips it: a
+    freshly finished session you have never looked at was invisible to
+    the whole needs-you flow until Shift+R. Comparing stamps at read time
+    fixes it with no second writer, keeping the single-writer discipline."""
+    if s.status != "done" or not acked or s.session_id not in acked:
+        return 0
+    if not isinstance(acked, dict):
+        return 1  # legacy set/list shape: seen once, never expires
+    count, stamp = acked[s.session_id]
+    if s.last_activity > stamp:
+        return 0
+    return count
+
+
+def _mark_ready_seen(session_id: str, status: str, last_activity: float = 0.0) -> None:
     """Read/unread for READY rows (Max, 2026-08-16): jumping to a session
     while it's done acknowledges it, so its row unbolds without touching
     its yellow status, until it cycles through another state and becomes
@@ -2718,18 +2852,36 @@ def _mark_ready_seen(session_id: str, status: str) -> None:
     filters it in memory (see _refresh_compute), never writes it back,
     after an earlier version's write-back raced this function's own
     read-modify-write and clobbered a just-added seen mark (Max, 2026-08-16:
-    "my 'marked as read' doesn't seem to stay that way")."""
+    "my 'marked as read' doesn't seem to stay that way").
+
+    Increments rather than just setting a flag (2026-08-18): a session
+    checked a second time without you acting on it de-emphasizes further
+    (the status badge itself unbolds, on top of already being mint and
+    the row title already being unbold from the first check). The count
+    restarts at 1 whenever the session has been active since the previous
+    mark, so "checked twice" never spans two separate done episodes.
+
+    Eviction past the cap is least-recently-marked (pop-then-reinsert
+    moves a re-marked key to the end), not first-ever-marked; the naive
+    version could evict a still-done session you revisited yesterday
+    while keeping long-dead sids (advisor review, 2026-08-18)."""
     if status != "done":
         return
-    prefs = load_prefs()
-    acked = prefs.get("acked_ready", [])
-    if session_id in acked:
-        return
-    acked = acked + [session_id]
-    if len(acked) > _ACKED_READY_CAP:
-        acked = acked[-_ACKED_READY_CAP:]
-    prefs["acked_ready"] = acked
-    save_prefs(prefs)
+
+    def mutate(prefs: dict) -> bool:
+        acked = _normalize_acked_ready(prefs.get("acked_ready", {}))
+        prev = acked.pop(session_id, None)
+        if prev is not None and last_activity <= prev[1]:
+            count = prev[0] + 1
+        else:
+            count = 1
+        acked[session_id] = [count, last_activity]
+        if len(acked) > _ACKED_READY_CAP:
+            acked = dict(list(acked.items())[-_ACKED_READY_CAP:])
+        prefs["acked_ready"] = acked
+        return True
+
+    _update_prefs(mutate)
 
 
 def focus_terminal_session(session: Session) -> bool:
@@ -3801,7 +3953,6 @@ class ClaudeMonitor(App):
     # clears IXON/IXOFF), a tmux-nested test transiently ate it.
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit"),
-        Binding("ctrl+r", "refresh", "Refresh"),
         Binding("ctrl+s", "cycle_sort", "Sort"),
         Binding("ctrl+a", "toggle_subagents", "Agents"),
         Binding("ctrl+z", "toggle_archived", "History"),
@@ -3812,7 +3963,7 @@ class ClaudeMonitor(App):
         Binding("slash", "start_search", "Search", show=False),
         Binding("escape", "clear_search", "Clear", show=False),
         Binding("down", "search_to_table", show=False),
-        Binding("R", "restart", "Restart", show=False),
+        Binding("R", "restart", "Refresh"),
         Binding("n", "jump_next_actionable", "Next"),
         Binding("ctrl+j", "cursor_down", "↓", show=False),
         Binding("ctrl+n", "edit_name", "Name"),
@@ -3881,7 +4032,7 @@ class ClaudeMonitor(App):
             id="detail-panel"
         )
         yield DosFooter([
-            ("Q", "Quit"), ("R", "Refresh"), ("S", "Sort"), ("A", "Agents"),
+            ("Q", "Quit"), ("R", "Refresh", "⇧"), ("S", "Sort"), ("A", "Agents"),
             ("H", "History"), ("C", "Columns"), ("N", "Name"),
             ("G", "Group"), ("n", "Next", ""),
         ])
@@ -3937,10 +4088,13 @@ class ClaudeMonitor(App):
         t0 = _perf("on_mount: set_interval + focus + mlog", t0)
 
         # Teach the jumpback hotkey for the first 20 launches
-        prefs = load_prefs()
-        launches = prefs.get("launch_count", 0) + 1
-        prefs["launch_count"] = launches
-        save_prefs(prefs)
+        launches = load_prefs().get("launch_count", 0) + 1
+
+        def _bump(prefs: dict) -> bool:
+            prefs["launch_count"] = prefs.get("launch_count", 0) + 1
+            return True
+
+        _update_prefs(_bump)
         if launches <= 20:
             self.notify(
                 "Press [b]Ctrl+Shift+Space[/] from any app to return here "
@@ -3994,10 +4148,21 @@ class ClaudeMonitor(App):
         try:
             srv = http.server.ThreadingHTTPServer(("127.0.0.1", JUMP_HTTP_PORT), _JumpHandler)
         except OSError:
+            # Another monitor instance owns the port, so it also owns the
+            # request file: stand down from polling it. Otherwise both
+            # instances race the 200ms poll and whichever ticks first
+            # serves Ctrl+Shift+N against ITS toggle-filtered session list
+            # and advances the shared next_cursor (advisor review,
+            # 2026-08-18; a duplicate monitor was accidentally spawned
+            # once that day). Only the instance whose HTTP listener is
+            # live is the one _a_monitor_is_running() actually detected.
+            self._owns_jump_requests = False
             mlog("jump", "http_port_busy", port=JUMP_HTTP_PORT)
             return
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         mlog("jump", "http_listening", port=JUMP_HTTP_PORT)
+
+    _owns_jump_requests: bool = True
 
     def _check_jump_request(self) -> None:
         """Poll for a jump request dropped by claude-jump (e.g. from the
@@ -4009,6 +4174,8 @@ class ClaudeMonitor(App):
         session count (measured 2026-08-16) versus near-zero here, where
         self.sessions is already warm from the running monitor's own
         3-second refresh loop."""
+        if not self._owns_jump_requests:
+            return  # a sibling instance owns the port and the request file
         try:
             if not JUMP_REQUEST_PATH.exists():
                 return
@@ -4043,7 +4210,7 @@ class ClaudeMonitor(App):
 
         def _jump_and_mark(s=s):
             if focus_terminal_session(s):
-                _mark_ready_seen(s.session_id, s.status)
+                _mark_ready_seen(s.session_id, s.status, s.last_activity)
 
         self.run_worker(_jump_and_mark, thread=True)
 
@@ -4053,14 +4220,13 @@ class ClaudeMonitor(App):
         (already warm, already deduped by dedupe_scheduled_sessions() in
         this instance's own refresh) instead of a fresh parse_sessions()."""
         prefs = load_prefs()
-        acked_ready = set(prefs.get("acked_ready", []))
+        acked_ready = _normalize_acked_ready(prefs.get("acked_ready", {}))
         target = find_next_actionable(self.sessions, prefs.get("next_cursor"), acked_ready)
         if target is None:
             mlog("jump", "next_request_none")
             self.notify("Nothing needs you right now", timeout=3)
             return
-        prefs["next_cursor"] = target.session_id
-        save_prefs(prefs)
+        _update_prefs(lambda p: p.__setitem__("next_cursor", target.session_id) or True)
         self._ack_bell(target.session_id)
         mlog("jump", "next_request", sid=target.session_id[:12], title=target.title)
 
@@ -4373,7 +4539,8 @@ class ClaudeMonitor(App):
             # (done_now excludes it), so it's inert, not wrong, and costs
             # nothing worth a second writer to avoid.
             done_now = {s.session_id for s in flat if s.status == "done"}
-            acked_ready = set(load_prefs().get("acked_ready", [])) & done_now
+            all_acked = _normalize_acked_ready(load_prefs().get("acked_ready", {}))
+            acked_ready = {sid: v for sid, v in all_acked.items() if sid in done_now}
 
             # Check system appearance in background thread (avoids
             # subprocess.run on Textual's main thread). Computed before the
@@ -4559,7 +4726,7 @@ class ClaudeMonitor(App):
                             self.notify("Could not find or resume session", timeout=4)
                 mlog("menu", "jump_result", sid=s.session_id[:12], success=ok)
                 if ok:
-                    _mark_ready_seen(s.session_id, s.status)
+                    _mark_ready_seen(s.session_id, s.status, s.last_activity)
                     self.action_clear_search()
             elif action == "edit_name":
                 self.action_edit_name()
@@ -4855,19 +5022,6 @@ class ClaudeMonitor(App):
         self._filter = ""
         self.refresh_sessions()
         self.query_one("#session-table", DataTable).focus()
-
-    def action_refresh(self) -> None:
-        global _pid_map_ts
-        _pid_map_ts = 0  # Force fresh PID map
-        _scan_cache.clear()  # Force re-read all transcripts
-        _subagent_cache.clear()
-        threading.Thread(target=_reconcile_sessions, daemon=True).start()
-        self._check_updates()
-        # Don't clear _refresh_pending — that would dispatch a second worker
-        # concurrently mutating the module-global caches. refresh_sessions()
-        # queues a follow-up refresh if one is already in flight.
-        self.refresh_sessions()
-        self.notify("Refreshed", timeout=3)
 
     def action_cycle_sort(self) -> None:
         self.sort_mode = self.sort_mode.next()
@@ -5242,8 +5396,7 @@ class ClaudeMonitor(App):
     def _save_view_state(self) -> None:
         if "PYTEST_CURRENT_TEST" in os.environ:
             return
-        prefs = load_prefs()
-        prefs["view_state"] = {
+        view_state = {
             "sort_mode": self.sort_mode.value,
             "show_subagents": self.show_subagents,
             "show_archived": self.show_archived,
@@ -5251,7 +5404,7 @@ class ClaudeMonitor(App):
             "show_detail": self.show_detail,
             "hide_inactive_pins": self.hide_inactive_pins,
         }
-        save_prefs(prefs)
+        _update_prefs(lambda p: p.__setitem__("view_state", view_state) or True)
 
     def _load_view_state(self) -> None:
         if "PYTEST_CURRENT_TEST" in os.environ:
@@ -5276,6 +5429,21 @@ class ClaudeMonitor(App):
 
     def action_restart(self) -> None:
         self._save_view_state()
+        # Refresh (the plain, in-process kind) is gone: R is the one
+        # refresh key now (Max, 2026-08-18: "let's just replace normal
+        # refresh with shift r, we don't need the cruft"). A restart is
+        # also a deliberate "start over" moment, so clear every READY
+        # seen-mark on the way: whatever's still done goes back to
+        # unseen/highlighted rather than carrying forward what you'd
+        # already decided to defer (Max, 2026-08-18: "shift r should
+        # reset ready claudes to the blue highlighted").
+        def _clear(prefs: dict) -> bool:
+            if not prefs.get("acked_ready"):
+                return False
+            prefs["acked_ready"] = {}
+            return True
+
+        _update_prefs(_clear)
         # Best-effort pull to pick up code changes. Must never crash the app:
         # the repo dir can be missing (e.g. a worktree was removed out from under
         # a running instance), git may be off PATH, offline, or time out. Any of
@@ -5393,10 +5561,12 @@ class ClaudeMonitor(App):
             if cols is not None and cols:
                 self._col_order = picker._col_keys
                 self._visible_cols = cols
-                prefs = load_prefs()
-                prefs["columns"] = cols
-                prefs["column_order"] = self._col_order
-                save_prefs(prefs)
+                def _cols(prefs: dict, cols=cols, order=self._col_order) -> bool:
+                    prefs["columns"] = cols
+                    prefs["column_order"] = order
+                    return True
+
+                _update_prefs(_cols)
                 self._rebuild_table_columns()
                 self.refresh_sessions()
                 self.notify("Columns updated", timeout=3)
@@ -5409,9 +5579,7 @@ class ClaudeMonitor(App):
 
         def on_dismiss(result: dict[str, bool] | None) -> None:
             if result is not None:
-                prefs = load_prefs()
-                prefs["statusline"] = result
-                save_prefs(prefs)
+                _update_prefs(lambda p: p.__setitem__("statusline", result) or True)
                 changed = {k: v for k, v in result.items() if v != sl_prefs.get(k)}
                 mlog("config", "statusline_saved", changed=changed)
                 self.notify("Statusline config saved", timeout=3)
@@ -5475,7 +5643,8 @@ ACTIONABLE_STATUSES = ("needs_approval", "done")
 
 
 def find_next_actionable(sessions: list["Session"], after_sid: str | None,
-                         acked_ready: "set[str] | None" = None) -> "Session | None":
+                         acked_ready: "dict[str, list] | set[str] | None" = None
+                         ) -> "Session | None":
     """The next session that needs you, cycling from after_sid so repeated
     calls walk the whole queue instead of landing on the same one every
     time. needs_approval sorts before done (it's the one actually blocking);
@@ -5497,7 +5666,7 @@ def find_next_actionable(sessions: list["Session"], after_sid: str | None,
     actionable = [
         s for s in sessions
         if s.status in ACTIONABLE_STATUSES and not s.is_subagent
-        and not (s.status == "done" and acked_ready and s.session_id in acked_ready)
+        and _effective_seen_count(acked_ready, s) == 0
     ]
     if not actionable:
         return None
@@ -5549,8 +5718,19 @@ def _a_monitor_is_running() -> bool:
         return sock.connect_ex(("127.0.0.1", JUMP_HTTP_PORT)) == 0
 
 
+# Outcomes of handing a request to a running monitor. Only UNSERVED means
+# "nobody will act on this": CONSUMED means the poller took our token,
+# SUPERSEDED means a later request overwrote ours before the poller read it
+# (the poller will serve THAT one instead, so a jump still happens). A
+# caller must fall back to doing the work itself on UNSERVED only; falling
+# back on SUPERSEDED double-jumps.
+REQ_CONSUMED = "consumed"
+REQ_SUPERSEDED = "superseded"
+REQ_UNSERVED = "unserved"
+
+
 def _drop_request_and_await_consumption(sentinel: str, timeout: float = 1.0,
-                                         poll: float = 0.05) -> bool:
+                                         poll: float = 0.05) -> str:
     """Write `sentinel:<unique token>` into the shared jump-request file
     click-to-jump links, --jump-next, and --restart all use, and wait for
     a live monitor's poller (_check_jump_request, every 200ms) to consume
@@ -5569,36 +5749,53 @@ def _drop_request_and_await_consumption(sentinel: str, timeout: float = 1.0,
     faster than the 200ms poll, or racing an unrelated click-to-jump link)
     would otherwise both see "file gone" and both report success even
     though only whichever one the poller actually read produced a real
-    jump (also caught by review)."""
+    jump (also caught by review). Returns one of REQ_CONSUMED,
+    REQ_SUPERSEDED, REQ_UNSERVED; see their comment for what a caller may
+    do with each."""
     if not _a_monitor_is_running():
-        return False
+        return REQ_UNSERVED
     token = f"{sentinel}:{os.getpid()}:{time.monotonic_ns()}"
     try:
         JUMP_REQUEST_PATH.write_text(token)
     except OSError:
-        return False
+        return REQ_UNSERVED
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             current = JUMP_REQUEST_PATH.read_text()
         except OSError:
-            return True  # gone: consumed, and it was still ours a moment ago
+            return REQ_CONSUMED  # gone: consumed, and it was still ours a moment ago
         if current != token:
-            return False  # overwritten before being read; not our consumption
+            return REQ_SUPERSEDED  # overwritten before being read
         time.sleep(poll)
+    # Deadline. Re-read BEFORE unlinking: the monitor's main thread can
+    # legitimately stall past our timeout (a menu jump runs
+    # focus_terminal_session synchronously on it; Shift+R's git pull can
+    # block up to 15s), so the poller may consume our token in the last
+    # instant. A blind unlink here then sent the caller down the cold
+    # fallback path: two jumps, next_cursor advanced twice, and a second
+    # process writing prefs under the running monitor (advisor review,
+    # 2026-08-18). Gone or changed means consumed/superseded, so report
+    # accordingly and never fall back; only a file still holding OUR token
+    # is a genuinely unserved request worth cleaning up and retrying cold.
+    try:
+        current = JUMP_REQUEST_PATH.read_text()
+    except OSError:
+        return REQ_CONSUMED
+    if current != token:
+        return REQ_SUPERSEDED
     JUMP_REQUEST_PATH.unlink(missing_ok=True)
-    return False
+    return REQ_UNSERVED
 
 
-def _try_fast_jump_next() -> bool:
+def _try_fast_jump_next() -> str:
     """Ask an already-running monitor to jump, via the shared request-file
     protocol. Near-instant because that monitor's session list is already
     warm in memory. The alternative, jump_to_next_actionable() below, calls
     parse_sessions() cold in a brand-new process, which took ~6.5s against
     this machine's real session count (measured 2026-08-16), the actual
-    cause of Ctrl+Shift+N feeling slow. Returns False (so the caller falls
-    back to that cold path) if no monitor is running, or if the request
-    couldn't be confirmed consumed."""
+    cause of Ctrl+Shift+N feeling slow. Returns the REQ_* outcome; the
+    caller may run the cold path on REQ_UNSERVED only."""
     return _drop_request_and_await_consumption(JUMP_NEXT_SENTINEL)
 
 
@@ -5611,7 +5808,7 @@ def _focus_or_resume_target(target: "Session") -> tuple[bool, str]:
     to be fixed at two near-identical copies of this exact sequence; a
     third was about to become a fourth."""
     if focus_terminal_session(target):
-        _mark_ready_seen(target.session_id, target.status)
+        _mark_ready_seen(target.session_id, target.status, target.last_activity)
         return True, target.title
     if _is_session_alive(target.session_id):
         mlog("DIVERGE", "alive_but_unfound", sid=target.session_id[:12], title=target.title,
@@ -5619,7 +5816,7 @@ def _focus_or_resume_target(target: "Session") -> tuple[bool, str]:
         _heal_hook_state(target.session_id)
         return False, f"Window not found for {target.title[:20]}. Press Enter → Resume."
     if resume_session(target):
-        _mark_ready_seen(target.session_id, target.status)
+        _mark_ready_seen(target.session_id, target.status, target.last_activity)
         return True, f"Resuming {target.title[:20]} in new window"
     return False, f"Could not find or resume {target.title[:20]}"
 
@@ -5638,13 +5835,12 @@ def jump_to_next_actionable() -> tuple[bool, str, "Session | None"]:
     sessions = parse_sessions(include_archived=False, include_subagents=False, pinned=pinned)
     sessions = dedupe_scheduled_sessions(sessions, pinned)
     prefs = load_prefs()
-    acked_ready = set(prefs.get("acked_ready", []))
+    acked_ready = _normalize_acked_ready(prefs.get("acked_ready", {}))
     target = find_next_actionable(sessions, prefs.get("next_cursor"), acked_ready)
     if target is None:
         return False, "Nothing needs you right now", None
 
-    prefs["next_cursor"] = target.session_id
-    save_prefs(prefs)
+    _update_prefs(lambda p: p.__setitem__("next_cursor", target.session_id) or True)
     ok, message = _focus_or_resume_target(target)
     return ok, message, target
 
@@ -5662,14 +5858,16 @@ def main():
         # thing Shift+R does, without a synthetic keystroke into that
         # window (which fires Claude Nest's push-to-talk regardless of
         # which key is sent). No-op if nothing is running to pick it up.
-        sys.exit(0 if _drop_request_and_await_consumption(RESTART_SENTINEL) else 1)
+        outcome = _drop_request_and_await_consumption(RESTART_SENTINEL)
+        sys.exit(0 if outcome != REQ_UNSERVED else 1)
     elif len(sys.argv) > 1 and sys.argv[1] == "--jump-next":
         # Ephemeral: no TUI, no visible window of its own. Fast path first:
         # hand off to an already-running monitor's warm session list
         # (near-instant); only cold-scan this process's own parse_sessions()
         # if nothing picked that up, which means no monitor is running.
-        if _try_fast_jump_next():
-            mlog("jump", "cli_next", ok=True, message="handed off to running monitor")
+        outcome = _try_fast_jump_next()
+        if outcome != REQ_UNSERVED:
+            mlog("jump", "cli_next", ok=True, message=f"handed off to running monitor ({outcome})")
             sys.exit(0)
         ok, message, _target = jump_to_next_actionable()
         mlog("jump", "cli_next", ok=ok, message=message)
