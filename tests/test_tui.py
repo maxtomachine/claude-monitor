@@ -175,14 +175,22 @@ class TestKeyBindings:
                 await pilot.press("ctrl+j")
                 await pilot.pause()
 
-    async def test_refresh_keybinding(self, sample_sessions):
+    async def test_ctrl_r_is_no_longer_bound(self, sample_sessions):
+        """Max, 2026-08-18: "let's just replace normal refresh with shift r,
+        we don't need the cruft." Ctrl+R was removed; R (Shift+r) is the
+        one refresh key. The old test here pressed ctrl+r and passed
+        vacuously (rows were already populated by mount's own refresh).
+        Now assert the binding is actually gone. R itself is not pressed
+        here: action_restart runs git pull and exits the app under test."""
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
                 await pilot.pause()
-                await pilot.press("ctrl+r")
-                await pilot.pause()
-                table = pilot.app.query_one("#session-table", DataTable)
-                assert table.row_count >= 3
+                bound_keys = {b.key for b in pilot.app.BINDINGS}
+                assert "ctrl+r" not in bound_keys
+                assert "R" in bound_keys
+                r_binding = next(b for b in pilot.app.BINDINGS if b.key == "R")
+                assert r_binding.action == "restart"
+                assert r_binding.description == "Refresh"
 
 
 class TestSessionMenu:
@@ -1290,7 +1298,7 @@ class TestReadyOnlyMarkedSeenOnActualJump:
             from claude_monitor import jump_to_next_actionable
             ok, _msg, _s = jump_to_next_actionable()
             assert ok is True
-            mark_seen.assert_called_once_with("ready-1", "done")
+            mark_seen.assert_called_once_with("ready-1", "done", target.last_activity)
 
     async def test_session_menu_jump_does_not_mark_seen_when_window_not_found(self):
         target = make_session(session_id="ready-1", title="Ready", status="done")
@@ -1316,7 +1324,7 @@ class TestReadyOnlyMarkedSeenOnActualJump:
                 handler = pilot.app._make_menu_handler(target)
                 handler("jump")
                 await pilot.pause()
-                mark_seen.assert_called_once_with("ready-1", "done")
+                mark_seen.assert_called_once_with("ready-1", "done", target.last_activity)
 
     async def test_refresh_never_writes_acked_ready(self):
         """Bug reported by Max (2026-08-16): a session he'd just marked seen
@@ -1347,6 +1355,41 @@ class TestReadyOnlyMarkedSeenOnActualJump:
                     saved = call[0][0]
                     if "acked_ready" in saved:
                         assert saved["acked_ready"] == ["ready-1"]
+
+
+class TestJumpRequestOwnership:
+    """Advisor review 2026-08-18: two monitor instances both polled the
+    shared request file (only the HTTP bind was exclusive), so whichever
+    ticked first served Ctrl+Shift+N against ITS filtered session list and
+    advanced the shared next_cursor. Only the instance that owns the port
+    may consume requests; a port collision demotes the other."""
+
+    async def test_default_owner_consumes_requests(self, tmp_path, monkeypatch):
+        import claude_monitor as cm
+        monkeypatch.setattr(cm, "JUMP_REQUEST_PATH", tmp_path / "jump-request")
+        target = make_session(session_id="ready-1", title="Ready", status="done")
+        with patch("claude_monitor.parse_sessions", return_value=[target]):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                assert pilot.app._owns_jump_requests is True
+                with patch.object(pilot.app, "_handle_jump_next_request") as handler:
+                    cm.JUMP_REQUEST_PATH.write_text("__jump_next__:1:1")
+                    pilot.app._check_jump_request()
+                    handler.assert_called_once()
+
+    async def test_demoted_instance_leaves_the_request_alone(self, tmp_path, monkeypatch):
+        import claude_monitor as cm
+        monkeypatch.setattr(cm, "JUMP_REQUEST_PATH", tmp_path / "jump-request")
+        target = make_session(session_id="ready-1", title="Ready", status="done")
+        with patch("claude_monitor.parse_sessions", return_value=[target]):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                pilot.app._owns_jump_requests = False  # what a port collision sets
+                with patch.object(pilot.app, "_handle_jump_next_request") as handler:
+                    cm.JUMP_REQUEST_PATH.write_text("__jump_next__:1:1")
+                    pilot.app._check_jump_request()
+                    handler.assert_not_called()
+                    assert cm.JUMP_REQUEST_PATH.exists()  # left for the owner
 
 
 class TestJumpRequestSentinelDispatch:
@@ -1455,7 +1498,8 @@ class TestJumpNextSkipsAlreadySeen:
         seen = make_session(session_id="seen", title="Seen", status="done", last_activity=100)
         unseen = make_session(session_id="unseen", title="Unseen", status="done", last_activity=50)
         with patch("claude_monitor.parse_sessions", return_value=[seen, unseen]), \
-             patch("claude_monitor.load_prefs", return_value={"acked_ready": ["seen"]}), \
+             patch("claude_monitor.load_prefs",
+                   return_value={"acked_ready": {"seen": [1, 100.0]}}), \
              patch("claude_monitor.save_prefs"), \
              patch("claude_monitor.focus_terminal_session", return_value=True) as jump:
             async with ClaudeMonitor().run_test() as pilot:
@@ -1466,9 +1510,10 @@ class TestJumpNextSkipsAlreadySeen:
                 assert jump.call_args[0][0].session_id == "unseen"
 
     async def test_all_seen_notifies_nothing_needs_you_without_jumping(self):
-        seen = make_session(session_id="seen", title="Seen", status="done")
+        seen = make_session(session_id="seen", title="Seen", status="done", last_activity=100.0)
         with patch("claude_monitor.parse_sessions", return_value=[seen]), \
-             patch("claude_monitor.load_prefs", return_value={"acked_ready": ["seen"]}), \
+             patch("claude_monitor.load_prefs",
+                   return_value={"acked_ready": {"seen": [1, 100.0]}}), \
              patch("claude_monitor.save_prefs"), \
              patch("claude_monitor.focus_terminal_session") as jump:
             async with ClaudeMonitor().run_test() as pilot:

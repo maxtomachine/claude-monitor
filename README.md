@@ -85,8 +85,7 @@ Plain letters, typed in sequence, are a Finder-style type-ahead: they jump the c
 | `double-click` | Jump straight to the session's terminal (single-click highlights) |
 | `Shift+Up/Down`, `Shift+Click` | Extend multi-row selection |
 | `Delete` | Hide selected closed/archived row(s); press twice to confirm |
-| `R` | Restart the monitor in-place (picks up code changes) |
-| `Ctrl+r` | Force refresh |
+| `R` | Refresh: restarts the monitor in place (picks up code changes) and resets every READY row back to unseen |
 | `Ctrl+q` | Quit |
 
 **Row markers**: `⊙` pinned · `↻` scheduled run (sdk/headless; collapsed to the latest per project by default) · a pulsing `●` means the session just flipped to needing your approval (clears when you jump to it, fades after 5 min).

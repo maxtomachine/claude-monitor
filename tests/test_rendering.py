@@ -37,6 +37,17 @@ class TestRenderRow:
         cells = render_row(s, ["status"])
         assert "dim" in cells[0]
 
+    def test_working_spinner_glyph_is_dim_too(self):
+        """Max, 2026-08-18: "the animating working ones are popping but the
+        ones I need to look at are visually dimmer." The WORKING label was
+        already dim, but the animated glyph beside it was full-brightness
+        coral, so the moving part still out-shouted READY. Both halves of
+        the working cell must be dim; nothing in it may be bold."""
+        s = make_session(status="working")
+        cell = render_row(s, ["status"])[0]
+        assert cell.startswith("[dim ")
+        assert "bold" not in cell
+
     def test_done_status(self):
         s = make_session(status="done")
         cells = render_row(s, ["status"])
@@ -218,8 +229,8 @@ class TestReadyColorFollowsTheme:
         assert READY_COLOR_DARK in cell
 
     def test_seen_mint_color_unaffected_by_theme(self):
-        dark_seen = render_status_cell("done", seen=True, dark=True)
-        light_seen = render_status_cell("done", seen=True, dark=False)
+        dark_seen = render_status_cell("done", seen_count=1, dark=True)
+        light_seen = render_status_cell("done", seen_count=1, dark=False)
         assert dark_seen == light_seen
 
     def test_render_row_threads_dark_through_to_status_cell(self):
@@ -246,13 +257,41 @@ class TestReadyReadUnread:
         assert "[bold]" in session_cells[0]
 
     def test_seen_ready_turns_mint_stays_bold_row_unbolds(self):
-        s = make_session(session_id="a", title="Seen", status="done")
-        status_cells = render_row(s, ["status"], acked_ready={"a"})
-        session_cells = render_row(s, ["session"], acked_ready={"a"})
+        s = make_session(session_id="a", title="Seen", status="done", last_activity=100.0)
+        status_cells = render_row(s, ["status"], acked_ready={"a": [1, 100.0]})
+        session_cells = render_row(s, ["session"], acked_ready={"a": [1, 100.0]})
         assert "bright_yellow" not in status_cells[0]
         assert "READY" in status_cells[0]
         assert "[bold" in status_cells[0]  # the status badge stays bold
         assert "[bold]" not in session_cells[0]  # only the row title unbolds
+
+    def test_seen_twice_unbolds_the_status_badge_too(self):
+        """Max, 2026-08-18: "when something is checked twice without action
+        please unbold it in ready state." Second tier: still mint, still
+        says READY, but now the badge itself drops bold as well."""
+        s = make_session(session_id="a", title="Seen twice", status="done", last_activity=100.0)
+        status_cells = render_row(s, ["status"], acked_ready={"a": [2, 100.0]})
+        assert "READY" in status_cells[0]
+        assert "bright_yellow" not in status_cells[0]
+        assert "[bold" not in status_cells[0]
+
+    def test_stale_ack_renders_as_unseen_again(self):
+        """Advisor review 2026-08-18: a session that did new work after
+        being marked seen must render bold yellow again, not carry the
+        old mint/unbold treatment onto a result you have never looked at."""
+        s = make_session(session_id="a", title="Redone", status="done", last_activity=250.0)
+        status_cells = render_row(s, ["status"], acked_ready={"a": [2, 100.0]})
+        session_cells = render_row(s, ["session"], acked_ready={"a": [2, 100.0]})
+        assert "bright_yellow" in status_cells[0]
+        assert "[bold]" in session_cells[0]
+
+    def test_legacy_set_shape_counts_as_seen_once(self):
+        """Callers/tests that still pass a plain set of sids get the
+        first-tier treatment (mint, bold badge), never the second."""
+        s = make_session(session_id="a", title="Seen", status="done")
+        status_cells = render_row(s, ["status"], acked_ready={"a"})
+        assert "bright_yellow" not in status_cells[0]
+        assert "[bold" in status_cells[0]
 
     def test_acked_set_ignored_for_non_ready_statuses(self):
         """Being in the acked set only matters while status is done; a
@@ -267,3 +306,28 @@ class TestReadyReadUnread:
         status_cells = render_row(s, ["status"])
         assert "[bold]" in session_cells[0]
         assert "bright_yellow" in status_cells[0]
+
+
+class TestStandbyRendering:
+    """Max, 2026-08-18: "anything with config- should go to STANDBY not
+    READY as a canonical customization for me." Standing desk sessions
+    are always-idle infrastructure; rendering them as READY pollutes the
+    "needs you" signal. STANDBY renders calm: dim badge, unbold title,
+    dim Doing text, same visual weight as archived."""
+
+    def test_standby_badge_is_dim_and_labelled(self):
+        cells = render_row(make_session(status="standby"), ["status"])
+        assert "STANDBY" in cells[0]
+        assert "dim" in cells[0]
+        assert "READY" not in cells[0]
+
+    def test_standby_title_is_not_bold(self):
+        s = make_session(title="config-skills", status="standby")
+        cells = render_row(s, ["session"])
+        assert "[bold]" not in cells[0]
+
+    def test_standby_doing_text_is_dim(self):
+        s = make_session(status="standby", last_tool="Read",
+                         last_tool_input={"file_path": "/tmp/x.py"})
+        cells = render_row(s, ["doing"])
+        assert "[dim]" in cells[0]
