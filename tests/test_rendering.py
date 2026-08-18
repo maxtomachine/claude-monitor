@@ -37,16 +37,35 @@ class TestRenderRow:
         cells = render_row(s, ["status"])
         assert "dim" in cells[0]
 
-    def test_working_spinner_glyph_is_dim_too(self):
-        """Max, 2026-08-18: "the animating working ones are popping but the
-        ones I need to look at are visually dimmer." The WORKING label was
-        already dim, but the animated glyph beside it was full-brightness
-        coral, so the moving part still out-shouted READY. Both halves of
-        the working cell must be dim; nothing in it may be bold."""
+    def test_working_spinner_glyph_is_near_background_gray_per_theme(self):
+        """Max, 2026-08-18, twice: "the animating working ones are popping"
+        then "gray out the animating *, it's too distracting, dim it
+        further to barely visible in both light and dark mode." The glyph
+        carries no hue (the coral is gone entirely), uses a per-theme gray
+        a few steps off that theme's background, and nothing in the
+        working cell is bold."""
+        from claude_monitor import SPINNER_COLOR_DARK, SPINNER_COLOR_LIGHT
         s = make_session(status="working")
-        cell = render_row(s, ["status"])[0]
-        assert cell.startswith("[dim ")
-        assert "bold" not in cell
+        dark_cell = render_row(s, ["status"], dark=True)[0]
+        light_cell = render_row(s, ["status"], dark=False)[0]
+        assert dark_cell.startswith(f"[{SPINNER_COLOR_DARK}]")
+        assert light_cell.startswith(f"[{SPINNER_COLOR_LIGHT}]")
+        for cell in (dark_cell, light_cell):
+            assert "D97757" not in cell  # the old coral, at any brightness
+            assert "bold" not in cell
+            assert "WORKING" in cell
+
+        # "Barely visible" means low contrast against each background:
+        # gray, not black-on-cream or white-on-charcoal.
+        def lum(hex6):
+            r, g, b = (int(hex6[i:i+2], 16) / 255 for i in (1, 3, 5))
+            f = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+            return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+        def contrast(a, b):
+            la, lb = sorted((lum(a), lum(b)), reverse=True)
+            return (la + 0.05) / (lb + 0.05)
+        assert contrast(SPINNER_COLOR_DARK, "#282828") < 2.0
+        assert contrast(SPINNER_COLOR_LIGHT, "#fbf1c7") < 2.0
 
     def test_done_status(self):
         s = make_session(status="done")
