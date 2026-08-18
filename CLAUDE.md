@@ -69,13 +69,19 @@ count still surfaces via `s.background_count` in the Doing column. The bell
 transitions only, not the old noisy "waiting" transition every session passed
 through constantly.
 
-The WORKING cell is dim in BOTH halves: label and the animated spinner
-glyph. The glyph was full-brightness coral for a while and, being the one
-thing on screen that moved, out-shouted the READY rows that actually need
-attention, the exact inversion the 2026-08-16 color rework was meant to end
-(Max, 2026-08-18: "the animating working ones are popping but the ones I
-need to look at are visually dimmer"). Motion is the "it's alive" cue;
-brightness stays reserved for what needs him.
+The WORKING cell is muted in BOTH halves: the label is dim and the
+animated spinner glyph is a per-theme gray a few steps off the background
+(`SPINNER_COLOR_DARK` `#4a4a4a` on `#282828`, contrast 1.7:1;
+`SPINNER_COLOR_LIGHT` `#d5c4a1` on `#fbf1c7`, 1.5:1). It was coral, then dim
+coral; a hue at any brightness still read as a moving colored dot on every
+busy row and, being the one thing on screen that moved, out-shouted the
+READY rows that actually need attention (Max, 2026-08-18, twice: "the
+animating working ones are popping", then "gray out the animating *, it's
+too distracting, dim it further to barely visible in both light and dark
+mode"). Motion is the "it's alive" cue; color and brightness stay reserved
+for what needs him. `_tick_spinner` derives `dark` from `self.theme`, not
+from `_system_is_dark()`, so the 132ms tick never spawns a subprocess and
+never flips the glyph's shade against the rest of the row.
 
 Column defaults changed to match: `duration` moved from on to off (`session`,
 `status`, `doing` are the only defaults now). `doing` is fact-derived from

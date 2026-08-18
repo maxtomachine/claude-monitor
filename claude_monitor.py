@@ -312,6 +312,16 @@ STATUS_DISPLAY = {
 READY_COLOR_DARK = "bright_yellow"
 READY_COLOR_LIGHT = "#007AFF"
 
+# The WORKING spinner glyph, a few steps off each theme's background so it
+# is barely there: motion you can find if you look, never something the
+# eye is pulled to. It was coral, then dim coral; a hue at any brightness
+# still registered as a moving colored dot on every busy row (Max,
+# 2026-08-18: "gray out the animating *, it's too distracting, dim it
+# further to barely visible in both light and dark mode"). Gruvbox dark
+# bg is #282828, light bg is #fbf1c7.
+SPINNER_COLOR_DARK = "#4a4a4a"
+SPINNER_COLOR_LIGHT = "#d5c4a1"
+
 # READY read/unread (Max, 2026-08-16): jumping to a done session without
 # sending it anything acknowledges it. Still bold, still says READY, the
 # color just moves off yellow (or, in light mode, off blue) to mint so a
@@ -2316,13 +2326,15 @@ def render_status_cell(status: str, spin_idx: int = 0, last_activity: float = 0.
     icon, color = STATUS_DISPLAY.get(status, ("?", "white"))
     if status == "working":
         frame = SPINNER_FRAMES[spin_idx % len(SPINNER_FRAMES)]
-        # The glyph still animates (motion is the "it's alive" cue) but it
-        # is dim, not full-brightness coral: a saturated moving glyph on
-        # every WORKING row out-shouted the READY rows that actually need
+        # The glyph still animates (motion is the "it's alive" cue) but in a
+        # near-background gray, not a color: a moving colored dot on every
+        # WORKING row out-shouted the READY rows that actually need
         # attention, the exact inversion the 2026-08-16 color rework was
-        # meant to end (Max, 2026-08-18: "the animating working ones are
-        # popping but the ones I need to look at are visually dimmer").
-        return f"[dim #D97757]{frame}[/] [{color}]WORKING[/]"
+        # meant to end (Max, 2026-08-18, twice: "the animating working ones
+        # are popping", then "gray out the animating *, it's too
+        # distracting"). See SPINNER_COLOR_*.
+        glyph = SPINNER_COLOR_DARK if dark else SPINNER_COLOR_LIGHT
+        return f"[{glyph}]{frame}[/] [{color}]WORKING[/]"
     if status == "done":
         color = READY_SEEN_COLOR if seen_count >= 1 else (READY_COLOR_DARK if dark else READY_COLOR_LIGHT)
         text = f"{icon} {format_ago(last_activity)}" if last_activity > 0 else icon
@@ -4338,7 +4350,11 @@ class ClaudeMonitor(App):
             table = self.query_one("#session-table", DataTable)
         except Exception:
             return
-        cell = render_status_cell("working", self._spin_idx)
+        # self.theme is kept in step with the system by _sync_system_theme
+        # on every refresh; deriving `dark` from it here avoids the
+        # `defaults read` subprocess _system_is_dark() runs, which has no
+        # place on a 132ms main-thread tick.
+        cell = render_status_cell("working", self._spin_idx, dark=(self.theme != "gruvbox-light"))
         for s in self._flat_rows:
             if s.status == "working":
                 try:
