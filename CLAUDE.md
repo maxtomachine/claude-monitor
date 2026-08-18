@@ -214,6 +214,61 @@ sweep a pinned desk out of view, and the SessionMenu treats it as live
 (Jump/Rename/Kill). It is not in `ACTIONABLE_STATUSES`, so neither `n` nor
 `Ctrl+Shift+N` land on it, and `StatsBar` omits it from every counter.
 
+## Inbox mode (Ctrl+B) hides what does not need you
+
+Max, 2026-08-18: "an 'inbox mode' that changes it so that anything that is
+working state disappears from the monitor so that I can further hone my
+attention focus." `inbox_mode` hides every row whose status is in
+`INBOX_HIDDEN_STATUSES` (`working`, and `standby` since a desk sitting idle
+by design is equally not-for-you). What remains is exactly the "needs you"
+set: APPROVE, unseen READY, and seen READY (still yours to act on, just
+de-emphasized). It persists in `view_state` like the other toggles and puts
+a reverse-video `INBOX` chip in the stats bar so a half-empty table never
+reads as sessions having vanished.
+
+He asked for `Ctrl+I`. It cannot be bound: Textual's terminal driver
+receives Ctrl+I as the identical byte to Tab (the same wall the detail
+panel hit on 2026-08-15, which is why that lives on `Ctrl+V`), so `B` is
+for inBox.
+
+**Inbox is a display filter and must stay one.** It filters `flat` (the
+render list), never `sessions` (what the app knows about), and it uses the
+keep-set `ACTIONABLE_STATUSES` so the inbox and the next-actionable key
+share one definition of "needs you". The first cut filtered `sessions`
+early and starved four consumers that have nothing to do with the screen
+(review, 2026-08-18): the status-transition loop never saw a hidden
+session flip to APPROVE, so its bell never rang; the debrief poller
+consumed and lost a hidden session's done-signal; the stats bar read
+"0 working" beside the INBOX chip; and jump-by-name reported "no session
+matching" for a live working session. All four now iterate `sessions`,
+each with a regression test. Two more rules carried over from
+`hide_inactive_pins`: `true_group_sizes` is computed (in both archive
+views, since 2026-08-18) from the pre-filter list so hiding a group's
+working members never demotes its one remaining READY row into
+"ungrouped"; and when the cursored row disappears, `_refresh_apply`'s
+restore falls back to the first real row (pre-parking `_selected_key` in
+the toggle action is dead code, since the refresh re-derives the key from
+the live cursor first). The stats chip reports how many rows are hidden.
+
+**The cursor row keeps its own colors.** Textual's default focused
+DataTable cursor paints a solid `$primary` band and forces the row's
+foreground to white, so every status color vanished on exactly the row Max
+had selected and reappeared when the window blurred (Max, 2026-08-18: "the
+blue is still only showing when I select a window other than monitor";
+measured focused fg=(255,255,255), blurred fg=row's own). The
+`.datatable--cursor` CSS override keeps a translucent band (45% focused,
+35% blurred) with `color: $foreground`, so status colors survive under the
+cursor in both states and both themes. If the band ever needs restyling,
+never reintroduce a foreground override.
+
+**Mutable app state is per-instance.** `_bell`, `_prev_statuses`,
+`_dismissing_sessions`, `_dismiss_failed` and friends are created in
+`ClaudeMonitor.__init__`, not as class-attribute literals: as class
+attributes they were one dict shared by every instance in the process,
+invisible in production (one instance) but every test's fresh app
+inherited the previous test's bells and status history, which surfaced as
+order-dependent failures while adding inbox mode.
+
 ## Pins are permanent; hiding inactive ones is a separate toggle
 
 A pin is an unconditional exemption from every age filter in `parse_sessions()`,
@@ -309,6 +364,7 @@ Plain letters (no modifier) are reserved for the type-ahead group jump below, so
 | `Ctrl+n` | Send `/rename` to selected session |
 | `Ctrl+p` | Pin/unpin session (a pin never expires on its own) |
 | `Ctrl+o` | Hide/show pinned-but-inactive (archived or closed) sessions in the default view (the pin itself is untouched either way) |
+| `Ctrl+b` | Inbox mode: hide every working and standby row so only what needs you is left (APPROVE and READY, seen or not). Persists across restarts; an INBOX chip shows in the stats bar while on. Ctrl+I was the ask but it is Tab on the wire and cannot be bound (see above) |
 | `n` | Move the cursor to the next session that needs you (needs_approval, then done, oldest-waiting first), cycling from wherever the cursor is now. Doesn't jump: follow with `Enter` → pick Jump to actually go there |
 | `Ctrl+Shift+N` (global, via `skhd`) | Instantly jump to the next session that needs you, from anywhere on the machine, no monitor window shown — `claude-monitor --jump-next`. Shares a persisted queue position (`next_cursor` in `monitor-prefs.json`) so repeated presses walk the whole queue rather than repeating |
 | `P` | Broadcast `/proactive` to all sessions in cursor's group |

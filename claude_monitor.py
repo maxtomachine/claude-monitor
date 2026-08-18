@@ -3851,11 +3851,12 @@ class StatsBar(Horizontal):
         yield Label("", id="stats-closed")
         yield Label("", id="stats-total-cost")
         yield Label("", id="stats-sort")
+        yield Label("", id="stats-inbox")
         yield Input(placeholder="🔍 filter...", id="search-bar")
         yield Label("[dim]/ search[/]", id="search-hint")
 
     def update_stats(self, sessions: list[Session], sort_mode: SortMode,
-                     dark: bool = True) -> None:
+                     dark: bool = True, inbox_mode: bool = False) -> None:
         working = sum(1 for s in sessions if s.status == "working")
         approve = sum(1 for s in sessions if s.status == "needs_approval")
         done = sum(1 for s in sessions if s.status == "done")
@@ -3875,6 +3876,15 @@ class StatsBar(Horizontal):
         self.query_one("#stats-closed", Label).update(f" [rgb(100,100,100)]⊘ {closed} closed[/]  " if closed else "")
         self.query_one("#stats-total-cost", Label).update(f" [cyan]Σ ${total_cost:.2f}[/]  ")
         self.query_one("#stats-sort", Label).update(f" [magenta]sort: {sort_mode.label}[/]")
+        # A visible chip whenever rows are being hidden on purpose, so a
+        # half-empty table never reads as "sessions vanished". The counters
+        # above are computed from the UNFILTERED list (inbox is a display
+        # filter on `flat`, not on `sessions`), so "12 working" stays true
+        # while those 12 rows are hidden; the chip says how many are.
+        hidden = sum(1 for s in sessions if s.status not in ACTIONABLE_STATUSES
+                     and not s.is_subagent)
+        self.query_one("#stats-inbox", Label).update(
+            f"  [bold reverse] INBOX [/][dim] {hidden} hidden[/]" if inbox_mode else "")
 
 
 class SessionTable(DataTable):
@@ -3927,6 +3937,24 @@ class ClaudeMonitor(App):
     #search-bar:focus { display: block; background: $boost; }
     #search-hint { width: auto; dock: right; }
     #session-table { height: 1fr; }
+    /* The cursor row keeps its own text colors. Textual's default focused
+       cursor paints a solid $primary band AND forces the row's foreground
+       to white, so the READY blue (light mode) or yellow (dark) vanished
+       on exactly the row Max had selected, and reappeared the moment the
+       window lost focus and the band went translucent. Measured
+       2026-08-18: focused fg=(255,255,255), blurred fg=row's own. A
+       translucent band with `color: auto` off lets every status color
+       survive under the cursor in both focus states. */
+    #session-table > .datatable--cursor {
+        background: $primary 35%;
+        color: $foreground;
+        text-style: none;
+    }
+    #session-table:focus > .datatable--cursor {
+        background: $primary 45%;
+        color: $foreground;
+        text-style: none;
+    }
     #detail-panel {
         height: auto; max-height: 35%; min-height: 5; padding: 0 2;
         background: $boost; dock: bottom; border-top: solid $primary;
@@ -3976,6 +4004,7 @@ class ClaudeMonitor(App):
         Binding("end", "table_end", "End", show=False, priority=True),
         Binding("ctrl+p", "toggle_pin", "Pin", show=False),
         Binding("ctrl+o", "toggle_hide_inactive_pins", "Pins", show=False),
+        Binding("ctrl+b", "toggle_inbox_mode", "Inbox", show=False),
         Binding("backspace", "hide_selected", "Hide", show=False),
         Binding("delete", "hide_selected", "Hide", show=False),
         Binding("shift+up", "extend_selection(-1)", "Select↑", show=False, priority=True),
@@ -3989,6 +4018,7 @@ class ClaudeMonitor(App):
     show_groups: reactive[bool] = reactive(True)
     show_detail: reactive[bool] = reactive(True)
     hide_inactive_pins: reactive[bool] = reactive(False)
+    inbox_mode: reactive[bool] = reactive(False)
     debug_logging: reactive[bool] = reactive(True)  # ON by default
     sessions: list[Session] = []
     _flat_rows: list[Session] = []
@@ -3999,12 +4029,19 @@ class ClaudeMonitor(App):
     _visible_cols: list[str] = []
     _col_order: list[str] = []
     _filter: str = ""
-    _dismissing_sessions: dict[str, str] = {}  # sid -> "debriefing" | "closing"
-    _dismiss_failed: set[str] = set()  # sids where dismiss failed (can't reach terminal)
-    _prev_statuses: dict[str, str] = {}  # sid -> previous status (for transition logging)
-    _bell: dict[str, dict] = {}  # sid -> {"rang_at": float, "acked": bool}
+    # NOTE: the mutable containers below are (re)created per instance in
+    # __init__. Declared here only for the type hints. As class attributes
+    # with literal defaults they were ONE dict shared by every
+    # ClaudeMonitor() in the process; harmless in production (one
+    # instance) but every test's fresh app inherited the previous test's
+    # bells and status history, which surfaced as order-dependent failures
+    # (found 2026-08-18 while adding inbox mode).
+    _dismissing_sessions: dict[str, str]  # sid -> "debriefing" | "closing"
+    _dismiss_failed: set[str]  # sids where dismiss failed (can't reach terminal)
+    _prev_statuses: dict[str, str]  # sid -> previous status (for transition logging)
+    _bell: dict[str, dict]  # sid -> {"rang_at": float, "acked": bool}
     _pulse_phase: bool = False
-    _first_cell_base: dict[str, str] = {}
+    _first_cell_base: dict[str, str]
     _spin_idx: int = 0
     _last_cursor_row: int = 0
     _hidden: set[str] = set()
@@ -4016,6 +4053,19 @@ class ClaudeMonitor(App):
     _typeahead_last_key: float = 0.0
     _last_rendered: dict[str, list[str]] = {}
     _extending_cursor: bool = False
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Per-instance containers; see the note above the declarations.
+        self._dismissing_sessions = {}
+        self._dismiss_failed = set()
+        self._prev_statuses = {}
+        self._bell = {}
+        self._first_cell_base = {}
+        self._last_rendered = {}
+        self._hidden = set()
+        self._pinned = set()
+        self._selection = set()
 
     def notify(self, message, *, timeout: float | None = 5, **kwargs):
         """Override to log every toast notification."""
@@ -4436,17 +4486,21 @@ class ClaudeMonitor(App):
             # 2026-08-16: a 2-member group loses its inactive pin, its
             # active member drops to ungrouped, reads as the active pin
             # itself having vanished).
-            if not self.show_archived:
-                sessions_kept_regardless = [
-                    s for s in sessions
-                    if s.status != "closed" or s.session_id in self._pinned
-                ]
-                true_group_sizes: dict[str, int] = {}
-                for s in sessions_kept_regardless:
-                    key = _group_key(s.title)
-                    true_group_sizes[key] = true_group_sizes.get(key, 0) + 1
-            else:
-                true_group_sizes = {}
+            # Computed in BOTH archive views. It used to be {} under
+            # show_archived, on the theory that history mode hides nothing;
+            # inbox mode hides in history mode too, so with the fallback to
+            # visible counts a group whose working members were filtered
+            # folded its lone READY row into "ungrouped" there, the same
+            # 2026-08-16 demotion in the other view (caught by review,
+            # 2026-08-18). The membership rule is the base filter's own.
+            sessions_kept_regardless = [
+                s for s in sessions
+                if self.show_archived or s.status != "closed" or s.session_id in self._pinned
+            ]
+            true_group_sizes: dict[str, int] = {}
+            for s in sessions_kept_regardless:
+                key = _group_key(s.title)
+                true_group_sizes[key] = true_group_sizes.get(key, 0) + 1
 
             if not self.show_archived:
                 # Step 1: the base filter, unchanged from before
@@ -4497,6 +4551,22 @@ class ClaudeMonitor(App):
             for s in flat:
                 if s.session_id in self._dismissing_sessions:
                     s.status = self._dismissing_sessions[s.session_id]
+
+            # Inbox mode is a DISPLAY filter, so it applies to `flat` (what
+            # renders), never to `sessions` (what the app knows about). A
+            # first cut filtered `sessions` and starved everything
+            # downstream that has nothing to do with the screen: the bell
+            # never saw a hidden session's APPROVE transition, the debrief
+            # poller consumed and lost a hidden session's done-signal, the
+            # stats bar read "0 working" beside the INBOX chip, and
+            # jump-by-name could not find a working session (all caught by
+            # review, 2026-08-18). Placed after the dismissing override so
+            # a "debriefing"/"closing" row is judged on that state. Keep-set
+            # (ACTIONABLE_STATUSES), not a hide-list: the inbox and the
+            # next-actionable key must share one definition of "needs you",
+            # or a status added later shows in one and not the other.
+            if self.inbox_mode:
+                flat = [s for s in flat if s.status in ACTIONABLE_STATUSES]
 
             # When grouping, stable-sort by group key (preserves within-group
             # sort from the earlier sort_mode pass). Singletons collapse into
@@ -4599,8 +4669,15 @@ class ClaudeMonitor(App):
                 timeout=3,
             )
 
-        # Log status transitions
-        for s in flat:
+        # Log status transitions. Over `sessions` (everything the app
+        # knows), NOT `flat` (what is on screen): with inbox mode on, a
+        # session hidden while working must still seed and reset
+        # _prev_statuses, or its APPROVE arrival rings no bell, and a
+        # session that rang, got approved, went back to working (hidden)
+        # and asked again reads as "no transition" (review, 2026-08-18).
+        # An inbox that goes silent on exactly the events it exists to
+        # surface would be worse than no inbox.
+        for s in sessions:
             if s.is_subagent:
                 continue
             prev = self._prev_statuses.get(s.session_id)
@@ -4677,13 +4754,29 @@ class ClaudeMonitor(App):
         # scroll=False: we restore the user's scroll position explicitly below.
         # Default scroll=True would yank the viewport to the cursor row on
         # every refresh, fighting the scroll_to() and bouncing the user up.
+        restored = False
         if saved_row_idx is None and selected_key:
             for idx, s in enumerate(row_map):
                 if s and s.session_id == selected_key:
                     table.move_cursor(row=idx, scroll=False)
+                    restored = True
                     break
         elif saved_row_idx is not None:
             table.move_cursor(row=min(saved_row_idx, len(row_map) - 1), scroll=False)
+            restored = True
+        if not restored:
+            # The cursored session is no longer in the table (a toggle such
+            # as inbox mode or hide_inactive_pins just filtered it, or a
+            # search narrowed past it). Textual leaves the cursor at row 0,
+            # which under grouping is a header (row_map[0] is None), so
+            # Enter and n silently do nothing. Land on the first real row
+            # instead. Lives here, not in each toggle's action: pre-parking
+            # _selected_key in an action is dead code, since
+            # refresh_sessions() and the snapshot above both re-derive the
+            # key from the live cursor first (caught by review, 2026-08-18).
+            first_real = next((i for i, s in enumerate(row_map) if s is not None), None)
+            if first_real is not None:
+                table.move_cursor(row=first_real, scroll=False)
         self.call_after_refresh(self._release_cursor_guard)
 
         self._fit_session_column(table)
@@ -4693,7 +4786,8 @@ class ClaudeMonitor(App):
         self.call_after_refresh(
             lambda: table.scroll_to(saved_scroll_x, saved_scroll_y, animate=False)
         )
-        self.query_one(StatsBar).update_stats(self.sessions, self.sort_mode, dark=sys_dark)
+        self.query_one(StatsBar).update_stats(
+            self.sessions, self.sort_mode, dark=sys_dark, inbox_mode=self.inbox_mode)
 
     def _make_menu_handler(self, s: Session):
         """Build the SessionMenu dismiss callback for a session."""
@@ -5235,6 +5329,25 @@ class ClaudeMonitor(App):
         self.refresh_sessions()
         self.notify(f"All sessions {'shown' if self.show_archived else 'recent only'}", timeout=3)
 
+    def action_toggle_inbox_mode(self) -> None:
+        """Ctrl+B: hide every working and standby row so only what needs
+        you is left (Max, 2026-08-18: "an inbox mode ... so that I can
+        further hone my attention focus"). Ctrl+I was the ask, but Ctrl+I
+        and Tab are the same byte to Textual's terminal driver, so a
+        binding on it is unreachable (the same wall the detail panel hit
+        on 2026-08-15); B is for inBox. If the cursored row is hidden by
+        the toggle, _refresh_apply's restore falls back to the first real
+        row (that fallback lives there so it serves every filter, not just
+        this one)."""
+        self._selection = set()
+        self._selection_anchor = None
+        self._delete_armed_for = None
+        turning_on = not self.inbox_mode
+        self.inbox_mode = turning_on
+        self._save_view_state()
+        self.refresh_sessions()
+        self.notify("Inbox: only what needs you" if turning_on else "Inbox off", timeout=3)
+
     def action_toggle_hide_inactive_pins(self) -> None:
         """Pins never expire on their own (Max: 'pins should stay until I
         unpin them'). This is the simpler ask instead: an on/off lens over
@@ -5403,6 +5516,7 @@ class ClaudeMonitor(App):
             "show_groups": self.show_groups,
             "show_detail": self.show_detail,
             "hide_inactive_pins": self.hide_inactive_pins,
+            "inbox_mode": self.inbox_mode,
         }
         _update_prefs(lambda p: p.__setitem__("view_state", view_state) or True)
 
@@ -5421,6 +5535,7 @@ class ClaudeMonitor(App):
         self.show_groups = bool(vs.get("show_groups", self.show_groups))
         self.show_detail = bool(vs.get("show_detail", self.show_detail))
         self.hide_inactive_pins = bool(vs.get("hide_inactive_pins", self.hide_inactive_pins))
+        self.inbox_mode = bool(vs.get("inbox_mode", self.inbox_mode))
         if not self.show_detail:
             try:
                 self.query_one("#detail-panel", Static).display = False

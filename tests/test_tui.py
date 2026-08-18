@@ -693,6 +693,265 @@ class TestHideInactivePins:
                 ClaudeMonitor.show_groups._default = original
 
 
+class TestInboxMode:
+    """Max, 2026-08-18: "an 'inbox mode' that changes it so that anything
+    that is working state disappears from the monitor so that I can further
+    hone my attention focus." Ctrl+B (Ctrl+I is Tab on the wire and cannot
+    be bound; see the BINDINGS comment). Hides working and standby; keeps
+    APPROVE and READY (seen or not). Persists like the other view toggles."""
+
+    def _mix(self):
+        return [
+            make_session(session_id="w", title="alpha-working", status="working"),
+            make_session(session_id="d", title="alpha-ready", status="done"),
+            make_session(session_id="a", title="beta-approve", status="needs_approval"),
+            make_session(session_id="s", title="config-skills", status="standby"),
+        ]
+
+    async def test_off_by_default_shows_everything(self):
+        with _mock_sessions(self._mix()):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                assert pilot.app.inbox_mode is False
+                titles = {s.title for s in pilot.app._row_map if s}
+                assert titles == {"alpha-working", "alpha-ready", "beta-approve", "config-skills"}
+
+    async def test_ctrl_b_hides_working_and_standby_keeps_needs_you(self):
+        with _mock_sessions(self._mix()):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("ctrl+b")
+                await pilot.pause()
+                await pilot.pause()
+                assert pilot.app.inbox_mode is True
+                titles = {s.title for s in pilot.app._row_map if s}
+                assert titles == {"alpha-ready", "beta-approve"}
+
+    async def test_seen_ready_stays_in_the_inbox(self):
+        """Seen means de-emphasized, not dealt with: it is still yours to
+        act on, so the inbox keeps it."""
+        ready = make_session(session_id="d", title="ready", status="done", last_activity=100.0)
+        with patch("claude_monitor.parse_sessions", return_value=[ready]), \
+             patch("claude_monitor.load_prefs",
+                   return_value={"acked_ready": {"d": [2, 100.0]}}), \
+             patch("claude_monitor.save_prefs"):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("ctrl+b")
+                await pilot.pause()
+                await pilot.pause()
+                assert [s.title for s in pilot.app._row_map if s] == ["ready"]
+
+    async def test_toggle_back_restores_everything(self):
+        with _mock_sessions(self._mix()):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("ctrl+b")
+                await pilot.pause()
+                await pilot.pause()
+                await pilot.press("ctrl+b")
+                await pilot.pause()
+                await pilot.pause()
+                assert pilot.app.inbox_mode is False
+                assert len([s for s in pilot.app._row_map if s]) == 4
+
+    async def test_hiding_working_members_does_not_demote_ready_groupmate(self):
+        """Same demotion guard hide_inactive_pins needed on 2026-08-16: a
+        group whose working members vanish must keep its one remaining
+        READY row under its own header, not fold it into 'ungrouped'."""
+        working = make_session(session_id="w", title="strategy-a", status="working")
+        ready = make_session(session_id="d", title="strategy-b", status="done")
+        with patch("claude_monitor.parse_sessions", return_value=[working, ready]):
+            original = ClaudeMonitor.show_groups._default
+            ClaudeMonitor.show_groups._default = True
+            try:
+                async with ClaudeMonitor().run_test(size=(200, 50)) as pilot:
+                    await pilot.pause()
+                    assert pilot.app._group_counts.get("strategy") == 2
+                    await pilot.press("ctrl+b")
+                    await pilot.pause()
+                    await pilot.pause()
+                    assert pilot.app._group_counts.get("strategy") == 1
+                    assert "ungrouped" not in pilot.app._group_counts
+                    assert [s.title for s in pilot.app._row_map if s] == ["strategy-b"]
+            finally:
+                ClaudeMonitor.show_groups._default = original
+
+    async def test_cursor_on_a_hidden_row_lands_on_first_real_row_under_grouping(self):
+        """Grouped view (the production default). Rows: [header, w1, w2, d1,
+        d2]; cursor on w2; Ctrl+B. The refresh restores the cursor by sid,
+        w2 is gone, and Textual leaves the cursor at row 0, which is the
+        group HEADER (row_map[0] is None): Enter and n then do nothing. The
+        restore path must fall back to the first real row. The earlier
+        version of this test ran ungrouped with every survivor by
+        construction non-working, so it could not fail (review,
+        2026-08-18); this one asserts the exact row."""
+        rows = [
+            make_session(session_id="w1", title="strategy-a", status="working"),
+            make_session(session_id="w2", title="strategy-b", status="working"),
+            make_session(session_id="d1", title="strategy-c", status="done"),
+            make_session(session_id="d2", title="strategy-d", status="done"),
+        ]
+        with patch("claude_monitor.parse_sessions", return_value=rows):
+            original = ClaudeMonitor.show_groups._default
+            ClaudeMonitor.show_groups._default = True
+            try:
+                async with ClaudeMonitor().run_test(size=(200, 50)) as pilot:
+                    await pilot.pause()
+                    table = pilot.app.query_one("#session-table", DataTable)
+                    assert pilot.app._row_map[0] is None  # header first, as in prod
+                    table.move_cursor(row=pilot.app._row_index_of("w2"))
+                    await pilot.pause()
+                    await pilot.press("ctrl+b")
+                    await pilot.pause()
+                    await pilot.pause()
+                    cur = pilot.app._row_map[table.cursor_row]
+                    assert cur is not None, "cursor stranded on the group header"
+                    assert cur.session_id == "d1"
+            finally:
+                ClaudeMonitor.show_groups._default = original
+
+    async def test_persists_in_view_state(self):
+        """_save_view_state is a no-op while PYTEST_CURRENT_TEST is set. An
+        earlier version popped that env var around the whole app mount,
+        which also un-gated on_mount's /dev/tty title write, the reconcile
+        thread against the real ~/.claude/session-states, and the real
+        port bind (review, 2026-08-18). Instead, call the save directly
+        with the guard patched out for that one call."""
+        with _mock_sessions(self._mix()), \
+             patch("claude_monitor._update_prefs") as upd:
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("ctrl+b")
+                await pilot.pause()
+                assert pilot.app.inbox_mode is True
+                upd.reset_mock()
+                with patch.dict("os.environ", {}, clear=False):
+                    import os
+                    os.environ.pop("PYTEST_CURRENT_TEST", None)
+                    pilot.app._save_view_state()
+                saved = {}
+                for call in upd.call_args_list:
+                    call.args[0](saved)
+                assert saved["view_state"]["inbox_mode"] is True
+
+    async def test_restores_from_view_state(self):
+        """_load_view_state is also a pytest no-op (it reads real prefs);
+        call it directly with the guard bypassed and mocked prefs."""
+        with _mock_sessions(self._mix()), \
+             patch("claude_monitor.load_prefs",
+                   return_value={"view_state": {"inbox_mode": True}}), \
+             patch("claude_monitor.save_prefs"):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                assert pilot.app.inbox_mode is False
+                with patch.dict("os.environ", {}, clear=False):
+                    import os
+                    os.environ.pop("PYTEST_CURRENT_TEST", None)
+                    pilot.app._load_view_state()
+                assert pilot.app.inbox_mode is True
+                pilot.app.refresh_sessions()
+                await pilot.pause()
+                await pilot.pause()
+                titles = {s.title for s in pilot.app._row_map if s}
+                assert titles == {"alpha-ready", "beta-approve"}
+
+    async def test_stats_counters_are_unfiltered_while_inbox_is_on(self):
+        """Review 2026-08-18: with the filter on `sessions`, the bar read
+        "0 working" right beside the INBOX chip, saying exactly what the
+        chip exists to deny."""
+        with _mock_sessions(self._mix()):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("ctrl+b")
+                await pilot.pause()
+                await pilot.pause()
+                working = pilot.app.query_one("#stats-working")
+                assert "1 working" in str(working.render())
+
+    async def test_bell_still_rings_for_a_session_hidden_while_working(self):
+        """Review 2026-08-18: a session that spent its whole working life
+        hidden never seeded _prev_statuses, so its APPROVE arrival rang no
+        bell, the one event an inbox exists to surface."""
+        w = make_session(session_id="x", title="x", status="working")
+        with patch("claude_monitor.parse_sessions", return_value=[w]):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("ctrl+b")
+                await pilot.pause()
+                await pilot.pause()
+                assert pilot.app._row_map == [] or all(r is None for r in pilot.app._row_map)
+                w.status = "needs_approval"
+                pilot.app.refresh_sessions()
+                await pilot.pause()
+                await pilot.pause()
+                assert "x" in pilot.app._bell
+
+    async def test_jump_by_name_finds_a_hidden_working_session(self, tmp_path, monkeypatch):
+        """Review 2026-08-18: the request-file jump resolved against the
+        filtered list, so `claude-jump <sid8>` for a working session
+        reported "no session matching" while inbox was on."""
+        import claude_monitor as cm
+        monkeypatch.setattr(cm, "JUMP_REQUEST_PATH", tmp_path / "jump-request")
+        w = make_session(session_id="abcd1234-0000", title="busy", status="working")
+        with patch("claude_monitor.parse_sessions", return_value=[w]), \
+             patch("claude_monitor.focus_terminal_session", return_value=True) as jump:
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                await pilot.press("ctrl+b")
+                await pilot.pause()
+                await pilot.pause()
+                cm.JUMP_REQUEST_PATH.write_text("abcd1234")
+                pilot.app._check_jump_request()
+                await pilot.pause()
+                jump.assert_called_once()
+
+    async def test_stats_bar_shows_inbox_chip_only_when_on(self):
+        with _mock_sessions(self._mix()):
+            async with ClaudeMonitor().run_test() as pilot:
+                await pilot.pause()
+                chip = pilot.app.query_one("#stats-inbox")
+                assert "INBOX" not in str(chip.render())
+                await pilot.press("ctrl+b")
+                await pilot.pause()
+                await pilot.pause()
+                rendered = str(chip.render())
+                assert "INBOX" in rendered
+                assert "2 hidden" in rendered  # alpha-working + config-skills
+
+
+class TestCursorRowKeepsStatusColors:
+    """Max, 2026-08-18: "the blue is still only showing when I select a
+    window other than monitor." Measured: Textual's default FOCUSED
+    DataTable cursor paints a solid $primary band and forces the row's
+    foreground to white, so the READY colour vanished on exactly the row
+    he had selected and came back the moment the window blurred (band
+    goes translucent, override goes away). The cursor must never override
+    the row's foreground, in either focus state, in either theme."""
+
+    async def test_focused_cursor_does_not_force_white_foreground(self):
+        rows = [make_session(session_id="a", title="ready", status="done")]
+        for dark in (False, True):
+            with patch("claude_monitor.parse_sessions", return_value=rows), \
+                 patch("claude_monitor._system_is_dark", return_value=dark):
+                app = ClaudeMonitor()
+                async with app.run_test() as pilot:
+                    await pilot.pause()
+                    await pilot.pause()
+                    table = app.query_one("#session-table", DataTable)
+                    table.focus()
+                    await pilot.pause()
+                    focused = table.get_component_styles("datatable--cursor")
+                    assert focused.color.rgb != (255, 255, 255), app.theme
+                    app.set_focus(None)
+                    await pilot.pause()
+                    blurred = table.get_component_styles("datatable--cursor")
+                    # Same text colour whether or not the table has focus.
+                    assert focused.color.rgb == blurred.color.rgb, app.theme
+                    # The band itself must still be visible (not fully transparent).
+                    assert focused.background.a > 0.2, app.theme
+
+
 class TestSubagents:
     async def test_subagents_shown_when_toggled(self):
         sub = make_session(session_id="sub-1", title="agent-1", is_subagent=True,
@@ -1444,6 +1703,9 @@ class TestJumpRequestSentinelDispatch:
                 await pilot.pause()
                 cm.JUMP_REQUEST_PATH.write_text("ready-1")
                 pilot.app._check_jump_request()
+                # The jump runs on a worker thread; one pause() is not
+                # always enough under load (see CLAUDE.md test notes).
+                await pilot.pause()
                 await pilot.pause()
                 jump.assert_called_once()
 
