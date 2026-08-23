@@ -4462,6 +4462,13 @@ class ClaudeMonitor(App):
 
     _refresh_pending: bool = False
     _refresh_queued: bool = False  # set when a refresh is requested mid-flight
+    # Incremented at the very end of _refresh_apply, the one moment the UI
+    # reflects a completed refresh. Tests wait on this (see
+    # tests/helpers.py wait_for_refresh) instead of a fixed pilot.pause()
+    # tick, which raced the worker-thread -> main-thread hop and produced
+    # load-dependent false failures; two were hand-bisected on
+    # 2026-08-18 alone. Not a behaviour change: nothing in the app reads it.
+    _refresh_generation: int = 0
 
     def refresh_sessions(self) -> None:
         """Schedule a refresh — heavy work runs in a background thread."""
@@ -4646,10 +4653,26 @@ class ClaudeMonitor(App):
                 sys_dark,
             )
         finally:
-            self._refresh_pending = False
-            if self._refresh_queued:
-                self._refresh_queued = False
-                self.call_from_thread(self.refresh_sessions)
+            # Bookkeeping hops to the main loop. It used to run here on
+            # the worker thread while refresh_sessions() (main thread)
+            # reads _refresh_pending and sets _refresh_queued: main could
+            # read pending=True and set queued=True in the instant after
+            # this thread had already checked queued and found it False,
+            # leaving queued=True with no worker to drain it. That refresh
+            # was silently lost until the next 3s tick, and once tests
+            # waited on the flags it surfaced as a 5s settle() timeout
+            # (review, 2026-08-19). On one thread the interleaving cannot
+            # happen.
+            self.call_from_thread(self._refresh_finished)
+
+    def _refresh_finished(self) -> None:
+        """Main thread: clear the in-flight flag and run a refresh that was
+        requested while the worker was busy. Lives on the main loop so it
+        can never interleave with refresh_sessions()'s own flag reads."""
+        self._refresh_pending = False
+        if self._refresh_queued:
+            self._refresh_queued = False
+            self.refresh_sessions()
 
     def _refresh_apply(self, sessions: list[Session], flat: list[Session],
                        rendered: list[tuple[Session, list[str]]],
@@ -4804,6 +4827,7 @@ class ClaudeMonitor(App):
         )
         self.query_one(StatsBar).update_stats(
             self.sessions, self.sort_mode, dark=sys_dark, inbox_mode=self.inbox_mode)
+        self._refresh_generation += 1
 
     def _make_menu_handler(self, s: Session):
         """Build the SessionMenu dismiss callback for a session."""

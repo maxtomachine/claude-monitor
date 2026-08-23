@@ -41,25 +41,32 @@ if ! defaults read com.apple.dock workspaces-auto-swoosh &>/dev/null; then
   echo "Enabled space-switching on app activate"
 fi
 
-# ── Statusline ─────────────────────────────────────────────────────────────────
+# ── Statusline (opt-in) ────────────────────────────────────────────────────────
+# Off by default since 2026-08-23. The monitor works without it: every cache
+# the statusline feeds (context %, cost, name, remote URL) has an in-app
+# fallback. Pass --with-statusline to install the two-line HUD as well.
 
 mkdir -p "$CLAUDE_DIR"
-ln -sf "$REPO_DIR/statusline/statusline.sh" "$CLAUDE_DIR/statusline.sh"
-echo "Linked statusline → $CLAUDE_DIR/statusline.sh"
-
-# Add statusLine config to settings.json if not already present
 SETTINGS="$CLAUDE_DIR/settings.json"
-if [ -f "$SETTINGS" ]; then
-  if ! grep -q '"statusLine"' "$SETTINGS"; then
-    tmp=$(mktemp)
-    jq '. + {"statusLine": {"type": "command", "command": "bash ~/.claude/statusline.sh"}}' "$SETTINGS" > "$tmp" && mv "$tmp" "$SETTINGS"
-    echo "Added statusLine to $SETTINGS"
+if [[ " $* " == *" --with-statusline "* ]]; then
+  ln -sf "$REPO_DIR/statusline/statusline.sh" "$CLAUDE_DIR/statusline.sh"
+  echo "Linked statusline → $CLAUDE_DIR/statusline.sh"
+
+  # Add statusLine config to settings.json if not already present
+  if [ -f "$SETTINGS" ]; then
+    if ! grep -q '"statusLine"' "$SETTINGS"; then
+      tmp=$(mktemp)
+      jq '. + {"statusLine": {"type": "command", "command": "bash ~/.claude/statusline.sh"}}' "$SETTINGS" > "$tmp" && mv "$tmp" "$SETTINGS"
+      echo "Added statusLine to $SETTINGS"
+    else
+      echo "statusLine already configured in $SETTINGS"
+    fi
   else
-    echo "statusLine already configured in $SETTINGS"
+    echo '{"statusLine": {"type": "command", "command": "bash ~/.claude/statusline.sh"}}' > "$SETTINGS"
+    echo "Created $SETTINGS with statusLine config"
   fi
 else
-  echo '{"statusLine": {"type": "command", "command": "bash ~/.claude/statusline.sh"}}' > "$SETTINGS"
-  echo "Created $SETTINGS with statusLine config"
+  echo "Statusline skipped (off by default; re-run with --with-statusline to install it)"
 fi
 
 # ── Session tracker hook ───────────────────────────────────────────────────────
@@ -148,4 +155,4 @@ if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
 fi
 
 echo ""
-echo "Done! Restart Claude Code for the statusline. Run 'claude-monitor' for the TUI."
+echo "Done! Run 'claude-monitor' for the TUI. (Statusline is opt-in: ./install.sh --with-statusline)"
