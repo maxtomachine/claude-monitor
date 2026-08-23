@@ -22,6 +22,7 @@ uv run pytest tests/ -v
 - `tests/test_parsing.py` — transcript parsing, status detection, sorting
 - `tests/test_rendering.py` — row rendering, column config, truncation
 - `tests/test_tui.py` — full TUI integration tests using Textual's headless pilot
+- `tests/test_lifecycle.py`: the needs-you lifecycle end to end through one real app instance (see below)
 - `tests/test_tmux_e2e.py` — tmux-based e2e tests (spawn real TUI in tmux pane, send keystrokes, assert on terminal output). Flaky by nature — skipped in CI and when tmux not installed. Supplements Pilot tests; failures don't block merge. Run: `uv run pytest tests/test_tmux_e2e.py -v`
 
 ### Writing TUI tests
@@ -29,9 +30,11 @@ uv run pytest tests/ -v
 TUI tests use Textual's `run_test()` to mount the app headlessly. Key patterns:
 
 - Mock `parse_sessions` to control session data: `patch("claude_monitor.parse_sessions", return_value=sessions)`
-- Always `await pilot.pause()` after keypresses that trigger UI changes
+- After mount, and after any keypress or call that refreshes or jumps, `await settle(pilot)` (from `tests/helpers.py`). Never a bare `await pilot.pause()`: a fixed tick races the refresh's worker-thread hop and produced load-dependent false failures (two hand-bisected on 2026-08-18). `settle` waits for every worker to finish (refresh AND jump/resume/broadcast threads, via `app.workers.wait_for_complete()`), then proves any requested refresh APPLIED via `_refresh_generation` (bumped at the very end of `_refresh_apply`), looping until a full pass sees nothing in flight. It fails loudly after 5s instead of letting a hang pass. A first cut only polled the pending/queued flags; a review (2026-08-19) showed that raced the jump worker and could fall through the gap between a worker clearing `_refresh_queued` and the main loop starting the re-queued refresh. `wait_for_refresh(pilot, since=g)` is the narrower tool when you need a specific refresh's completion.
 - Query modal screens via `pilot.app.screen.query_one(...)`, not `pilot.app.query_one(...)`
 - Use `tests/helpers.py` for `make_session()` and `make_transcript_jsonl()` factories
+- `tests/test_lifecycle.py` drives one real `ClaudeMonitor` through a session's whole needs-you life (working -> done -> jumped -> seen -> new work -> done again -> approval under inbox mode -> cleared) with real prefs persistence against the per-test scratch file. Every real bug this week lived between units that each passed; add a step there when you change the ack, bell, candidate, or inbox logic. It is mutation-checked: reintroducing #51 or the inbox-starves-the-bell bug fails the named step.
+- Two autouse fixtures in `conftest.py` guard real state: `_isolate_monitor_state_files` points every state path at scratch files, and `_real_state_untouched` wraps `Path.write_text` for the test's duration and fails the test by name if THIS PROCESS writes to any real state path (captured from the app's own constants at import, before isolation repoints them). Attribution is by process, not by hashing the files: Max's live monitor and his Ctrl+Shift+N presses write those same files during a test run, and a file-watching canary blamed whichever test happened to be running (review, 2026-08-19). Do not weaken either fixture to make a test pass; give the test its own scratch path.
 
 ### Writing unit tests
 
@@ -384,9 +387,9 @@ Plain letters (no modifier) are reserved for the type-ahead group jump below, so
 
 Naming a session with `&ignore` (case-insensitive, anywhere in the name) opts it out of monitoring entirely: dropped from every view along with its PID-siblings and subagents, beats pinning. Implemented in `filter_ignored()`; remove the marker to track again.
 
-## Statusline integration
+## Statusline integration (opt-in since 2026-08-23)
 
-The statusline (`statusline/statusline.sh`) shares data with the monitor:
+The statusline is no longer installed by default (`./install.sh --with-statusline` adds it). Max turned it off on 2026-08-23 ahead of pulling the repo onto his personal machine. Nothing in the monitor requires it: `_read_session_cache()` returns empty when the cache dir is absent and every caller falls back (context % to the token estimate, cost to the in-app estimate, name to the transcript/hook title). When present, the statusline (`statusline/statusline.sh`) shares data with the monitor:
 - **Context %**: statusline writes ground-truth `remaining_percentage` to `/tmp/claude-ctx-{session_id}`, which the monitor reads instead of estimating from token counts.
 - **Session name**: statusline writes `session_name` to `/tmp/claude-name-{session_id}`, used by jump-to-terminal for match resolution.
 - **Jump to terminal**: matches on Ghostty window titles (instant, no AXTextArea cycling). Falls back to AXTextArea content for unrenamed sessions. Uses `AXRaise` + `AXMain` + `proc.frontmost` (not `tell app to activate`).
@@ -409,6 +412,8 @@ This project layers multiple technologies in unusual ways: bash statusline scrip
 
 5. **Never send System Events keystroke/keyCode to open a new window/tab.** Confirmed live 2026-08-15: any Accessibility-injected keyboard event, real key or fake modifier, any combo (Cmd+T, Cmd+N tested), fires Claude Nest's push-to-talk hotkey as a side effect, even from a plain terminal `osascript` with no claude-monitor involved at all. It is not about which key is sent; it is about the event being synthetic. `resume_session()` opens the window through Ghostty's own `newWindow({withConfiguration: {command: ...}})` scripting instead, confirmed clean against the same live reproduction. If a future change needs to simulate typing into a terminal app again, retest against Nest first.
 
+6. **Refresh bookkeeping runs on the main loop, never on the worker thread.** `_refresh_compute`'s `finally` used to clear `_refresh_pending` and check `_refresh_queued` on the worker thread while `refresh_sessions()` (main thread) reads pending and sets queued: main could set queued=True in the instant after the worker had checked it, leaving a queued refresh no worker would ever drain (silently dropped until the next 3s tick; surfaced as a 5s `settle()` timeout once tests waited on the flags, review 2026-08-19). The `finally` now hops to `_refresh_finished()` via `call_from_thread`, so the two can never interleave. Keep it that way.
+
 4. **Any action that calls `refresh_sessions()` must preserve cursor position.** The refresh path restores the cursor by `_selected_key` (the sid under the cursor when refresh was scheduled). If your action removes/filters/re-sorts rows such that the cursor's sid is no longer in the new table, the cursor silently resets to row 0. Before calling `refresh_sessions()`, move the cursor to a row that will survive the refresh — or set `_selected_key` to a survivor's sid directly.
 
 ## Key conventions
@@ -417,7 +422,7 @@ This project layers multiple technologies in unusual ways: bash statusline scrip
 - **Python 3.12+** (venv is 3.12.13, `requires-python>=3.12`): modern syntax (union types, etc.) is fine; 3.14-only syntax is not
 - **Dependencies**: `textual` for TUI, `rich` for markup. Dev: `pytest`, `pytest-asyncio`
 - **Preferences** saved to `~/.claude/monitor-prefs.json` — columns and column order
-- **Statusline** at `statusline/statusline.sh` — symlinked to `~/.claude/statusline.sh` by installer
+- **Statusline** at `statusline/statusline.sh`, symlinked to `~/.claude/statusline.sh` only when the installer is run with `--with-statusline`
 
 ## Common tasks
 

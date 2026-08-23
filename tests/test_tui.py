@@ -20,7 +20,7 @@ from claude_monitor import (
     Session,
     ALL_COLUMNS,
 )
-from tests.helpers import make_session
+from tests.helpers import make_session, settle
 
 
 def _mock_sessions(sessions: list[Session]):
@@ -59,7 +59,7 @@ class TestAppMounts:
     async def test_app_starts(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table is not None
                 # Grouped view (default) adds group header rows
@@ -68,7 +68,7 @@ class TestAppMounts:
     async def test_stats_bar_shows(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 stats = pilot.app.query_one(StatsBar)
                 assert stats is not None
 
@@ -84,7 +84,7 @@ class TestAppMounts:
         from claude_monitor import SortMode, READY_COLOR_DARK, READY_COLOR_LIGHT
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 stats = pilot.app.query_one(StatsBar)
                 label = stats.query_one("#stats-done")
 
@@ -99,7 +99,7 @@ class TestAppMounts:
     async def test_detail_panel_exists(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 panel = pilot.app.query_one("#detail-panel", Static)
                 assert panel is not None
 
@@ -108,7 +108,7 @@ class TestSessionColumnElastic:
     async def _session_w(self, sessions, term_w):
         with _mock_sessions(sessions):
             async with ClaudeMonitor().run_test(size=(term_w, 30)) as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 col = table.columns["session"]
                 others = sum(
@@ -136,44 +136,44 @@ class TestKeyBindings:
     async def test_sort_cycles(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 initial_sort = pilot.app.sort_mode
                 await pilot.press("ctrl+s")
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app.sort_mode != initial_sort
 
     async def test_toggle_subagents(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app.show_subagents is False
                 await pilot.press("ctrl+a")
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app.show_subagents is True
                 await pilot.press("ctrl+a")
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app.show_subagents is False
 
     async def test_search_opens_and_closes(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 search = pilot.app.query_one("#search-bar", Input)
                 assert search.display is False
                 await pilot.press("slash")
-                await pilot.pause()
+                await settle(pilot)
                 assert search.display is True
                 await pilot.press("escape")
-                await pilot.pause()
+                await settle(pilot)
                 assert search.display is False
 
     async def test_vim_navigation(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("ctrl+j")
                 await pilot.press("ctrl+j")
-                await pilot.pause()
+                await settle(pilot)
 
     async def test_ctrl_r_is_no_longer_bound(self, sample_sessions):
         """Max, 2026-08-18: "let's just replace normal refresh with shift r,
@@ -184,7 +184,7 @@ class TestKeyBindings:
         here: action_restart runs git pull and exits the app under test."""
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 bound_keys = {b.key for b in pilot.app.BINDINGS}
                 assert "ctrl+r" not in bound_keys
                 assert "R" in bound_keys
@@ -197,19 +197,19 @@ class TestSessionMenu:
     async def test_enter_opens_menu(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
                 assert len(pilot.app.screen_stack) > 1
 
     async def test_single_click_highlights_only(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 # click row index 1 (offset y=2: y=0 header, y=1 row0, y=2 row1)
                 await pilot.click("#session-table", offset=(2, 2), times=1)
-                await pilot.pause()
+                await settle(pilot)
                 assert table.cursor_row == 1
                 assert len(pilot.app.screen_stack) == 1  # no menu
 
@@ -217,9 +217,9 @@ class TestSessionMenu:
         with _mock_sessions(sample_sessions), \
              patch("claude_monitor.focus_terminal_session", return_value=True) as mock_jump:
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.click("#session-table", offset=(2, 2), times=2)
-                await pilot.pause()
+                await settle(pilot)
                 assert mock_jump.called
                 assert len(pilot.app.screen_stack) == 1  # no menu
 
@@ -229,19 +229,19 @@ class TestSessionMenu:
         with _mock_sessions(sample_sessions), \
              patch("claude_monitor.focus_terminal_session", return_value=True) as mock_jump:
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 # row 0 is highlighted on mount
                 await pilot.click("#session-table", offset=(2, 1), times=2)
-                await pilot.pause()
+                await settle(pilot)
                 assert mock_jump.called
                 assert len(pilot.app.screen_stack) == 1
 
     async def test_menu_shows_options(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
                 screen = pilot.app.screen
                 options = screen.query_one("#menu-options", OptionList)
                 assert options is not None
@@ -250,20 +250,20 @@ class TestSessionMenu:
     async def test_menu_escape_closes(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
                 assert len(pilot.app.screen_stack) > 1
                 await pilot.press("escape")
-                await pilot.pause()
+                await settle(pilot)
                 assert len(pilot.app.screen_stack) == 1
 
     async def test_menu_shows_session_title(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
                 screen = pilot.app.screen
                 title_label = screen.query_one("#menu-title")
                 label_text = str(title_label.render())
@@ -274,9 +274,9 @@ class TestSessionMenu:
     async def test_menu_has_remote_link_when_available(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
                 screen = pilot.app.screen
                 options = screen.query_one("#menu-options", OptionList)
                 option_ids = [options.get_option_at_index(i).id
@@ -287,9 +287,9 @@ class TestSessionMenu:
         sessions = [make_session(session_id="no-remote", remote_url="", slug="")]
         with _mock_sessions(sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
                 screen = pilot.app.screen
                 options = screen.query_one("#menu-options", OptionList)
                 option_ids = [options.get_option_at_index(i).id
@@ -301,35 +301,35 @@ class TestColumnPicker:
     async def test_column_picker_opens(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("ctrl+c")
-                await pilot.pause()
+                await settle(pilot)
                 assert len(pilot.app.screen_stack) > 1
 
     async def test_column_picker_escape_closes(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("ctrl+c")
-                await pilot.pause()
+                await settle(pilot)
                 assert len(pilot.app.screen_stack) > 1
                 await pilot.press("escape")
-                await pilot.pause()
+                await settle(pilot)
                 assert len(pilot.app.screen_stack) == 1
 
     async def test_column_toggle(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("ctrl+c")
-                await pilot.pause()
+                await settle(pilot)
                 screen = pilot.app.screen
                 picker = screen
                 ol = screen.query_one("#picker-list", OptionList)
                 first_key = picker._col_keys[0]
                 was_selected = first_key in picker.selected_cols
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
                 assert (first_key in picker.selected_cols) != was_selected
 
 
@@ -337,42 +337,41 @@ class TestSearch:
     async def test_search_filters_sessions(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("slash")
-                await pilot.pause()
+                await settle(pilot)
                 search = pilot.app.query_one("#search-bar", Input)
                 search.value = "First"
-                await pilot.pause()
-                await pilot.pause()  # filtering runs via refresh_sessions' worker thread
+                await settle(pilot)
+                await settle(pilot)  # filtering runs via refresh_sessions' worker thread
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count == 1
 
     async def test_clear_search_restores_all(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("slash")
-                await pilot.pause()
+                await settle(pilot)
                 search = pilot.app.query_one("#search-bar", Input)
                 search.value = "First"
-                await pilot.pause()
-                await pilot.pause()  # filtering runs via refresh_sessions' worker thread
+                await settle(pilot)
+                await settle(pilot)  # filtering runs via refresh_sessions' worker thread
                 await pilot.press("escape")
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count >= 3
 
     async def test_search_no_match(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("slash")
-                await pilot.pause()
+                await settle(pilot)
                 search = pilot.app.query_one("#search-bar", Input)
                 search.value = "nonexistent-session-xyz"
-                await pilot.pause()
-                await pilot.pause()  # filtering runs via refresh_sessions' worker thread
+                await settle(pilot)
+                await settle(pilot)  # filtering runs via refresh_sessions' worker thread
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count == 0
 
@@ -381,12 +380,12 @@ class TestSearch:
         not the type-ahead group jump (every real hotkey needs Ctrl)."""
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 sort_before = pilot.app.sort_mode
                 await pilot.press("slash")
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("s")
-                await pilot.pause()
+                await settle(pilot)
                 search = pilot.app.query_one("#search-bar", Input)
                 assert search.value == "s"
                 assert pilot.app.sort_mode == sort_before
@@ -396,24 +395,24 @@ class TestSearch:
     ):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("slash")
-                await pilot.pause()
+                await settle(pilot)
                 search = pilot.app.query_one("#search-bar", Input)
                 search.value = "First"
-                await pilot.pause()
-                await pilot.pause()  # filtering runs via refresh_sessions' worker thread
+                await settle(pilot)
+                await settle(pilot)  # filtering runs via refresh_sessions' worker thread
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count == 1
                 await pilot.press("down")
-                await pilot.pause()
+                await settle(pilot)
                 assert table.has_focus
                 assert pilot.app._filter == "First"
                 assert table.row_count == 1
                 assert search.display is True
                 # Esc from the table still clears the filter and restores rows.
                 await pilot.press("escape")
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app._filter == ""
                 assert search.display is False
                 assert table.row_count >= 3
@@ -427,7 +426,7 @@ class TestSearch:
              patch("claude_monitor.focus_terminal_session", return_value=True), \
              patch.object(ClaudeMonitor, "action_clear_search") as clear:
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 s = pilot.app._flat_rows[0]
                 pilot.app._make_menu_handler(s)("jump")
                 clear.assert_called_once()
@@ -440,7 +439,7 @@ class TestSearch:
              patch("claude_monitor._resolve_match_candidates", return_value=[]), \
              patch.object(ClaudeMonitor, "action_clear_search") as clear:
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 s = pilot.app._flat_rows[0]
                 pilot.app._make_menu_handler(s)("jump")
                 clear.assert_not_called()
@@ -448,15 +447,15 @@ class TestSearch:
     async def test_i_toggles_detail_panel(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 panel = pilot.app.query_one("#detail-panel", Static)
                 assert panel.display is True
                 await pilot.press("ctrl+v")
-                await pilot.pause()
+                await settle(pilot)
                 assert panel.display is False
                 assert pilot.app.show_detail is False
                 await pilot.press("ctrl+v")
-                await pilot.pause()
+                await settle(pilot)
                 assert panel.display is True
 
 
@@ -464,13 +463,13 @@ class TestArchived:
     async def test_archive_toggle(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app.show_archived is False
                 await pilot.press("ctrl+z")
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app.show_archived is True
                 await pilot.press("ctrl+z")
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app.show_archived is False
 
     async def test_archived_sessions_appear_when_toggled(self):
@@ -488,11 +487,11 @@ class TestArchived:
 
         with patch("claude_monitor.parse_sessions", side_effect=_mock_parse):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 before = table.row_count
                 await pilot.press("ctrl+z")
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count > before  # archived session appeared
 
@@ -500,9 +499,9 @@ class TestArchived:
         s = make_session(session_id="old-1", title="Old Session", status="archived")
         with _mock_sessions([s]):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
                 screen = pilot.app.screen
                 options = screen.query_one("#menu-options", OptionList)
                 option_ids = [options.get_option_at_index(i).id
@@ -513,9 +512,9 @@ class TestArchived:
     async def test_active_menu_shows_jump(self, sample_sessions):
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
                 screen = pilot.app.screen
                 options = screen.query_one("#menu-options", OptionList)
                 option_ids = [options.get_option_at_index(i).id
@@ -552,12 +551,11 @@ class TestHideInactivePins:
         sessions = self._sessions()
         with patch("claude_monitor.parse_sessions", return_value=sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app.hide_inactive_pins is False
                 pilot.app._pinned = {"pinned-1"}
                 pilot.app.refresh_sessions()
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 titles = [s.title for s in pilot.app._row_map if s]
                 assert "Pinned Closed" in titles
 
@@ -565,23 +563,20 @@ class TestHideInactivePins:
         sessions = self._sessions()
         with patch("claude_monitor.parse_sessions", return_value=sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 pilot.app._pinned = {"pinned-1"}
                 pilot.app.refresh_sessions()
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
 
                 await pilot.press("ctrl+o")
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app.hide_inactive_pins is True
                 titles = [s.title for s in pilot.app._row_map if s]
                 assert "Pinned Closed" not in titles
                 assert "Active" in titles  # never touches non-pinned rows
 
                 await pilot.press("ctrl+o")
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app.hide_inactive_pins is False
                 titles = [s.title for s in pilot.app._row_map if s]
                 assert "Pinned Closed" in titles  # the pin itself never expired
@@ -590,10 +585,10 @@ class TestHideInactivePins:
         sessions = self._sessions()
         with patch("claude_monitor.parse_sessions", return_value=sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 pilot.app._pinned = {"pinned-1"}
                 await pilot.press("ctrl+o")
-                await pilot.pause()
+                await settle(pilot)
                 assert "pinned-1" in pilot.app._pinned
 
     async def test_hides_archived_pin_not_just_closed(self):
@@ -606,17 +601,15 @@ class TestHideInactivePins:
                                        status="archived")
         with patch("claude_monitor.parse_sessions", return_value=[archived_pinned]):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 pilot.app._pinned = {"pinned-archived"}
                 pilot.app.refresh_sessions()
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 titles = [s.title for s in pilot.app._row_map if s]
                 assert "Archived Pin" in titles
 
                 await pilot.press("ctrl+o")
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 titles = [s.title for s in pilot.app._row_map if s]
                 assert "Archived Pin" not in titles
 
@@ -631,13 +624,12 @@ class TestHideInactivePins:
                                          status="archived")
         with patch("claude_monitor.parse_sessions", return_value=[unpinned_archived]):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 titles = [s.title for s in pilot.app._row_map if s]
                 assert "Old Unpinned" in titles
 
                 await pilot.press("ctrl+o")
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 titles = [s.title for s in pilot.app._row_map if s]
                 assert "Old Unpinned" in titles  # never pinned, toggle is irrelevant to it
 
@@ -649,15 +641,13 @@ class TestHideInactivePins:
         done_pinned = make_session(session_id="pinned-done", title="Done Pin", status="done")
         with patch("claude_monitor.parse_sessions", return_value=[done_pinned]):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 pilot.app._pinned = {"pinned-done"}
                 pilot.app.refresh_sessions()
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
 
                 await pilot.press("ctrl+o")
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 titles = [s.title for s in pilot.app._row_map if s]
                 assert "Done Pin" in titles
 
@@ -675,16 +665,14 @@ class TestHideInactivePins:
             ClaudeMonitor.show_groups._default = True
             try:
                 async with ClaudeMonitor().run_test(size=(200, 50)) as pilot:
-                    await pilot.pause()
+                    await settle(pilot)
                     pilot.app._pinned = {"active-pin", "closed-pin"}
                     pilot.app.refresh_sessions()
-                    await pilot.pause()
-                    await pilot.pause()
+                    await settle(pilot)
                     assert pilot.app._group_counts.get("strategy") == 2
 
                     await pilot.press("ctrl+o")
-                    await pilot.pause()
-                    await pilot.pause()
+                    await settle(pilot)
                     assert pilot.app._group_counts.get("strategy") == 1
                     assert "ungrouped" not in pilot.app._group_counts
                     titles = [s.title for s in pilot.app._row_map if s]
@@ -711,7 +699,7 @@ class TestInboxMode:
     async def test_off_by_default_shows_everything(self):
         with _mock_sessions(self._mix()):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app.inbox_mode is False
                 titles = {s.title for s in pilot.app._row_map if s}
                 assert titles == {"alpha-working", "alpha-ready", "beta-approve", "config-skills"}
@@ -719,10 +707,9 @@ class TestInboxMode:
     async def test_ctrl_b_hides_working_and_standby_keeps_needs_you(self):
         with _mock_sessions(self._mix()):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("ctrl+b")
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app.inbox_mode is True
                 titles = {s.title for s in pilot.app._row_map if s}
                 assert titles == {"alpha-ready", "beta-approve"}
@@ -736,22 +723,19 @@ class TestInboxMode:
                    return_value={"acked_ready": {"d": [2, 100.0]}}), \
              patch("claude_monitor.save_prefs"):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("ctrl+b")
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 assert [s.title for s in pilot.app._row_map if s] == ["ready"]
 
     async def test_toggle_back_restores_everything(self):
         with _mock_sessions(self._mix()):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("ctrl+b")
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("ctrl+b")
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app.inbox_mode is False
                 assert len([s for s in pilot.app._row_map if s]) == 4
 
@@ -766,11 +750,10 @@ class TestInboxMode:
             ClaudeMonitor.show_groups._default = True
             try:
                 async with ClaudeMonitor().run_test(size=(200, 50)) as pilot:
-                    await pilot.pause()
+                    await settle(pilot)
                     assert pilot.app._group_counts.get("strategy") == 2
                     await pilot.press("ctrl+b")
-                    await pilot.pause()
-                    await pilot.pause()
+                    await settle(pilot)
                     assert pilot.app._group_counts.get("strategy") == 1
                     assert "ungrouped" not in pilot.app._group_counts
                     assert [s.title for s in pilot.app._row_map if s] == ["strategy-b"]
@@ -797,14 +780,13 @@ class TestInboxMode:
             ClaudeMonitor.show_groups._default = True
             try:
                 async with ClaudeMonitor().run_test(size=(200, 50)) as pilot:
-                    await pilot.pause()
+                    await settle(pilot)
                     table = pilot.app.query_one("#session-table", DataTable)
                     assert pilot.app._row_map[0] is None  # header first, as in prod
                     table.move_cursor(row=pilot.app._row_index_of("w2"))
-                    await pilot.pause()
+                    await settle(pilot)
                     await pilot.press("ctrl+b")
-                    await pilot.pause()
-                    await pilot.pause()
+                    await settle(pilot)
                     cur = pilot.app._row_map[table.cursor_row]
                     assert cur is not None, "cursor stranded on the group header"
                     assert cur.session_id == "d1"
@@ -821,9 +803,9 @@ class TestInboxMode:
         with _mock_sessions(self._mix()), \
              patch("claude_monitor._update_prefs") as upd:
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("ctrl+b")
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app.inbox_mode is True
                 upd.reset_mock()
                 with patch.dict("os.environ", {}, clear=False):
@@ -843,7 +825,7 @@ class TestInboxMode:
                    return_value={"view_state": {"inbox_mode": True}}), \
              patch("claude_monitor.save_prefs"):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app.inbox_mode is False
                 with patch.dict("os.environ", {}, clear=False):
                     import os
@@ -851,8 +833,7 @@ class TestInboxMode:
                     pilot.app._load_view_state()
                 assert pilot.app.inbox_mode is True
                 pilot.app.refresh_sessions()
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 titles = {s.title for s in pilot.app._row_map if s}
                 assert titles == {"alpha-ready", "beta-approve"}
 
@@ -862,10 +843,9 @@ class TestInboxMode:
         chip exists to deny."""
         with _mock_sessions(self._mix()):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("ctrl+b")
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 working = pilot.app.query_one("#stats-working")
                 assert "1 working" in str(working.render())
 
@@ -876,15 +856,13 @@ class TestInboxMode:
         w = make_session(session_id="x", title="x", status="working")
         with patch("claude_monitor.parse_sessions", return_value=[w]):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("ctrl+b")
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app._row_map == [] or all(r is None for r in pilot.app._row_map)
                 w.status = "needs_approval"
                 pilot.app.refresh_sessions()
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 assert "x" in pilot.app._bell
 
     async def test_jump_by_name_finds_a_hidden_working_session(self, tmp_path, monkeypatch):
@@ -897,24 +875,22 @@ class TestInboxMode:
         with patch("claude_monitor.parse_sessions", return_value=[w]), \
              patch("claude_monitor.focus_terminal_session", return_value=True) as jump:
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("ctrl+b")
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 cm.JUMP_REQUEST_PATH.write_text("abcd1234")
                 pilot.app._check_jump_request()
-                await pilot.pause()
+                await settle(pilot)
                 jump.assert_called_once()
 
     async def test_stats_bar_shows_inbox_chip_only_when_on(self):
         with _mock_sessions(self._mix()):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 chip = pilot.app.query_one("#stats-inbox")
                 assert "INBOX" not in str(chip.render())
                 await pilot.press("ctrl+b")
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 rendered = str(chip.render())
                 assert "INBOX" in rendered
                 assert "2 hidden" in rendered  # alpha-working + config-skills
@@ -936,15 +912,15 @@ class TestCursorRowKeepsStatusColors:
                  patch("claude_monitor._system_is_dark", return_value=dark):
                 app = ClaudeMonitor()
                 async with app.run_test() as pilot:
-                    await pilot.pause()
-                    await pilot.pause()
+                    await settle(pilot)
+                    await settle(pilot)
                     table = app.query_one("#session-table", DataTable)
                     table.focus()
-                    await pilot.pause()
+                    await settle(pilot)
                     focused = table.get_component_styles("datatable--cursor")
                     assert focused.color.rgb != (255, 255, 255), app.theme
                     app.set_focus(None)
-                    await pilot.pause()
+                    await settle(pilot)
                     blurred = table.get_component_styles("datatable--cursor")
                     # Same text colour whether or not the table has focus.
                     assert focused.color.rgb == blurred.color.rgb, app.theme
@@ -959,11 +935,11 @@ class TestSubagents:
         parent = make_session(session_id="parent-1", title="Parent", subagents=[sub])
         with _mock_sessions([parent]):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count == 1
                 await pilot.press("ctrl+a")
-                await pilot.pause()
+                await settle(pilot)
                 assert table.row_count == 2
 
     async def test_subagents_hidden_again(self):
@@ -971,11 +947,11 @@ class TestSubagents:
         parent = make_session(session_id="p1", subagents=[sub])
         with _mock_sessions([parent]):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("ctrl+a")
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("ctrl+a")
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 assert table.row_count == 1
 
@@ -986,11 +962,11 @@ class TestEmptyState:
         # into _row_map / old_map with that.
         with patch("claude_monitor.parse_sessions", return_value=[]):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 # Explicitly drive a refresh cycle too
                 pilot.app.refresh_sessions()
-                await pilot.pause()
-                await pilot.pause()  # refresh_sessions runs in a worker thread
+                await settle(pilot)
+                await settle(pilot)  # refresh_sessions runs in a worker thread
                 assert pilot.app._row_map == []
 
 
@@ -1008,7 +984,7 @@ class TestProactiveGroup:
         with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
              patch("claude_monitor._is_session_alive", return_value=True):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 # Find a bashing-* session row (skip group header)
                 for i, s in enumerate(pilot.app._row_map):
@@ -1023,7 +999,7 @@ class TestProactiveGroup:
         with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
              patch("claude_monitor._is_session_alive", return_value=True):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 # Find the bashing group header row (None in _row_map)
                 for i, s in enumerate(pilot.app._row_map):
@@ -1046,14 +1022,14 @@ class TestProactiveGroup:
              patch("claude_monitor._is_session_alive", return_value=True), \
              patch.object(ClaudeMonitor, "_broadcast_command", fake_broadcast):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 for i, s in enumerate(pilot.app._row_map):
                     if s and s.title.startswith("bashing-"):
                         table.move_cursor(row=i)
                         break
                 await pilot.press("P")
-                await pilot.pause()
+                await settle(pilot)
                 # Worker runs in thread; give it a beat
                 await pilot.app.workers.wait_for_complete()
                 assert captured.get("cmd") == "/proactive"
@@ -1066,14 +1042,14 @@ class TestProactiveGroup:
              patch("claude_monitor._is_session_alive", return_value=True), \
              patch.object(ClaudeMonitor, "_broadcast_command") as mock_bc:
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 for i, s in enumerate(pilot.app._row_map):
                     if s and s.session_id == "other-1":
                         table.move_cursor(row=i)
                         break
                 await pilot.press("P")
-                await pilot.pause()
+                await settle(pilot)
                 mock_bc.assert_not_called()
 
 
@@ -1099,10 +1075,10 @@ class TestTypeaheadJump:
         with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
              patch("claude_monitor._is_session_alive", return_value=True):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 await pilot.press("s")
-                await pilot.pause()
+                await settle(pilot)
                 cr = table.cursor_row
                 assert pilot.app._row_map[cr] is None  # landed on a header row
                 nxt = next(s for s in pilot.app._row_map[cr:] if s)
@@ -1112,11 +1088,11 @@ class TestTypeaheadJump:
         with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
              patch("claude_monitor._is_session_alive", return_value=True):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 for k in ("b", "a", "s", "h"):
                     await pilot.press(k)
-                await pilot.pause()
+                await settle(pilot)
                 cr = table.cursor_row
                 nxt = next(s for s in pilot.app._row_map[cr:] if s)
                 assert nxt.title.startswith("bashing")
@@ -1126,12 +1102,12 @@ class TestTypeaheadJump:
         with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
              patch("claude_monitor._is_session_alive", return_value=True):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("b")
-                await pilot.pause()
+                await settle(pilot)
                 pilot.app._typeahead_last_key -= 10  # force timeout
                 await pilot.press("s")
-                await pilot.pause()
+                await settle(pilot)
                 # Stale "b" buffer must not survive; fresh "s" alone matches strategy.
                 assert pilot.app._typeahead_buffer == "s"
                 table = pilot.app.query_one("#session-table", DataTable)
@@ -1142,54 +1118,54 @@ class TestTypeaheadJump:
         with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
              patch("claude_monitor._is_session_alive", return_value=True):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 table.move_cursor(row=0)
                 await pilot.press("z")
-                await pilot.pause()
+                await settle(pilot)
                 assert table.cursor_row == 0
 
     async def test_ignored_while_modal_open(self, grouped_sessions):
         with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
              patch("claude_monitor._is_session_alive", return_value=True):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 row = next(i for i, s in enumerate(pilot.app._row_map) if s)
                 table.move_cursor(row=row)
                 await pilot.press("enter")  # opens SessionMenu (a real row, not a header)
-                await pilot.pause()
+                await settle(pilot)
                 assert len(pilot.app.screen_stack) > 1
                 await pilot.press("s")
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("escape")
-                await pilot.pause()
+                await settle(pilot)
                 assert table.cursor_row == row
 
     async def test_ignored_while_search_focused(self, grouped_sessions):
         with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
              patch("claude_monitor._is_session_alive", return_value=True):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 table.move_cursor(row=0)
                 await pilot.press("slash")
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("s")
-                await pilot.pause()
+                await settle(pilot)
                 assert table.cursor_row == 0
 
     async def test_ungrouped_view_jumps_to_first_row_of_group(self, grouped_sessions):
         with patch("claude_monitor.parse_sessions", return_value=grouped_sessions), \
              patch("claude_monitor._is_session_alive", return_value=True):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 pilot.app.show_groups = False
                 pilot.app.refresh_sessions()
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 await pilot.press("s")
-                await pilot.pause()
+                await settle(pilot)
                 sel = pilot.app._row_map[table.cursor_row]
                 assert sel is not None and sel.title.startswith("strategy")
 
@@ -1203,7 +1179,7 @@ class TestTitleDisambiguation:
         ]
         with _mock_sessions(dups):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 titles = [s.title for s in pilot.app._flat_rows]
                 assert "Shared Name ·abc12345" in titles
                 assert "Shared Name ·def67890" in titles
@@ -1234,7 +1210,7 @@ class TestHideAndMultiSelect:
                        side_effect=lambda h: saved.append(set(h))):
                 async with ClaudeMonitor().run_test() as pilot:
                     pilot.app.show_archived = True
-                    await pilot.pause()
+                    await settle(pilot)
                     pilot._saved = saved  # type: ignore
                     yield pilot
         return _ctx()
@@ -1244,23 +1220,23 @@ class TestHideAndMultiSelect:
              patch("claude_monitor.load_hidden_sessions", return_value=set()), \
              patch("claude_monitor.save_hidden_sessions"):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 # show_archived defaults False; cursor on archived row 0
                 await pilot.press("backspace")
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app._delete_armed_for is not None
 
     async def test_delete_arms_then_hides(self, archived_sessions):
         async with await self._app(archived_sessions) as pilot:
             table = pilot.app.query_one("#session-table", DataTable)
             table.move_cursor(row=0)  # arch-1
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("backspace")
-            await pilot.pause()
+            await settle(pilot)
             assert pilot.app._delete_armed_for == frozenset({"arch-1"})
             assert "arch-1" not in pilot.app._hidden
             await pilot.press("backspace")
-            await pilot.pause()
+            await settle(pilot)
             assert "arch-1" in pilot.app._hidden
             assert pilot._saved[-1] == {"arch-1"}
 
@@ -1272,9 +1248,9 @@ class TestHideAndMultiSelect:
                 if s and s.session_id == "live-1":
                     table.move_cursor(row=i)
                     break
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("backspace")
-            await pilot.pause()
+            await settle(pilot)
             assert pilot.app._delete_armed_for is None
             assert "live-1" not in pilot.app._hidden
 
@@ -1282,51 +1258,51 @@ class TestHideAndMultiSelect:
         async with await self._app(archived_sessions) as pilot:
             table = pilot.app.query_one("#session-table", DataTable)
             table.move_cursor(row=0)
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("shift+down")
-            await pilot.pause()
+            await settle(pilot)
             assert len(pilot.app._selection) == 2
             await pilot.press("shift+down")
-            await pilot.pause()
+            await settle(pilot)
             assert len(pilot.app._selection) == 3
 
     async def test_plain_arrow_clears_selection(self, archived_sessions):
         async with await self._app(archived_sessions) as pilot:
             table = pilot.app.query_one("#session-table", DataTable)
             table.move_cursor(row=0)
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("shift+down")
-            await pilot.pause()
+            await settle(pilot)
             assert pilot.app._selection
             await pilot.press("down")
-            await pilot.pause()
+            await settle(pilot)
             assert pilot.app._selection == set()
 
     async def test_batch_hide_via_selection(self, archived_sessions):
         async with await self._app(archived_sessions) as pilot:
             table = pilot.app.query_one("#session-table", DataTable)
             table.move_cursor(row=0)
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("shift+down", "shift+down")  # select 3 rows
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("backspace")  # arm
-            await pilot.pause()
+            await settle(pilot)
             armed = pilot.app._delete_armed_for
             assert armed is not None and len(armed) >= 2
             await pilot.press("backspace")  # confirm
-            await pilot.pause()
+            await settle(pilot)
             assert pilot.app._hidden >= {"arch-1", "arch-2"}
 
     async def test_shift_up_shrinks_selection(self, archived_sessions):
         async with await self._app(archived_sessions) as pilot:
             table = pilot.app.query_one("#session-table", DataTable)
             table.move_cursor(row=0)
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("shift+down", "shift+down")
-            await pilot.pause()
+            await settle(pilot)
             n_before = len(pilot.app._selection)
             await pilot.press("shift+up")
-            await pilot.pause()
+            await settle(pilot)
             assert len(pilot.app._selection) == n_before - 1
             assert pilot.app._selection_anchor is not None
 
@@ -1336,14 +1312,13 @@ class TestHideAndMultiSelect:
             pilot.app._extending_cursor = True
             table.move_cursor(row=1)  # anchor NOT at row 0
             pilot.app._extending_cursor = False
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("shift+down")
-            await pilot.pause()
+            await settle(pilot)
             sel_before = set(pilot.app._selection)
             anchor_before = pilot.app._selection_anchor
             pilot.app.refresh_sessions()
-            await pilot.pause()
-            await pilot.pause()
+            await settle(pilot)
             assert pilot.app._selection == sel_before
             assert pilot.app._selection_anchor == anchor_before
 
@@ -1354,9 +1329,9 @@ class TestHideAndMultiSelect:
             pilot.app._extending_cursor = True
             table.move_cursor(row=1)
             pilot.app._extending_cursor = False
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("backspace", "backspace")
-            await pilot.pause()
+            await settle(pilot)
             assert "arch-2" in pilot.app._hidden
             # arch-2 gone; cursor should land on next survivor (arch-3), not row 0
             cur = pilot.app._row_map[table.cursor_row]
@@ -1367,12 +1342,12 @@ class TestHideAndMultiSelect:
         async with await self._app(archived_sessions) as pilot:
             table = pilot.app.query_one("#session-table", DataTable)
             table.move_cursor(row=0)
-            await pilot.pause()
+            await settle(pilot)
             await pilot.press("backspace")
-            await pilot.pause()
+            await settle(pilot)
             assert pilot.app._delete_armed_for is not None
             await pilot.press("down")
-            await pilot.pause()
+            await settle(pilot)
             assert pilot.app._delete_armed_for is None
 
 
@@ -1399,9 +1374,9 @@ class TestNextActionableMovesCursorOnly:
              patch("claude_monitor.focus_terminal_session") as jump, \
              patch("claude_monitor.resume_session") as resume:
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("n")
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 cursor_session = pilot.app._row_map[table.cursor_row]
                 assert cursor_session.session_id == "approve-1"
@@ -1416,10 +1391,10 @@ class TestNextActionableMovesCursorOnly:
              patch("claude_monitor.save_prefs") as save, \
              patch("claude_monitor.focus_terminal_session"):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 save.reset_mock()  # drop the startup launch_count save
                 await pilot.press("n")
-                await pilot.pause()
+                await settle(pilot)
                 for call in save.call_args_list:
                     prefs_arg = call[0][0]
                     assert "next_cursor" not in prefs_arg
@@ -1430,9 +1405,9 @@ class TestNextActionableMovesCursorOnly:
         with patch("claude_monitor.parse_sessions", return_value=sessions), \
              patch("claude_monitor.focus_terminal_session") as jump:
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("n")
-                await pilot.pause()
+                await settle(pilot)
                 jump.assert_not_called()
 
     async def test_n_cycles_from_current_cursor_not_the_start(self):
@@ -1440,19 +1415,19 @@ class TestNextActionableMovesCursorOnly:
         b = make_session(session_id="b", title="B", status="done", last_activity=200)
         with patch("claude_monitor.parse_sessions", return_value=[a, b]):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
 
                 await pilot.press("n")
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app._row_map[table.cursor_row].session_id == "a"
 
                 await pilot.press("n")
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app._row_map[table.cursor_row].session_id == "b"
 
                 await pilot.press("n")  # wraps back around
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app._row_map[table.cursor_row].session_id == "a"
 
     async def test_n_walks_table_order_not_priority_order(self):
@@ -1472,13 +1447,13 @@ class TestNextActionableMovesCursorOnly:
         d = make_session(session_id="d", title="D", status="done", last_activity=200)
         with patch("claude_monitor.parse_sessions", return_value=[a, b, c, d]):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 b_row = pilot.app._row_index_of("b")
                 table.move_cursor(row=b_row)
 
                 await pilot.press("n")
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app._row_map[table.cursor_row].session_id == "c"
 
     async def test_n_enter_enter_still_jumps(self):
@@ -1489,13 +1464,13 @@ class TestNextActionableMovesCursorOnly:
         with patch("claude_monitor.parse_sessions", return_value=sessions), \
              patch("claude_monitor.focus_terminal_session", return_value=True) as jump:
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("n")
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle(pilot)
                 jump.assert_called_once()
                 assert jump.call_args[0][0].session_id == "approve-1"
 
@@ -1510,15 +1485,14 @@ class TestNextActionableMovesCursorOnly:
         sessions = self._sessions()  # ready-1 and approve-1 are the actionable ones
         with patch("claude_monitor.parse_sessions", return_value=sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 pilot.app._filter = "working"  # matches only working-1 (not actionable)
                 pilot.app.refresh_sessions()
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 table = pilot.app.query_one("#session-table", DataTable)
                 before = table.cursor_row
                 await pilot.press("n")
-                await pilot.pause()
+                await settle(pilot)
                 # ready-1 and approve-1 are both hidden by the filter: nothing to move to.
                 assert table.cursor_row == before
 
@@ -1567,10 +1541,10 @@ class TestReadyOnlyMarkedSeenOnActualJump:
              patch("claude_monitor._heal_hook_state"), \
              patch("claude_monitor._mark_ready_seen") as mark_seen:
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 handler = pilot.app._make_menu_handler(target)
                 handler("jump")
-                await pilot.pause()
+                await settle(pilot)
                 mark_seen.assert_not_called()
 
     async def test_session_menu_jump_marks_seen_on_success(self):
@@ -1579,10 +1553,10 @@ class TestReadyOnlyMarkedSeenOnActualJump:
              patch("claude_monitor.focus_terminal_session", return_value=True), \
              patch("claude_monitor._mark_ready_seen") as mark_seen:
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 handler = pilot.app._make_menu_handler(target)
                 handler("jump")
-                await pilot.pause()
+                await settle(pilot)
                 mark_seen.assert_called_once_with("ready-1", "done", target.last_activity)
 
     async def test_refresh_never_writes_acked_ready(self):
@@ -1605,11 +1579,10 @@ class TestReadyOnlyMarkedSeenOnActualJump:
              patch("claude_monitor.load_prefs", return_value={"acked_ready": ["ready-1"]}), \
              patch("claude_monitor.save_prefs") as save:
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 for _ in range(3):
                     pilot.app.refresh_sessions()
-                    await pilot.pause()
-                    await pilot.pause()
+                    await settle(pilot)
                 for call in save.call_args_list:
                     saved = call[0][0]
                     if "acked_ready" in saved:
@@ -1629,7 +1602,7 @@ class TestJumpRequestOwnership:
         target = make_session(session_id="ready-1", title="Ready", status="done")
         with patch("claude_monitor.parse_sessions", return_value=[target]):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app._owns_jump_requests is True
                 with patch.object(pilot.app, "_handle_jump_next_request") as handler:
                     cm.JUMP_REQUEST_PATH.write_text("__jump_next__:1:1")
@@ -1642,7 +1615,7 @@ class TestJumpRequestOwnership:
         target = make_session(session_id="ready-1", title="Ready", status="done")
         with patch("claude_monitor.parse_sessions", return_value=[target]):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 pilot.app._owns_jump_requests = False  # what a port collision sets
                 with patch.object(pilot.app, "_handle_jump_next_request") as handler:
                     cm.JUMP_REQUEST_PATH.write_text("__jump_next__:1:1")
@@ -1673,7 +1646,7 @@ class TestJumpRequestSentinelDispatch:
         target = make_session(session_id="ready-1", title="Ready", status="done")
         with patch("claude_monitor.parse_sessions", return_value=[target]):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 with patch.object(pilot.app, "_handle_jump_next_request") as handler:
                     cm.JUMP_REQUEST_PATH.write_text("__jump_next__:12345:999")
                     pilot.app._check_jump_request()
@@ -1685,7 +1658,7 @@ class TestJumpRequestSentinelDispatch:
         target = make_session(session_id="ready-1", title="Ready", status="done")
         with patch("claude_monitor.parse_sessions", return_value=[target]):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 with patch.object(pilot.app, "action_restart") as restart:
                     cm.JUMP_REQUEST_PATH.write_text("__restart__:12345:999")
                     pilot.app._check_jump_request()
@@ -1700,13 +1673,12 @@ class TestJumpRequestSentinelDispatch:
         with patch("claude_monitor.parse_sessions", return_value=[target]), \
              patch("claude_monitor.focus_terminal_session", return_value=True) as jump:
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 cm.JUMP_REQUEST_PATH.write_text("ready-1")
                 pilot.app._check_jump_request()
                 # The jump runs on a worker thread; one pause() is not
                 # always enough under load (see CLAUDE.md test notes).
-                await pilot.pause()
-                await pilot.pause()
+                await settle(pilot)
                 jump.assert_called_once()
 
 
@@ -1725,10 +1697,10 @@ class TestJumpNextRequestFailureFeedback:
              patch("claude_monitor._is_session_alive", return_value=False), \
              patch("claude_monitor.resume_session", return_value=False):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 with patch.object(pilot.app, "notify") as notify:
                     pilot.app._handle_jump_next_request()
-                    await pilot.pause()
+                    await settle(pilot)
                     notify.assert_called_once()
                     assert "Ready" in notify.call_args[0][0]
 
@@ -1740,10 +1712,10 @@ class TestJumpNextRequestFailureFeedback:
              patch("claude_monitor._mark_ready_seen"), \
              patch("claude_monitor.focus_terminal_session", return_value=True):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 with patch.object(pilot.app, "notify") as notify:
                     pilot.app._handle_jump_next_request()
-                    await pilot.pause()
+                    await settle(pilot)
                     notify.assert_not_called()
 
 
@@ -1765,9 +1737,9 @@ class TestJumpNextSkipsAlreadySeen:
              patch("claude_monitor.save_prefs"), \
              patch("claude_monitor.focus_terminal_session", return_value=True) as jump:
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 pilot.app._handle_jump_next_request()
-                await pilot.pause()
+                await settle(pilot)
                 jump.assert_called_once()
                 assert jump.call_args[0][0].session_id == "unseen"
 
@@ -1779,10 +1751,10 @@ class TestJumpNextSkipsAlreadySeen:
              patch("claude_monitor.save_prefs"), \
              patch("claude_monitor.focus_terminal_session") as jump:
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 with patch.object(pilot.app, "notify") as notify:
                     pilot.app._handle_jump_next_request()
-                    await pilot.pause()
+                    await settle(pilot)
                     jump.assert_not_called()
                     notify.assert_called_once_with("Nothing needs you right now", timeout=3)
 
@@ -1792,7 +1764,7 @@ class TestBell:
         sessions = [make_session(session_id="s1", title="t", status="needs_approval")]
         with _mock_sessions(sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 assert pilot.app._bell == {}
 
     async def test_rings_on_working_to_needs_approval(self):
@@ -1802,12 +1774,11 @@ class TestBell:
             ClaudeMonitor.show_groups._default = False
             try:
                 async with ClaudeMonitor().run_test() as pilot:
-                    await pilot.pause()
+                    await settle(pilot)
                     assert pilot.app._bell == {}
                     s.status = "needs_approval"
                     pilot.app.refresh_sessions()
-                    await pilot.pause()
-                    await pilot.pause()
+                    await settle(pilot)
                     assert "s1" in pilot.app._bell
                     assert pilot.app._bell["s1"]["acked"] is False
             finally:
@@ -1820,11 +1791,10 @@ class TestBell:
             ClaudeMonitor.show_groups._default = False
             try:
                 async with ClaudeMonitor().run_test() as pilot:
-                    await pilot.pause()
+                    await settle(pilot)
                     s.status = "needs_approval"
                     pilot.app.refresh_sessions()
-                    await pilot.pause()
-                    await pilot.pause()
+                    await settle(pilot)
                     assert "s1" in pilot.app._bell
                     pilot.app._ack_bell("s1")
                     pilot.app._tick_bell()
@@ -1839,16 +1809,14 @@ class TestBell:
             ClaudeMonitor.show_groups._default = False
             try:
                 async with ClaudeMonitor().run_test() as pilot:
-                    await pilot.pause()
+                    await settle(pilot)
                     s.status = "needs_approval"
                     pilot.app.refresh_sessions()
-                    await pilot.pause()
-                    await pilot.pause()
+                    await settle(pilot)
                     assert "s1" in pilot.app._bell
                     s.status = "working"
                     pilot.app.refresh_sessions()
-                    await pilot.pause()
-                    await pilot.pause()
+                    await settle(pilot)
                     assert "s1" not in pilot.app._bell
             finally:
                 ClaudeMonitor.show_groups._default = original
@@ -1880,10 +1848,10 @@ class TestRestartHardening:
         from claude_monitor import RESTART_EXIT_CODE
         with _mock_sessions(sample_sessions):
             async with ClaudeMonitor().run_test() as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 with patch.object(pilot.app, "_save_view_state"), \
                      patch("claude_monitor.subprocess.run",
                            side_effect=OSError(2, "No such file or directory")):
                     pilot.app.action_restart()  # must not raise
-                    await pilot.pause()
+                    await settle(pilot)
                 assert pilot.app.return_code == RESTART_EXIT_CODE
