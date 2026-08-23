@@ -38,14 +38,14 @@ cd claude-monitor
 
 The installer sets up everything:
 - Python environment via [uv](https://docs.astral.sh/uv/)
-- Statusline HUD symlinked into Claude Code
+- Statusline HUD symlinked into Claude Code (opt-in: `./install.sh --with-statusline`)
 - Session tracker hooks for real-time status
 - `claude-monitor` command on your PATH
 - `Ctrl+Shift+Space` global hotkey to jump back to the monitor (via skhd)
 
 **Then three steps to go:**
 
-1. **Restart Claude Code** — picks up the statusline and hooks
+1. **Restart Claude Code**: picks up the hooks (and the statusline, if you opted in)
 2. **Run `claude-monitor`** — opens the dashboard
 3. **Grant Accessibility when prompted** — first `Ctrl+Shift+Space` press
    will ask; click "Open System Settings" → enable skhd. One-time.
@@ -105,9 +105,9 @@ Plain letters, typed in sequence, are a Finder-style type-ahead: they jump the c
 
 If jump-to-terminal can't find the window (renamed tab, moved to a different space), it falls back to opening a new Ghostty window and resuming the session there, launched through Ghostty's own scripting rather than a simulated keystroke (see CLAUDE.md).
 
-### 2. The Statusline (HUD)
+### 2. The Statusline (HUD), opt-in
 
-A two-line display inside every Claude Code session:
+Off by default since 2026-08-23; install it with `./install.sh --with-statusline`. The monitor does not need it: every value it feeds (context %, cost, session name, remote URL) has an in-app fallback. A two-line display inside every Claude Code session:
 
 ```
 ctx ██████░░▒▒  58%  🧠 max    341k tok
