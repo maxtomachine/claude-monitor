@@ -350,3 +350,43 @@ class TestStandbyRendering:
                          last_tool_input={"file_path": "/tmp/x.py"})
         cells = render_row(s, ["doing"])
         assert "[dim]" in cells[0]
+
+
+class TestHotkeyLineShipsWithEveryHotkey:
+    """Max, 2026-08-24: "add ctrl L to the hotkey line; make a note that
+    hotkeys need these so they ship when we add or change one." The note
+    is this test. The footer is GENERATED from BINDINGS (a binding's
+    `show` flag is the one switch), so the footer cannot drift; and every
+    hotkey on the footer must have a row in the README's key table, so the
+    docs cannot drift either. Before this, the hand-kept footer showed
+    ^H for History (bound to Ctrl+Z) and omitted Ctrl+L, and the README
+    had no row for `n` or `Ctrl+g`."""
+
+    def _visible(self):
+        from claude_monitor import ClaudeMonitor
+        return [b for b in ClaudeMonitor.BINDINGS if getattr(b, "show", True)]
+
+    def test_footer_is_exactly_the_visible_bindings(self):
+        from claude_monitor import ClaudeMonitor, footer_items_from_bindings
+        items = footer_items_from_bindings(ClaudeMonitor.BINDINGS)
+        assert [i[1] for i in items] == [b.description for b in self._visible()]
+
+    def test_ctrl_l_is_on_the_hotkey_line(self):
+        from claude_monitor import ClaudeMonitor, footer_items_from_bindings
+        assert ("L", "Layout", "^") in footer_items_from_bindings(ClaudeMonitor.BINDINGS)
+
+    def test_footer_prefix_tells_the_truth_about_the_modifier(self):
+        from claude_monitor import ClaudeMonitor, footer_items_from_bindings
+        by_label = {i[1]: i for i in footer_items_from_bindings(ClaudeMonitor.BINDINGS)}
+        assert by_label["History"] == ("Z", "History", "^")   # was shown as ^H
+        assert by_label["Refresh"] == ("R", "Refresh", "⇧")   # Shift, not Ctrl
+        assert by_label["Next"] == ("n", "Next", "")          # plain letter
+
+    def test_every_visible_hotkey_has_a_readme_row(self):
+        from pathlib import Path
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+        rows = [ln for ln in readme.splitlines() if ln.startswith("| `")]
+        for b in self._visible():
+            key = b.key
+            cell = f"`Ctrl+{key[-1]}`" if key.startswith("ctrl+") else f"`{key}`"
+            assert any(cell in r for r in rows), f"README key table has no row for {cell} ({b.description})"

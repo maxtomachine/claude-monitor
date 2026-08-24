@@ -79,6 +79,8 @@ Plain letters, typed in sequence, are a Finder-style type-ahead: they jump the c
 | `Ctrl+a` | Toggle subagent rows — see spawned agents nested under parents |
 | `Ctrl+z` | Show archived — include closed/old sessions with option to resume |
 | `Ctrl+n` | Send `/rename` to the selected session (patches unnamed sessions) |
+| `Ctrl+g` | Toggle grouping by name prefix |
+| `n` | Move the cursor to the next session that needs you (no jump; see below) |
 | `Ctrl+p` | Pin/unpin: a pin never expires on its own |
 | `Ctrl+o` | Hide/show pinned-but-inactive sessions in the default view (doesn't touch the pin itself) |
 | `Ctrl+l` | Save layout: every window and tab, pins every Claude, so you can quit Ghostty and rebuild with `claude-monitor --restore-layout` |

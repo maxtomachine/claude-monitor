@@ -3003,35 +3003,56 @@ _SID8_RE = re.compile(r"·([0-9a-f]{8})\b")
 
 
 def _snapshot_ghostty_layout() -> list[dict] | None:
-    """AX read of every Ghostty window: frame, ordered tab titles, active
-    tab. Single-tab windows expose no tabGroups; their one "tab" is the
-    window title. Returns None (not []) when the read itself failed:
-    Ghostty not running, Accessibility denied, osascript timeout or
-    non-zero exit. The caller must not mistake that for "no windows"."""
+    """Every Ghostty window, across every Space: its tabs in order (title,
+    selected) from Ghostty's OWN scripting dictionary, and its frame from
+    CoreGraphics' window list, joined by tab title (the tabs of one
+    window are separate NSWindows sharing one frame, so any tab's title
+    finds the frame). Returns None (not []) when the read failed.
+
+    The first cut read everything through System Events AX, which lists
+    only the windows on the CURRENT Space: on 2026-08-24, with stakes,
+    it saved 4 of Max's 41 windows and reported success, twice. Ghostty's
+    dictionary sees all 41 but has no frame property; CoreGraphics sees
+    all 41 frames (kCGWindowListOptionAll, owner Ghostty, layer 0) but
+    cannot enumerate tabs. Joined, they are complete: verified 41/41
+    framed, and exact agreement with AX for the 10 AX could see. A frame
+    of [0,0,0,0] means no CG entry matched (rare: a window whose every
+    tab title is empty); the builder then leaves placement to Ghostty."""
     jxa = """(() => {
-      const se = Application("System Events");
-      let proc;
-      try { proc = se.processes.byName("Ghostty"); proc.windows(); } catch (e) { return "ERR:" + e; }
+      ObjC.import("CoreGraphics");
+      const cg = {};
+      try {
+        const arr = ObjC.castRefToObject(
+          $.CGWindowListCopyWindowInfo($.kCGWindowListOptionAll, $.kCGNullWindowID));
+        for (let i = 0; i < arr.count; i++) {
+          const d = arr.objectAtIndex(i);
+          if (ObjC.unwrap(d.objectForKey("kCGWindowOwnerName")) !== "Ghostty") continue;
+          if (ObjC.unwrap(d.objectForKey("kCGWindowLayer")) !== 0) continue;
+          const name = ObjC.unwrap(d.objectForKey("kCGWindowName")) || "";
+          if (!name) continue;
+          const b = ObjC.deepUnwrap(d.objectForKey("kCGWindowBounds"));
+          if (!cg[name]) cg[name] = [b.X, b.Y, b.Width, b.Height];
+        }
+      } catch (e) { return "ERR:cg:" + e; }
+      let g;
+      try { g = Application("Ghostty"); g.windows(); } catch (e) { return "ERR:ghostty:" + e; }
       const out = [];
-      for (const w of proc.windows()) {
+      for (const w of g.windows()) {
         let tabs = [];
-        try {
-          // value() is a boolean here (true for the selected radio), not
-          // the 1 the AX docs suggest; a strict === 1 compare matched
-          // nothing and every window saved as active tab 0 (caught on the
-          // first live save, 2026-08-23).
-          tabs = w.tabGroups[0].radioButtons().map(t => ({title: t.title(), active: !!t.value()}));
-        } catch (e) {}
-        if (!tabs.length) tabs = [{title: w.name(), active: true}];
-        let pos = [0, 0], size = [0, 0];
-        try { pos = w.position(); size = w.size(); } catch (e) {}
-        out.push({name: w.name(), frame: [pos[0], pos[1], size[0], size[1]], tabs: tabs});
+        try { tabs = w.tabs().map(t => ({title: t.name(), active: !!t.selected()})); } catch (e) {}
+        let name = "";
+        try { name = w.name(); } catch (e) {}
+        if (!tabs.length) tabs = [{title: name, active: true}];
+        let frame = [0, 0, 0, 0];
+        for (const t of tabs) { if (cg[t.title]) { frame = cg[t.title]; break; } }
+        if (frame[2] === 0 && cg[name]) frame = cg[name];
+        out.push({name: name, frame: frame, tabs: tabs});
       }
       return JSON.stringify(out);
     })()"""
     try:
         r = subprocess.run(["osascript", "-l", "JavaScript", "-e", jxa],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, timeout=20)
     except (subprocess.SubprocessError, OSError) as e:
         mlog("layout", "snapshot_failed", error=str(e))
         return None
@@ -3053,11 +3074,25 @@ def _layout_from_snapshot(raw_windows: list[dict], sessions: list[Session]) -> d
     sibling rows, and saving that key would pin and restore a string that
     matches nothing once the pids are gone (review, 2026-08-23). Pure."""
     by_sid8: dict[str, str] = {}
+    by_title: dict[str, set[str]] = {}
     for s in sessions:
         if s.is_subagent:
             continue
         sid = base_sid(s.session_id)
         by_sid8.setdefault(sid[:8], sid)
+        by_title.setdefault(s.title, set()).add(sid)
+    # Fallback for tabs with no sid8 marker: a tab in Claude Nest voice
+    # mode is titled "◐ <name>" with no marker at all, so a marker-only
+    # resolver saved the session Max was actually talking to as a plain
+    # shell (live, 2026-08-24, with real stakes: he was about to close
+    # Ghostty). Exact title match, accepted only when it names ONE
+    # conversation after base_sid() folding; an ambiguous title stays
+    # unresolved rather than guessing.
+    def resolve_by_title(title: str) -> str | None:
+        bare = re.sub(r"^[^\w]+", "", title).strip()
+        sids = by_title.get(bare, set())
+        return next(iter(sids)) if len(sids) == 1 else None
+
     windows = []
     for w in raw_windows:
         tabs = []
@@ -3076,6 +3111,8 @@ def _layout_from_snapshot(raw_windows: list[dict], sessions: list[Session]) -> d
                 m = _SID8_RE.search(title)
                 if m:
                     sid = by_sid8.get(m.group(1))
+                if sid is None:
+                    sid = resolve_by_title(title)
             tabs.append({"sid": sid, "title": title,
                          "monitor": MONITOR_TAB_MARK in title})
         windows.append({"frame": w.get("frame", [0, 0, 0, 0]), "active": active or 0, "tabs": tabs})
@@ -3123,6 +3160,8 @@ def save_layout(sessions: list[Session] | None = None) -> dict:
     sids = {t["sid"] for w in layout["windows"] for t in w["tabs"] if t["sid"]}
     save_pinned_sessions(pinned_now | sids)
     try:
+        if previous:
+            LAYOUT_PATH.with_suffix(".json.bak").write_text(json.dumps(previous, indent=2))
         LAYOUT_PATH.write_text(json.dumps(layout, indent=2))
     except OSError as e:
         mlog("layout", "save_write_failed", error=str(e))
@@ -3131,6 +3170,7 @@ def save_layout(sessions: list[Session] | None = None) -> dict:
             "unresolved_tabs": 0}}
     layout["ok"] = True
     layout["summary"] = {
+        "previous_windows": len(previous["windows"]) if previous else None,
         "windows": len(layout["windows"]),
         "claudes": len(sids),
         "newly_pinned": len(sids - pinned_now),
@@ -3266,7 +3306,7 @@ def _ghostty_build_window(window: dict) -> str:
         g.newTab(Object.assign({{in: win}}, mk(cmd)));
       }}
       delay(0.3);
-      let framed = false;
+      let framed = !({w} > 0 && {h} > 0);  // no saved frame: nothing to apply
       const stamp = {json.dumps(stamp)};
       if (stamp && {w} > 0 && {h} > 0) {{
         // Find the window by ANY tab carrying the stamp (the active tab
@@ -4233,6 +4273,30 @@ class StatuslineConfig(ModalScreen[dict[str, bool] | None]):
 # ── Main App ──────────────────────────────────────────────────────────────────
 
 
+def footer_items_from_bindings(bindings) -> list[tuple[str, str, str]]:
+    """The hotkey line, derived from BINDINGS: every binding with
+    show=True, in declaration order, as (letter, label, prefix). "^" for
+    Ctrl+letter, "⇧" for a Shift-letter binding ("R"), "" for a plain
+    letter ("n"). Derived rather than hand-listed so a new or changed
+    hotkey cannot ship without its footer entry (Max, 2026-08-24: "make a
+    note that hotkeys need these so they ship when we add or change
+    one"); the hand-kept list had drifted twice (History showed ^H while
+    bound to Ctrl+Z; Ctrl+L was missing). A binding's `show` flag is the
+    one switch: flip it and the footer follows."""
+    items = []
+    for b in bindings:
+        if not getattr(b, "show", True):
+            continue
+        key, label = b.key, b.description or b.action
+        if key.startswith("ctrl+") and len(key) == 6:
+            items.append((key[-1].upper(), label, "^"))
+        elif len(key) == 1 and key.isalpha():
+            items.append((key, label, "⇧" if key.isupper() else ""))
+        else:
+            items.append((key, label, ""))
+    return items
+
+
 class DosFooter(Static):
     """DOS-style hotkey bar: the key letter is highlighted within the word."""
 
@@ -4423,7 +4487,7 @@ class ClaudeMonitor(App):
         Binding("ctrl+p", "toggle_pin", "Pin", show=False),
         Binding("ctrl+o", "toggle_hide_inactive_pins", "Pins", show=False),
         Binding("ctrl+b", "toggle_inbox_mode", "Inbox", show=False),
-        Binding("ctrl+l", "save_layout", "Layout", show=False),
+        Binding("ctrl+l", "save_layout", "Layout"),
         Binding("backspace", "hide_selected", "Hide", show=False),
         Binding("delete", "hide_selected", "Hide", show=False),
         Binding("shift+up", "extend_selection(-1)", "Select↑", show=False, priority=True),
@@ -4500,11 +4564,7 @@ class ClaudeMonitor(App):
             "",
             id="detail-panel"
         )
-        yield DosFooter([
-            ("Q", "Quit"), ("R", "Refresh", "⇧"), ("S", "Sort"), ("A", "Agents"),
-            ("H", "History"), ("C", "Columns"), ("N", "Name"),
-            ("G", "Group"), ("n", "Next", ""),
-        ])
+        yield DosFooter(footer_items_from_bindings(self.BINDINGS))
 
     def on_mount(self) -> None:
         t0 = time.perf_counter()
@@ -6460,7 +6520,8 @@ def main():
                   f"Previous snapshot at {LAYOUT_PATH} left untouched.")
             sys.exit(1)
         r = result["summary"]
-        print(f"Saved {r['windows']} window(s), {r['claudes']} Claude(s) "
+        prev = f" (previous snapshot had {r['previous_windows']})" if r.get("previous_windows") is not None else ""
+        print(f"Saved {r['windows']} window(s){prev}, {r['claudes']} Claude(s) "
               f"({r['newly_pinned']} newly pinned) to {LAYOUT_PATH}")
         if r["unresolved_tabs"]:
             print(f"  {r['unresolved_tabs']} tab(s) had no Claude marker; kept as plain shells")
