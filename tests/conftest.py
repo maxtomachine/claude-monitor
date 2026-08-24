@@ -16,7 +16,7 @@ import claude_monitor as _cm
 _REAL_STATE_PATHS = frozenset(
     p.resolve() for p in (
         _cm.PREFS_PATH, _cm.HIDDEN_PATH, _cm.PINNED_PATH,
-        _cm.SCAN_CACHE_PATH, _cm.JUMP_REQUEST_PATH,
+        _cm.SCAN_CACHE_PATH, _cm.JUMP_REQUEST_PATH, _cm.LAYOUT_PATH,
     )
 )
 
@@ -83,6 +83,7 @@ def _isolate_monitor_state_files(tmp_path, monkeypatch):
     monkeypatch.setattr(cm, "PINNED_PATH", tmp_path / "monitor-pinned.json")
     monkeypatch.setattr(cm, "SCAN_CACHE_PATH", tmp_path / "monitor-scan-cache.json")
     monkeypatch.setattr(cm, "JUMP_REQUEST_PATH", tmp_path / "jump-request")
+    monkeypatch.setattr(cm, "LAYOUT_PATH", tmp_path / "monitor-layout.json")
 
 
 @pytest.fixture
