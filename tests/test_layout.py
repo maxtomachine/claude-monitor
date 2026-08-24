@@ -362,3 +362,136 @@ class TestSnapshotCompleteness:
         import json
         bak = json.loads((tmp_path / "layout.json.bak").read_text())
         assert len(bak["windows"]) == 10
+
+
+class TestCompactRestore:
+    """2026-08-24: a literal rebuild of a 41-window layout put all 41 on
+    one Space (macOS cannot place a window elsewhere) with 44 Claude TUIs
+    at once. Unusable, and Ghostty went down minutes later taking every
+    session with it. Restore now folds one-tab windows into a few grouped,
+    tabbed windows by default; --exact keeps the literal rebuild."""
+
+    def _single(self, sid, title):
+        return {"frame": [0, 0, 100, 100], "active": 0,
+                "tabs": [{"sid": sid, "monitor": False, "title": title}]}
+
+    def _sessions(self, tmp_path, *titles):
+        t = tmp_path / "x.jsonl"; t.write_text("{}")
+        return [make_session(session_id=f"sid-{i}", title=n, transcript_path=str(t))
+                for i, n in enumerate(titles)]
+
+    def test_single_tab_windows_fold_into_grouped_windows(self, tmp_path):
+        names = [f"frontier-{i}" for i in range(5)] + [f"strategy-{i}" for i in range(3)]
+        sessions = self._sessions(tmp_path, *names)
+        layout = {"windows": [self._single(s.session_id, s.title) for s in sessions]}
+        plan, _, _ = _restore_plan(layout, sessions, compact=True)
+        assert len(plan) == 2, [w.get("group") for w in plan]
+        assert {w["group"] for w in plan} == {"frontier", "strategy"}
+        assert sum(len(w["tabs"]) for w in plan) == 8
+
+    def test_exact_mode_keeps_one_window_per_saved_window(self, tmp_path):
+        sessions = self._sessions(tmp_path, "a-1", "a-2", "a-3")
+        layout = {"windows": [self._single(s.session_id, s.title) for s in sessions]}
+        plan, _, _ = _restore_plan(layout, sessions, compact=False)
+        assert len(plan) == 3
+        assert all(w["frame"] == [0, 0, 100, 100] for w in plan)
+
+    def test_multi_tab_windows_are_kept_exactly_with_their_frame(self, tmp_path):
+        sessions = self._sessions(tmp_path, "a-1", "a-2", "solo-9")
+        layout = {"windows": [
+            {"frame": [7, 8, 9, 10], "active": 1,
+             "tabs": [{"sid": "sid-0", "monitor": False}, {"sid": "sid-1", "monitor": False}]},
+            self._single("sid-2", "solo-9"),
+        ]}
+        plan, _, _ = _restore_plan(layout, sessions, compact=True)
+        kept = [w for w in plan if w["frame"] == [7, 8, 9, 10]]
+        assert len(kept) == 1 and len(kept[0]["tabs"]) == 2 and kept[0]["active"] == 1
+
+    def test_groups_of_one_pool_into_misc_instead_of_a_window_each(self, tmp_path):
+        sessions = self._sessions(tmp_path, "alpha-x", "beta-y", "gamma-z")
+        layout = {"windows": [self._single(s.session_id, s.title) for s in sessions]}
+        plan, _, _ = _restore_plan(layout, sessions, compact=True)
+        assert len(plan) == 1 and plan[0]["group"] == "misc"
+        assert len(plan[0]["tabs"]) == 3
+
+    def test_a_group_larger_than_the_cap_splits_into_several_windows(self, tmp_path):
+        names = [f"frontier-{i}" for i in range(19)]
+        sessions = self._sessions(tmp_path, *names)
+        layout = {"windows": [self._single(s.session_id, s.title) for s in sessions]}
+        plan, _, _ = _restore_plan(layout, sessions, compact=True)
+        assert len(plan) == 3                      # 8 + 8 + 3
+        assert max(len(w["tabs"]) for w in plan) == 8
+
+    def test_every_window_gets_its_own_stamp_after_compaction(self, tmp_path):
+        names = [f"frontier-{i}" for i in range(3)] + [f"strategy-{i}" for i in range(3)]
+        sessions = self._sessions(tmp_path, *names)
+        layout = {"windows": [self._single(s.session_id, s.title) for s in sessions]}
+        plan, _, _ = _restore_plan(layout, sessions, compact=True)
+        stamps = [w["stamp"] for w in plan]
+        assert len(set(stamps)) == len(plan)
+        for w in plan:
+            assert w["stamp"] in w["tabs"][0]["cmd"]
+
+    def test_the_same_session_saved_twice_gets_one_tab(self, tmp_path):
+        """A layout can hold one sid in two windows (same session open in
+        two terminals). Resuming it twice just makes Claude's
+        single-instance guard kill one."""
+        sessions = self._sessions(tmp_path, "dup")
+        sid = sessions[0].session_id
+        layout = {"windows": [self._single(sid, "dup"), self._single(sid, "dup")]}
+        plan, _, _ = _restore_plan(layout, sessions, compact=True)
+        assert sum(len(w["tabs"]) for w in plan) == 1
+
+
+class TestJumpbackNeverSilentlyNoOps:
+    """2026-08-24: during the 41-window restore, Ctrl+Shift+Space did
+    nothing at all (jumpback logged err:proc_live_no_tab five times).
+    Its walk came back empty because Ghostty was too busy to answer, and
+    the anti-duplicate guard read that as "monitor is absent but a process
+    is alive, so refuse" precisely when Max most needed the key. The walk
+    now reports how many windows it examined, so a mute Ghostty is told
+    apart from real absence."""
+
+    def _run(self, walk_output, ghostty_running=True, monitor_ttys=()):
+        import subprocess, textwrap
+        script = textwrap.dedent(f'''
+            walk() {{ echo "{walk_output}"; }}
+            pgrep() {{ case "$*" in *ghostty*) return {0 if ghostty_running else 1};; esac; return 1; }}
+            result=""
+            for attempt in 1 2 3; do
+                result="$(walk)"
+                case "$result" in
+                    ok:*) break ;;
+                    none:0:*) pgrep -qx ghostty || break ;;
+                    err:*|"") : ;;
+                    *) break ;;
+                esac
+            done
+            case "$result" in
+                none:0:*)
+                    if pgrep -qx ghostty; then result="err:ghostty_mute"; else result="not_found"; fi
+                    ;;
+                none:*) result="not_found${{result#none}}" ;;
+            esac
+            case "$result" in not_found*) result="LAUNCH" ;; esac
+            echo "$result"
+        ''')
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True).stdout.strip()
+
+    def test_found_tab_raises_it(self):
+        assert self._run("ok:tab") == "ok:tab"
+
+    def test_mute_ghostty_is_never_read_as_absence(self):
+        """The exact failure: Ghostty up but answering with zero windows."""
+        assert self._run("none:0:0", ghostty_running=True) == "err:ghostty_mute"
+
+    def test_ghostty_actually_gone_launches_a_monitor(self):
+        assert self._run("none:0:0", ghostty_running=False) == "LAUNCH"
+
+    def test_reliable_absence_launches_a_monitor(self):
+        """Walk examined real windows and found no monitor tab: launch,
+        rather than refusing because some process is alive."""
+        assert self._run("none:12:37") == "LAUNCH"
+
+    def test_walk_error_is_retried_not_treated_as_absence(self):
+        assert self._run("err:walk:boom").startswith("err:")

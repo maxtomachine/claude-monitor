@@ -3194,7 +3194,8 @@ LAYOUT_STAMP_PREFIX = "·layout-"
 def _restore_plan(layout: dict, sessions: list[Session],
                   live_sids: set[str] | None = None,
                   visible_sid8s: set[str] | None = None,
-                  monitor_running: bool = False) -> tuple[list[dict], list[str], list[str]]:
+                  monitor_running: bool = False,
+                  compact: bool = True) -> tuple[list[dict], list[str], list[str]]:
     """Turn a saved layout into concrete launch steps. Pure. Returns
     (windows_to_build, missing_sids, skipped_live_sids).
 
@@ -3213,6 +3214,10 @@ def _restore_plan(layout: dict, sessions: list[Session],
     live_sids = {base_sid(x) for x in (live_sids or set())}
     visible_sid8s = visible_sid8s or set()
     plan, missing, skipped_live = [], [], []
+    # One conversation, one tab: a layout can hold the same sid twice (the
+    # same session open in two terminals at save time). Resuming it twice
+    # just makes Claude's single-instance guard kill one of them.
+    planned_sids: set[str] = set()
     for w in layout.get("windows", []):
         tabs = []
         active_label = None
@@ -3236,7 +3241,10 @@ def _restore_plan(layout: dict, sessions: list[Session],
                         missing.append(sid)
                     elif sid in live_sids or sid[:8] in visible_sid8s:
                         skipped_live.append(sid)
+                    elif sid in planned_sids:
+                        pass  # already given a tab in this plan
                     else:
+                        planned_sids.add(sid)
                         cmd, cwd = _resume_command_for(sess)
                         entry = {"cmd": _ghostty_surface_command(cwd, cmd), "label": sess.title}
             if entry is not None:
@@ -3251,12 +3259,59 @@ def _restore_plan(layout: dict, sessions: list[Session],
             # prompt overwrites it moments later, which is fine; the frame
             # is applied before that. "stamp" is kept on the window so the
             # builder and a test can read it back.
-            stamp = f"{LAYOUT_STAMP_PREFIX}{len(plan) + 1}-{int(time.time() * 1000) % 100000}"
-            first = tabs[0]
-            first["cmd"] = _restamp_surface_command(first["cmd"], stamp)
             plan.append({"frame": w.get("frame", [0, 0, 0, 0]), "active": active_label,
-                         "tabs": tabs, "stamp": stamp})
+                         "tabs": tabs})
+    if compact:
+        plan = _compact_plan(plan)
+    _stamp_plan(plan)
     return plan, missing, skipped_live
+
+
+LAYOUT_TABS_PER_WINDOW = 8
+
+
+def _compact_plan(plan: list[dict], per_window: int = LAYOUT_TABS_PER_WINDOW) -> list[dict]:
+    """Fold one-tab windows into a few grouped, tabbed windows.
+
+    macOS cannot place a window on a Space other than the current one, so
+    a literal rebuild of a layout spread over several Spaces lands every
+    window on ONE Space. On 2026-08-24 that meant 41 overlapping windows
+    and 44 Claude TUIs at once: unusable, and Ghostty went down minutes
+    later taking every session with it. Since the monitor's own jump
+    handles background tabs, tabs cost nothing to reach and stack cleanly.
+
+    Windows that already held two or more tabs were grouped on purpose and
+    are kept exactly, frame and all. Single-tab windows are regrouped by
+    session-name prefix (the same _group_key the table groups by) into
+    windows of at most `per_window` tabs, positioned by Ghostty."""
+    kept = [w for w in plan if len(w["tabs"]) > 1]
+    singles = [w for w in plan if len(w["tabs"]) == 1]
+    groups: dict[str, list[dict]] = {}
+    for w in singles:
+        groups.setdefault(_group_key(w["tabs"][0]["label"]), []).append(w)
+    # A group of one is not a group: those would each still take a whole
+    # window, which is the problem we are solving. Pool them.
+    loners = [w for k, wins in groups.items() if len(wins) < 2 for w in wins]
+    real = {k: v for k, v in groups.items() if len(v) > 1}
+    if loners:
+        real["misc"] = loners
+    folded = []
+    for key in sorted(real):
+        wins = real[key]
+        for i in range(0, len(wins), per_window):
+            chunk = wins[i:i + per_window]
+            folded.append({"frame": [0, 0, 0, 0], "active": 0,
+                           "tabs": [w["tabs"][0] for w in chunk], "group": key})
+    return kept + folded
+
+
+def _stamp_plan(plan: list[dict]) -> None:
+    """Give each window's first tab a unique OSC title stamp so the builder
+    can find that window in the AX tree to frame it."""
+    for i, w in enumerate(plan):
+        stamp = f"{LAYOUT_STAMP_PREFIX}{i + 1}-{int(time.time() * 1000) % 100000}"
+        w["tabs"][0]["cmd"] = _restamp_surface_command(w["tabs"][0]["cmd"], stamp)
+        w["stamp"] = stamp
 
 
 def _restamp_surface_command(cmd: str, stamp: str) -> str:
@@ -3356,7 +3411,8 @@ def _ghostty_build_window(window: dict) -> str:
         return "failed"
 
 
-def restore_layout(restore_pins: bool = False) -> dict:
+def restore_layout(restore_pins: bool = False, compact: bool = True,
+                   dry_run: bool = False) -> dict:
     """Rebuild the saved layout. Windows are created in saved order. Live
     or already-visible sessions are skipped (never duplicated) and
     reported. `restore_pins` puts the pin list back to what it was before
@@ -3371,7 +3427,14 @@ def restore_layout(restore_pins: bool = False) -> dict:
     visible = _snapshot_window_sids()
     monitor_running = _a_monitor_is_running()
     plan, missing, skipped_live = _restore_plan(
-        layout, sessions, live_sids=live, visible_sid8s=visible, monitor_running=monitor_running)
+        layout, sessions, live_sids=live, visible_sid8s=visible,
+        monitor_running=monitor_running, compact=compact)
+    if dry_run:
+        return {"ok": True, "dry_run": True, "windows_planned": len(plan),
+                "tabs_planned": sum(len(w["tabs"]) for w in plan),
+                "plan": [{"group": w.get("group", ""), "frame": w["frame"],
+                          "tabs": [t["label"] for t in w["tabs"]]} for w in plan],
+                "missing": missing, "skipped_live": skipped_live}
     built = unframed = 0
     for window in plan:
         outcome = _ghostty_build_window(window)
@@ -6527,7 +6590,19 @@ def main():
             print(f"  {r['unresolved_tabs']} tab(s) had no Claude marker; kept as plain shells")
         sys.exit(0)
     elif len(sys.argv) > 1 and sys.argv[1] == "--restore-layout":
-        r = restore_layout(restore_pins="--restore-pins" in sys.argv)
+        r = restore_layout(restore_pins="--restore-pins" in sys.argv,
+                           compact="--exact" not in sys.argv,
+                           dry_run="--dry-run" in sys.argv)
+        if r.get("dry_run"):
+            print(f"Would open {r['windows_planned']} window(s), "
+                  f"{r['tabs_planned']} tab(s):")
+            for w in r["plan"]:
+                where = "placed" if w["frame"][2] else "auto"
+                head = f"[{w['group']}]" if w["group"] else "[kept]"
+                print(f"  {head:14} {where:6} {', '.join(w['tabs'])}")
+            if r["skipped_live"]:
+                print(f"  ({len(r['skipped_live'])} already running, skipped)")
+            sys.exit(0)
         if not r["ok"] and "reason" in r:
             print(r["reason"])
             sys.exit(1)
