@@ -296,3 +296,69 @@ class TestWindowStamp:
     def test_restamp_of_an_empty_placeholder_yields_a_shell(self):
         cmd = cm._restamp_surface_command("", "·layout-9-1")
         assert "·layout-9-1" in cmd and "exec zsh" in cmd
+
+
+class TestTitleFallback:
+    """Live, 2026-08-24, with stakes: a tab in Claude Nest voice mode is
+    titled "◐ <name>" with no sid8 marker, so the session Max was
+    actually talking to saved as a plain shell and would not have come
+    back. Exact title match resolves it, only when the title names one
+    conversation."""
+
+    def test_markerless_tab_resolves_by_unique_title(self):
+        s = make_session(session_id="7a5651f1-0000", title="tools-monitor")
+        raw = [_win((0, 0, 0, 0), ("◐ tools-monitor", True))]
+        assert _layout_from_snapshot(raw, [s])["windows"][0]["tabs"][0]["sid"] == "7a5651f1-0000"
+
+    def test_sibling_rows_of_one_conversation_count_as_one(self):
+        a1 = make_session(session_id="4b72a283-0000@111", title="prep-IHG")
+        a2 = make_session(session_id="4b72a283-0000@222", title="prep-IHG")
+        raw = [_win((0, 0, 0, 0), ("✳ prep-IHG", True))]
+        assert _layout_from_snapshot(raw, [a1, a2])["windows"][0]["tabs"][0]["sid"] == "4b72a283-0000"
+
+    def test_ambiguous_title_stays_unresolved(self):
+        a = make_session(session_id="aaaaaaaa-0000", title="general")
+        b = make_session(session_id="bbbbbbbb-0000", title="general")
+        raw = [_win((0, 0, 0, 0), ("✳ general", True))]
+        assert _layout_from_snapshot(raw, [a, b])["windows"][0]["tabs"][0]["sid"] is None
+
+    def test_marker_wins_over_title(self):
+        """A marker is authoritative; the title of a renamed tab may lag."""
+        real = make_session(session_id="aaaaaaaa-0000", title="old-name")
+        decoy = make_session(session_id="bbbbbbbb-0000", title="new-name")
+        raw = [_win((0, 0, 0, 0), ("✳ new-name ·aaaaaaaa", True))]
+        assert _layout_from_snapshot(raw, [real, decoy])["windows"][0]["tabs"][0]["sid"] == "aaaaaaaa-0000"
+
+
+class TestSnapshotCompleteness:
+    """2026-08-24, with stakes: the AX-only snapshot saw the current Space
+    only and saved 4 of 41 windows, reporting success. The snapshot now
+    comes from Ghostty's own dictionary (every window, every Space) joined
+    to CoreGraphics frames; the pure layer must handle a window with no
+    frame, and a save must keep the previous snapshot as .bak and report
+    the window-count delta so a shrunken save is visible."""
+
+    def test_window_without_frame_is_kept_and_not_framed(self):
+        a = make_session(session_id="aaaaaaaa-0000", title="a")
+        raw = [{"name": "✳ a ·aaaaaaaa", "frame": [0, 0, 0, 0],
+                "tabs": [{"title": "✳ a ·aaaaaaaa", "active": True}]}]
+        layout = _layout_from_snapshot(raw, [a])
+        assert layout["windows"][0]["frame"] == [0, 0, 0, 0]
+        assert layout["windows"][0]["tabs"][0]["sid"] == "aaaaaaaa-0000"
+
+    def test_save_keeps_previous_snapshot_as_bak_and_reports_delta(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cm, "PINNED_PATH", tmp_path / "pinned.json")
+        monkeypatch.setattr(cm, "LAYOUT_PATH", tmp_path / "layout.json")
+        a = make_session(session_id="aaaaaaaa-0000", title="a")
+        ten = [_win((0, 0, 1, 1), ("✳ a ·aaaaaaaa", True))] * 10
+        four = [_win((0, 0, 1, 1), ("✳ a ·aaaaaaaa", True))] * 4
+        with patch("claude_monitor._snapshot_ghostty_layout", return_value=ten):
+            first = save_layout(sessions=[a])
+        assert first["summary"]["previous_windows"] is None
+        with patch("claude_monitor._snapshot_ghostty_layout", return_value=four):
+            second = save_layout(sessions=[a])
+        assert second["summary"]["previous_windows"] == 10
+        assert second["summary"]["windows"] == 4
+        import json
+        bak = json.loads((tmp_path / "layout.json.bak").read_text())
+        assert len(bak["windows"]) == 10
