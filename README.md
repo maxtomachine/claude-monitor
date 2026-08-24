@@ -83,7 +83,7 @@ Plain letters, typed in sequence, are a Finder-style type-ahead: they jump the c
 | `n` | Move the cursor to the next session that needs you (no jump; see below) |
 | `Ctrl+p` | Pin/unpin: a pin never expires on its own |
 | `Ctrl+o` | Hide/show pinned-but-inactive sessions in the default view (doesn't touch the pin itself) |
-| `Ctrl+l` | Save layout: every window and tab, pins every Claude, so you can quit Ghostty and rebuild with `claude-monitor --restore-layout` |
+| `Ctrl+l` | Save layout: every window and tab, pins every Claude, so you can quit Ghostty and rebuild with `claude-monitor --restore-layout` (add `--dry-run` to preview, `--exact` to rebuild window-per-window instead of compacting into tabs) |
 | `Ctrl+b` | Inbox mode: hide everything that is working (or a standby desk) so only sessions that need you remain; an INBOX chip shows while it's on |
 | `P` | Broadcast `/proactive` to all sessions in the cursor's group |
 | `double-click` | Jump straight to the session's terminal (single-click highlights) |

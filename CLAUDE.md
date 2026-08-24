@@ -274,6 +274,30 @@ scheme that failed on the real Ghostty before the next:
   a minimum). `_ghostty_build_window` returns `ok`, `ok_unframed`, or
   `failed`, and `restore_layout` reports unframed windows, never swallows.
 
+**Restore is compact by default, and that is not cosmetic.** macOS cannot
+place a window on a Space other than the current one, so a literal rebuild
+of a layout spread across Spaces lands every window on ONE Space. On
+2026-08-24 that ran for real: 41 windows and 44 Claude TUIs opened on top
+of each other, Ctrl+Shift+Space stopped responding, and minutes later
+Ghostty went down and took every session with it. `_compact_plan()` now
+keeps multi-tab windows exactly as saved (they were grouped on purpose)
+and folds single-tab windows by `_group_key` into windows of at most
+`LAYOUT_TABS_PER_WINDOW` tabs, pooling one-member groups into "misc": 41
+windows became 8. Background tabs cost nothing to reach, since jump
+handles them. `--exact` restores the literal window-per-window rebuild;
+`--dry-run` prints the plan and opens nothing. One sid is planned once
+even if the layout saved it twice, because a double resume just makes
+Claude's single-instance guard kill one.
+
+**jumpback must never silently do nothing.** Its walk returns
+`none:<windows>:<tabs>`, so "examined real windows and found no ·MONITOR"
+(absence: launch one) is distinguishable from "examined zero windows while
+Ghostty is running" (Ghostty too busy to answer: retry, never absence).
+The old guard refused to launch whenever any monitor process was alive,
+which during the 2026-08-24 restore turned every keypress into a no-op
+(`err:proc_live_no_tab`, five times). A monitor process with no
+controlling terminal is now retired before launching a replacement.
+
 Sessions whose transcript is gone are reported as `missing`, never
 silently dropped; a window with no surviving tabs is not built. Sessions
 already alive, or whose sid8 is already visible in a terminal title, are

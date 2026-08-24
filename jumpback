@@ -24,10 +24,13 @@ osascript -l JavaScript -e '(() => {
     // be a background tab; window.name() only shows the FRONT tab title.
     // Any throw during the walk = incomplete result: report it, do not
     // conclude the monitor is absent.
+    let seenWindows = 0, seenTabs = 0;
     try {
         const ghostty = Application("Ghostty");
         for (const w of ghostty.windows()) {
+            seenWindows++;
             for (const tab of w.tabs()) {
+                seenTabs++;
                 if ((tab.name() || "").includes("·MONITOR")) {
                     tab.selectTab();
                     ghostty.activateWindow(w);
@@ -79,27 +82,57 @@ osascript -l JavaScript -e '(() => {
         } catch(e) {}
     }
 
-    return "not_found";
+    return "none:" + seenWindows + ":" + seenTabs;
 })()' 2>/dev/null
 }
 
+# A walk that examined ZERO Ghostty windows while Ghostty is running told
+# us nothing: Ghostty was too busy to answer (2026-08-24: a 41-window
+# layout restore saturated its scripting, every walk came back empty, and
+# the guard below turned that into a silent no-op precisely when Max most
+# needed the key). Retry those; only a walk that actually examined windows
+# can prove absence.
 result=""
 for attempt in 1 2 3; do
     result="$(walk)"
     case "$result" in
         ok:*) break ;;
+        none:0:*)
+            pgrep -qx ghostty || break          # Ghostty really is gone: absence is real
+            [ "$attempt" -lt 3 ] && sleep 0.4   # Ghostty is up but mute: ask again
+            ;;
         err:*|"") [ "$attempt" -lt 3 ] && sleep 0.2 ;;
         *) break ;;
     esac
 done
 
-# Absence must also be proven at the process layer: a live monitor process
-# means the walk missed a real tab, so never spawn a duplicate.
-if [ "$result" = "not_found" ] && pgrep -qf 'claude_monitor\.py'; then
-    result="err:proc_live_no_tab"
-fi
+# An unreachable monitor process is not a reason to do nothing. When the
+# walk RELIABLY found no ·MONITOR tab (it examined at least one window)
+# but a monitor process is alive, that process is headless: its terminal
+# is gone, so it can never be raised. Retire it and launch a fresh one,
+# rather than refusing forever. Only a process with no controlling
+# terminal is killed; one still attached to a tty we simply could not
+# walk is left alone and joined by a new window.
+case "$result" in
+    none:0:*)
+        # Zero windows examined: absence only if Ghostty is really gone.
+        # Ghostty up but answering with nothing means it was too busy to
+        # look, which must never read as absence.
+        if pgrep -qx ghostty; then result="err:ghostty_mute"; else result="not_found"; fi
+        ;;
+    none:*)
+        for pid in $(pgrep -f 'claude_monitor\.py'); do
+            tty=$(ps -o tty= -p "$pid" | tr -d ' ')
+            if [ "$tty" = "??" ] || [ -z "$tty" ]; then
+                kill "$pid" 2>/dev/null
+                result="${result}:retired_orphan_$pid"
+            fi
+        done
+        result="not_found${result#none}"
+        ;;
+esac
 
-if [ "$result" = "not_found" ]; then
+case "$result" in not_found*) 
     result="$(osascript -l JavaScript -e '(() => {
         try {
             const ghostty = Application("Ghostty");
@@ -110,7 +143,7 @@ if [ "$result" = "not_found" ]; then
             return "launched";
         } catch(e) { return "err:launch:" + e.message; }
     })()' 2>/dev/null)"
-fi
+;; esac
 
 printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${result:-empty}" >> "$LOG" 2>/dev/null
 echo "$result"
