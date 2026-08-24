@@ -111,6 +111,7 @@ _STATE_HOME.mkdir(parents=True, exist_ok=True)
 PREFS_PATH = _STATE_HOME / "monitor-prefs.json"
 HIDDEN_PATH = _STATE_HOME / "monitor-hidden.json"
 PINNED_PATH = _STATE_HOME / "monitor-pinned.json"
+LAYOUT_PATH = _STATE_HOME / "monitor-layout.json"
 SCAN_CACHE_PATH = _STATE_HOME / "monitor-scan-cache.json"
 BELL_DECAY_S = 300
 
@@ -2978,6 +2979,375 @@ def _raise_monitor_window() -> None:
         pass
 
 
+# ── Layout save/restore ────────────────────────────────────────────────────────
+# Max, 2026-08-23: "a command that saves which claudes are pinned, saves which
+# claudes are in which windows and tabs, then pins all the claudes and
+# restarts everything so that I can close and reopen ghostty and then
+# regenerate where I left off."
+#
+# Snapshot shape (monitor-layout.json):
+#   {"saved_at": float, "pinned_before": [sid...],
+#    "windows": [{"frame": [x, y, w, h], "active": int,
+#                 "tabs": [{"sid": "<full sid>" | null, "title": str}, ...]}]}
+# A null sid is a tab with no Claude in it (a plain shell, or the monitor
+# itself, see MONITOR_TAB_MARK); it is kept so tab ORDER survives.
+#
+# Reading is one System Events AX walk (the same one jump uses), so what it
+# sees is exactly what jump can find. Writing uses Ghostty's own scripting
+# dictionary (`new window`, `new tab in`, `select tab`) and AX position/size
+# sets: no synthetic keystrokes anywhere, which matters because any injected
+# key fires Claude Nest's push-to-talk (see resume_session).
+
+MONITOR_TAB_MARK = "·MONITOR"  # the monitor's own tab title carries this
+_SID8_RE = re.compile(r"·([0-9a-f]{8})\b")
+
+
+def _snapshot_ghostty_layout() -> list[dict] | None:
+    """AX read of every Ghostty window: frame, ordered tab titles, active
+    tab. Single-tab windows expose no tabGroups; their one "tab" is the
+    window title. Returns None (not []) when the read itself failed:
+    Ghostty not running, Accessibility denied, osascript timeout or
+    non-zero exit. The caller must not mistake that for "no windows"."""
+    jxa = """(() => {
+      const se = Application("System Events");
+      let proc;
+      try { proc = se.processes.byName("Ghostty"); proc.windows(); } catch (e) { return "ERR:" + e; }
+      const out = [];
+      for (const w of proc.windows()) {
+        let tabs = [];
+        try {
+          // value() is a boolean here (true for the selected radio), not
+          // the 1 the AX docs suggest; a strict === 1 compare matched
+          // nothing and every window saved as active tab 0 (caught on the
+          // first live save, 2026-08-23).
+          tabs = w.tabGroups[0].radioButtons().map(t => ({title: t.title(), active: !!t.value()}));
+        } catch (e) {}
+        if (!tabs.length) tabs = [{title: w.name(), active: true}];
+        let pos = [0, 0], size = [0, 0];
+        try { pos = w.position(); size = w.size(); } catch (e) {}
+        out.push({name: w.name(), frame: [pos[0], pos[1], size[0], size[1]], tabs: tabs});
+      }
+      return JSON.stringify(out);
+    })()"""
+    try:
+        r = subprocess.run(["osascript", "-l", "JavaScript", "-e", jxa],
+                           capture_output=True, text=True, timeout=10)
+    except (subprocess.SubprocessError, OSError) as e:
+        mlog("layout", "snapshot_failed", error=str(e))
+        return None
+    out = r.stdout.strip()
+    if r.returncode != 0 or out.startswith("ERR:") or not out:
+        mlog("layout", "snapshot_failed", rc=r.returncode, out=out[:120], err=r.stderr[:120])
+        return None
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        mlog("layout", "snapshot_failed", out=out[:120])
+        return None
+
+
+def _layout_from_snapshot(raw_windows: list[dict], sessions: list[Session]) -> dict:
+    """Resolve AX tab titles to full sids. The title carries only sid8; the
+    session list maps it back to the full id. Keys are normalised through
+    base_sid(): a conversation open in two pids is listed as 'uuid@pid'
+    sibling rows, and saving that key would pin and restore a string that
+    matches nothing once the pids are gone (review, 2026-08-23). Pure."""
+    by_sid8: dict[str, str] = {}
+    for s in sessions:
+        if s.is_subagent:
+            continue
+        sid = base_sid(s.session_id)
+        by_sid8.setdefault(sid[:8], sid)
+    windows = []
+    for w in raw_windows:
+        tabs = []
+        active = None
+        win_name = w.get("name", "") or ""
+        for i, t in enumerate(w.get("tabs", [])):
+            title = t.get("title", "") or ""
+            if t.get("active"):
+                active = i
+            # Belt and braces: the window's own title always names the
+            # selected tab, so use it if the radio value was unreadable.
+            if active is None and win_name and title == win_name:
+                active = i
+            sid = None
+            if MONITOR_TAB_MARK not in title:
+                m = _SID8_RE.search(title)
+                if m:
+                    sid = by_sid8.get(m.group(1))
+            tabs.append({"sid": sid, "title": title,
+                         "monitor": MONITOR_TAB_MARK in title})
+        windows.append({"frame": w.get("frame", [0, 0, 0, 0]), "active": active or 0, "tabs": tabs})
+    return {"saved_at": time.time(), "windows": windows}
+
+
+def save_layout(sessions: list[Session] | None = None) -> dict:
+    """Snapshot the Ghostty layout, pin every live Claude in it (so none
+    ages out of the monitor while Ghostty is closed), and persist both.
+
+    `sessions`: pass the running app's own list from the Ctrl+L path. The
+    first cut called parse_sessions() here on a worker thread, racing the
+    refresh worker's parse_sessions() on the unlocked module _scan_cache;
+    _save_scan_cache_to_disk() iterates that dict uncopied, so the race
+    raised "dictionary changed size during iteration" and, with
+    run_worker's exit_on_error default, took the whole monitor down
+    (review, 2026-08-23). Only the CLI path, where no refresh worker
+    exists, parses cold.
+
+    Refuses to overwrite the last good snapshot when the AX read failed or
+    saw no windows: an Accessibility-denied shell or a save after Ghostty
+    already quit used to write `windows: []` and exit 0, destroying the
+    snapshot the user was about to restore from (review, 2026-08-23).
+
+    `pinned_before` is the pin set from BEFORE THE FIRST save in a chain,
+    carried forward from the existing layout file: re-reading the pin file
+    on a second save would record the first save's additions as "before",
+    so --restore-pins could never roll back past the latest save."""
+    pinned_now = load_pinned_sessions()
+    if sessions is None:
+        sessions = parse_sessions(include_archived=False, include_subagents=False,
+                                  pinned=pinned_now)
+    raw = _snapshot_ghostty_layout()
+    if not raw:
+        reason = "Ghostty layout could not be read" if raw is None else "no Ghostty windows"
+        mlog("layout", "save_refused", reason=reason)
+        return {"ok": False, "reason": reason,
+                "summary": {"windows": 0, "claudes": 0, "newly_pinned": 0, "unresolved_tabs": 0}}
+    layout = _layout_from_snapshot(raw, sessions)
+    previous = load_layout()
+    if previous and "pinned_before" in previous:
+        layout["pinned_before"] = previous["pinned_before"]
+    else:
+        layout["pinned_before"] = sorted(pinned_now)
+    sids = {t["sid"] for w in layout["windows"] for t in w["tabs"] if t["sid"]}
+    save_pinned_sessions(pinned_now | sids)
+    try:
+        LAYOUT_PATH.write_text(json.dumps(layout, indent=2))
+    except OSError as e:
+        mlog("layout", "save_write_failed", error=str(e))
+        return {"ok": False, "reason": f"could not write {LAYOUT_PATH}", "summary": {
+            "windows": len(layout["windows"]), "claudes": len(sids), "newly_pinned": 0,
+            "unresolved_tabs": 0}}
+    layout["ok"] = True
+    layout["summary"] = {
+        "windows": len(layout["windows"]),
+        "claudes": len(sids),
+        "newly_pinned": len(sids - pinned_now),
+        "unresolved_tabs": sum(1 for w in layout["windows"] for t in w["tabs"]
+                               if not t["sid"] and not t["monitor"]),
+    }
+    mlog("layout", "saved", **layout["summary"])
+    return layout
+
+
+def load_layout() -> dict | None:
+    try:
+        return json.loads(LAYOUT_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+LAYOUT_STAMP_PREFIX = "·layout-"
+
+
+def _restore_plan(layout: dict, sessions: list[Session],
+                  live_sids: set[str] | None = None,
+                  visible_sid8s: set[str] | None = None,
+                  monitor_running: bool = False) -> tuple[list[dict], list[str], list[str]]:
+    """Turn a saved layout into concrete launch steps. Pure. Returns
+    (windows_to_build, missing_sids, skipped_live_sids).
+
+    Skips and reports a session that is already alive or already visible
+    in a terminal title: every interactive resume path refuses to spawn a
+    duplicate (Claude Code's single-instance guard kicks it and leaves a
+    dead tab), and a restore run twice, or run before Ghostty was actually
+    quit, would have done exactly that for every tab (review, 2026-08-23).
+    The monitor tab is likewise skipped when a monitor is already running.
+
+    The restored active index is resolved AFTER dropping unrestorable
+    tabs, by tracking which surviving tab carried the saved index; a
+    plain clamp selected the wrong tab whenever a dropped tab sat before
+    the active one (review, 2026-08-23)."""
+    by_sid = {base_sid(s.session_id): s for s in sessions}
+    live_sids = {base_sid(x) for x in (live_sids or set())}
+    visible_sid8s = visible_sid8s or set()
+    plan, missing, skipped_live = [], [], []
+    for w in layout.get("windows", []):
+        tabs = []
+        active_label = None
+        saved_active = w.get("active", 0)
+        for i, t in enumerate(w.get("tabs", [])):
+            entry = None
+            if t.get("monitor"):
+                if monitor_running:
+                    pass
+                else:
+                    entry = {"cmd": _ghostty_surface_command(str(_REPO_DIR), "claude-monitor"),
+                             "label": "claude-monitor"}
+            else:
+                sid = t.get("sid")
+                if not sid:
+                    entry = {"cmd": "", "label": t.get("title", "")}  # plain shell
+                else:
+                    sid = base_sid(sid)
+                    sess = by_sid.get(sid)
+                    if sess is None or not (sess.transcript_path and Path(sess.transcript_path).exists()):
+                        missing.append(sid)
+                    elif sid in live_sids or sid[:8] in visible_sid8s:
+                        skipped_live.append(sid)
+                    else:
+                        cmd, cwd = _resume_command_for(sess)
+                        entry = {"cmd": _ghostty_surface_command(cwd, cmd), "label": sess.title}
+            if entry is not None:
+                tabs.append(entry)
+                if i == saved_active:
+                    active_label = len(tabs) - 1
+        if tabs:
+            if active_label is None:
+                active_label = min(saved_active, len(tabs) - 1)
+            # Unique title stamp on the first tab: how _ghostty_build_window
+            # finds THIS window in the AX tree to frame it. Claude or the
+            # prompt overwrites it moments later, which is fine; the frame
+            # is applied before that. "stamp" is kept on the window so the
+            # builder and a test can read it back.
+            stamp = f"{LAYOUT_STAMP_PREFIX}{len(plan) + 1}-{int(time.time() * 1000) % 100000}"
+            first = tabs[0]
+            first["cmd"] = _restamp_surface_command(first["cmd"], stamp)
+            plan.append({"frame": w.get("frame", [0, 0, 0, 0]), "active": active_label,
+                         "tabs": tabs, "stamp": stamp})
+    return plan, missing, skipped_live
+
+
+def _restamp_surface_command(cmd: str, stamp: str) -> str:
+    """Prefix an existing surface command (or an empty placeholder) with a
+    title stamp. Pure string work; the plan builds commands before it
+    knows which one leads a window."""
+    if not cmd:
+        return _ghostty_surface_command(str(Path.home()), "", title_stamp=stamp)
+    # cmd is "/bin/zsh -ic '<inner>'": re-wrap with the stamp in front.
+    prefix = "/bin/zsh -ic "
+    if cmd.startswith(prefix):
+        inner = shlex.split(cmd[len(prefix):])[0]
+        inner = f"printf '\\033]0;{stamp}\\007' && {inner}"
+        return f"{prefix}{shlex.quote(inner)}"
+    return cmd
+
+
+def _ghostty_build_window(window: dict) -> str:
+    """Create one window with its tabs through Ghostty's own dictionary
+    (no keystrokes), then set its frame via AX and select the saved tab.
+    Returns "ok", "ok_unframed" (built but the frame could not be applied),
+    or "failed".
+
+    Ghostty has no frame property in its dictionary, so position/size go
+    through System Events, a property set, not an input event. The AX
+    window to frame is found by the unique title STAMP the plan put on
+    its first tab's command (see _restore_plan). Two earlier schemes
+    failed live (2026-08-23): `proc.windows()[0]` was the frontmost
+    pre-existing window (Max's monitor), and a before/after diff of AX
+    window names or frames collided because fresh windows share one
+    placeholder title and one default frame. A frame that could not be
+    applied is reported, never swallowed."""
+    tabs = window["tabs"]
+    first, rest = tabs[0], tabs[1:]
+    x, y, w, h = window["frame"]
+    stamp = window.get("stamp", "")
+    jxa = f"""(() => {{
+      const g = Application("Ghostty");
+      const se = Application("System Events");
+      const mk = (cmd) => cmd ? {{withConfiguration: {{command: cmd}}}} : {{}};
+      const win = g.newWindow(mk({json.dumps(first["cmd"])}));
+      // All tabs FIRST, then frame: adding a tab makes Ghostty re-lay the
+      // window out (tab bar appears, width grows), which undid a frame
+      // set before the tabs existed (live probe, 2026-08-23).
+      for (const cmd of {json.dumps([t["cmd"] for t in rest])}) {{
+        delay(0.35);
+        g.newTab(Object.assign({{in: win}}, mk(cmd)));
+      }}
+      delay(0.3);
+      let framed = false;
+      const stamp = {json.dumps(stamp)};
+      if (stamp && {w} > 0 && {h} > 0) {{
+        // Find the window by ANY tab carrying the stamp (the active tab
+        // may already be a later one), polling briefly for the shell to
+        // emit its title.
+        const carries = (aw) => {{
+          try {{ if (aw.name() === stamp) return true; }} catch (e) {{}}
+          try {{ return aw.tabGroups[0].radioButtons().some(t => t.title() === stamp); }}
+          catch (e) {{ return false; }}
+        }};
+        let hit = null;
+        for (let i = 0; i < 20 && !hit; i++) {{
+          try {{ hit = se.processes.byName("Ghostty").windows().find(carries); }} catch (e) {{}}
+          if (!hit) delay(0.1);
+        }}
+        // Set, then VERIFY, retrying a few times: Ghostty re-lays the
+        // window out for a moment after the last tab is added, and a
+        // single blind set in that window was overridden (widths came
+        // back 852/1252 for 660/640 requested; every width is accepted
+        // once the window has settled, so this is timing, not a minimum).
+        for (let i = 0; hit && i < 8 && !framed; i++) {{
+          try {{
+            hit.position = [{x}, {y}];
+            hit.size = [{w}, {h}];
+            delay(0.15);
+            const p = hit.position(), sz = hit.size();
+            framed = (p[0] === {x} && p[1] === {y} && sz[0] === {w} && sz[1] === {h});
+          }} catch (e) {{}}
+        }}
+      }}
+      try {{
+        const t = win.tabs()[{window["active"]}];
+        if (t) g.selectTab(t);
+      }} catch (e) {{}}
+      return framed ? "ok" : "ok_unframed";
+    }})()"""
+    try:
+        r = subprocess.run(["osascript", "-l", "JavaScript", "-e", jxa],
+                           capture_output=True, text=True, timeout=60)
+        out = r.stdout.strip()
+        if r.returncode == 0 and out in ("ok", "ok_unframed"):
+            return out
+        mlog("layout", "build_window_failed", rc=r.returncode, err=r.stderr[:200])
+        return "failed"
+    except (subprocess.SubprocessError, OSError) as e:
+        mlog("layout", "build_window_failed", error=str(e))
+        return "failed"
+
+
+def restore_layout(restore_pins: bool = False) -> dict:
+    """Rebuild the saved layout. Windows are created in saved order. Live
+    or already-visible sessions are skipped (never duplicated) and
+    reported. `restore_pins` puts the pin list back to what it was before
+    the first save; the default leaves everything pinned (safer: nothing
+    ages out until Max unpins it himself)."""
+    layout = load_layout()
+    if not layout:
+        return {"ok": False, "reason": "no saved layout"}
+    sessions = parse_sessions(include_archived=True, include_subagents=False,
+                              pinned=load_pinned_sessions())
+    live = {base_sid(s.session_id) for s in sessions if _is_session_alive(s.session_id)}
+    visible = _snapshot_window_sids()
+    monitor_running = _a_monitor_is_running()
+    plan, missing, skipped_live = _restore_plan(
+        layout, sessions, live_sids=live, visible_sid8s=visible, monitor_running=monitor_running)
+    built = unframed = 0
+    for window in plan:
+        outcome = _ghostty_build_window(window)
+        if outcome != "failed":
+            built += 1
+        if outcome == "ok_unframed":
+            unframed += 1
+        time.sleep(0.5)
+    if restore_pins and "pinned_before" in layout:
+        save_pinned_sessions(set(layout["pinned_before"]))
+    result = {"ok": built == len(plan), "windows_built": built, "windows_planned": len(plan),
+              "windows_unframed": unframed, "missing": missing, "skipped_live": skipped_live}
+    mlog("layout", "restored", **result)
+    return result
+
+
 def _frontmost_terminal_title() -> str:
     """Return the frontmost Ghostty/iTerm2/Terminal window title (or '')."""
     jxa = """(() => {
@@ -3179,6 +3549,50 @@ def _auto_rename_after_resume(old_name: str, expected_sid8: str) -> None:
         mlog("resume", "auto_rename_error", name=old_name, new_sid8=new_sid8)
 
 
+def _resume_command_for(session: Session) -> tuple[str, str]:
+    """(command, cwd) to relaunch this session. Claude CLI resolves sessions
+    by hashing the cwd, so the original launch directory matters:
+    sessions-index projectPath > transcript path > last cwd. Shared by
+    resume_session() and the layout restore so the two cannot drift."""
+    # base_sid: a sibling row's id is 'uuid@pid' (or 'uuid#startedms');
+    # `claude --resume` wants the bare conversation id. The layout restore
+    # test caught this building `--resume uuid@12345` (2026-08-23); the
+    # same row reaches resume_session via the menu, so the fix lives here.
+    cmd = f"claude --resume {base_sid(session.session_id)}"
+    candidates = (
+        session.project_path,
+        _derive_cwd_from_transcript(session.transcript_path),
+        session.cwd,
+    )
+    # First candidate that still exists on disk: a deleted worktree made
+    # `cd /gone && claude ...` fail inside the new surface, which under
+    # Ghostty's exec-direct command can close the tab on the spot
+    # (review FYI, 2026-08-23). Home is always a valid fallback and
+    # `claude --resume <sid>` still finds the conversation by id.
+    cwd = next((c for c in candidates if c and Path(c).is_dir()), str(Path.home()))
+    return cmd, cwd
+
+
+def _ghostty_surface_command(cwd: str, cmd: str, title_stamp: str = "") -> str:
+    """The one string Ghostty's `command` field execs directly (no shell):
+    wrap in `zsh -ic` so PATH from .zshrc applies (see resume_session's
+    notes: -i is required, -l alone does not source .zshrc).
+
+    `title_stamp`: emitted as an OSC 0 title before the real command so
+    the window is findable by a UNIQUE name in the AX tree from the first
+    instant, before `claude` (or a prompt) stamps its own title. Without
+    it every fresh window wears the same placeholder and two created back
+    to back cannot be told apart (live probe, 2026-08-23). An empty cmd
+    (a plain-shell placeholder tab) still gets the stamp, then a shell."""
+    parts = []
+    if title_stamp:
+        parts.append(f"printf '\\033]0;{title_stamp}\\007'")
+    parts.append(f"cd {shlex.quote(cwd)}")
+    parts.append(cmd if cmd else "exec zsh")
+    inner = " && ".join(parts)
+    return f"/bin/zsh -ic {shlex.quote(inner)}"
+
+
 def resume_session(session: Session) -> bool:
     """Resume a Claude session in a new Ghostty window (falls back to Terminal.app).
 
@@ -3195,15 +3609,7 @@ def resume_session(session: Session) -> bool:
     keystroke-only) is dropped rather than left as a latent repeat of the
     same collision for any iTerm2 user: it falls through to Terminal.app.
     """
-    cmd = f"claude --resume {session.session_id}"
-    # Claude CLI resolves sessions by hashing the cwd. Use the original
-    # launch directory: sessions-index projectPath > transcript path > last cwd.
-    cwd = (
-        session.project_path
-        or _derive_cwd_from_transcript(session.transcript_path)
-        or session.cwd
-        or str(Path.home())
-    )
+    cmd, cwd = _resume_command_for(session)
 
     # Verify the JSONL transcript exists before trying to resume
     jsonl_exists = bool(session.transcript_path) and Path(session.transcript_path).exists()
@@ -3225,7 +3631,7 @@ def resume_session(session: Session) -> bool:
     # whole inner command as zsh's -c argument) round-trips correctly even
     # when cwd itself contains a single quote.
     inner_cmd = f"cd {shlex.quote(cwd)} && {cmd}"
-    zsh_cmd = f"/bin/zsh -ic {shlex.quote(inner_cmd)}"
+    zsh_cmd = _ghostty_surface_command(cwd, cmd)
     jxa = f"""(() => {{
         const zshCmd = {json.dumps(zsh_cmd)};
         try {{
@@ -4017,6 +4423,7 @@ class ClaudeMonitor(App):
         Binding("ctrl+p", "toggle_pin", "Pin", show=False),
         Binding("ctrl+o", "toggle_hide_inactive_pins", "Pins", show=False),
         Binding("ctrl+b", "toggle_inbox_mode", "Inbox", show=False),
+        Binding("ctrl+l", "save_layout", "Layout", show=False),
         Binding("backspace", "hide_selected", "Hide", show=False),
         Binding("delete", "hide_selected", "Hide", show=False),
         Binding("shift+up", "extend_selection(-1)", "Select↑", show=False, priority=True),
@@ -5369,6 +5776,37 @@ class ClaudeMonitor(App):
         self.refresh_sessions()
         self.notify(f"All sessions {'shown' if self.show_archived else 'recent only'}", timeout=3)
 
+    def action_save_layout(self) -> None:
+        """Ctrl+L: snapshot every Ghostty window and tab, pin every Claude
+        in them, and write monitor-layout.json, so Ghostty can be closed
+        and `claude-monitor --restore-layout` rebuilds it (Max,
+        2026-08-23). Runs on a worker: the AX walk and parse_sessions are
+        both slow for the main thread."""
+        sessions = list(self.sessions)  # main-thread snapshot; no parse on the worker
+
+        def work():
+            result = save_layout(sessions=sessions)
+            r = result["summary"]
+
+            def apply():
+                if not result.get("ok"):
+                    self.notify(f"Layout NOT saved: {result.get('reason', 'unknown')}",
+                                timeout=8, severity="error")
+                    return
+                # Reload pins into memory: action_toggle_pin writes
+                # self._pinned back to disk wholesale, so a stale in-memory
+                # set would silently undo the pins the save just added on
+                # the next Ctrl+P.
+                self._pinned = load_pinned_sessions()
+                self.notify(
+                    f"Layout saved: {r['windows']} windows, {r['claudes']} Claudes "
+                    f"({r['newly_pinned']} newly pinned). Restore: claude-monitor --restore-layout",
+                    timeout=8,
+                )
+                self.refresh_sessions()
+            self.call_from_thread(apply)
+        self.run_worker(work, thread=True)
+
     def action_toggle_inbox_mode(self) -> None:
         """Ctrl+B: hide every working and standby row so only what needs
         you is left (Max, 2026-08-18: "an inbox mode ... so that I can
@@ -6015,6 +6453,35 @@ def main():
         # which key is sent). No-op if nothing is running to pick it up.
         outcome = _drop_request_and_await_consumption(RESTART_SENTINEL)
         sys.exit(0 if outcome != REQ_UNSERVED else 1)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--save-layout":
+        result = save_layout()
+        if not result.get("ok"):
+            print(f"Not saved: {result.get('reason', 'unknown')}. "
+                  f"Previous snapshot at {LAYOUT_PATH} left untouched.")
+            sys.exit(1)
+        r = result["summary"]
+        print(f"Saved {r['windows']} window(s), {r['claudes']} Claude(s) "
+              f"({r['newly_pinned']} newly pinned) to {LAYOUT_PATH}")
+        if r["unresolved_tabs"]:
+            print(f"  {r['unresolved_tabs']} tab(s) had no Claude marker; kept as plain shells")
+        sys.exit(0)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--restore-layout":
+        r = restore_layout(restore_pins="--restore-pins" in sys.argv)
+        if not r["ok"] and "reason" in r:
+            print(r["reason"])
+            sys.exit(1)
+        print(f"Rebuilt {r['windows_built']}/{r['windows_planned']} window(s)")
+        if r.get("windows_unframed"):
+            print(f"  {r['windows_unframed']} window(s) opened but could not be positioned")
+        if r.get("skipped_live"):
+            print(f"  {len(r['skipped_live'])} session(s) already running; not duplicated:")
+            for sid in r["skipped_live"]:
+                print(f"    {sid}")
+        if r["missing"]:
+            print(f"  {len(r['missing'])} session(s) no longer resumable (transcript gone):")
+            for sid in r["missing"]:
+                print(f"    {sid}")
+        sys.exit(0 if r["ok"] else 1)
     elif len(sys.argv) > 1 and sys.argv[1] == "--jump-next":
         # Ephemeral: no TUI, no visible window of its own. Fast path first:
         # hand off to an already-running monitor's warm session list

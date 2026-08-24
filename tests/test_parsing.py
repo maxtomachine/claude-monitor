@@ -1413,3 +1413,29 @@ class TestStandbyAppliedOnEveryConstructionPath:
         desk = make_session(session_id="d", title="config-MCPs", status="done")
         _apply_standby_to_all([desk])
         assert find_next_actionable([desk], None) is None
+
+
+class TestResumeCommandForSiblingRows:
+    def test_resume_uses_bare_conversation_id_for_a_sibling_row(self):
+        """A double-resumed conversation is listed as 'uuid@pid' rows;
+        `claude --resume` must get the bare uuid (found by the layout
+        restore test, 2026-08-23, but it bites the menu's Resume too)."""
+        from claude_monitor import _resume_command_for
+        sib = make_session(session_id="cafecafe-0000@12345", project_path=str(Path.home()))
+        cmd, cwd = _resume_command_for(sib)
+        assert cmd == "claude --resume cafecafe-0000"
+        assert cwd == str(Path.home())
+
+    def test_resume_falls_back_to_home_when_every_cwd_candidate_is_gone(self):
+        from claude_monitor import _resume_command_for
+        s = make_session(session_id="a", project_path="/definitely/not/here",
+                         cwd="/also/gone", transcript_path="")
+        _, cwd = _resume_command_for(s)
+        assert cwd == str(Path.home())
+
+    def test_resume_skips_a_deleted_project_path_for_a_live_cwd(self, tmp_path):
+        from claude_monitor import _resume_command_for
+        s = make_session(session_id="a", project_path="/definitely/not/here",
+                         cwd=str(tmp_path), transcript_path="")
+        _, cwd = _resume_command_for(s)
+        assert cwd == str(tmp_path)

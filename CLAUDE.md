@@ -223,6 +223,72 @@ sweep a pinned desk out of view, and the SessionMenu treats it as live
 (Jump/Rename/Kill). It is not in `ACTIONABLE_STATUSES`, so neither `n` nor
 `Ctrl+Shift+N` land on it, and `StatsBar` omits it from every counter.
 
+## Layout save/restore (Ctrl+L, --save-layout, --restore-layout)
+
+Max, 2026-08-23: "saves which claudes are pinned, saves which claudes are in
+which windows and tabs, then pins all the claudes ... so that I can close
+and reopen ghostty and then regenerate where I left off." `save_layout()`
+does one System Events AX walk of Ghostty (the same walk jump uses, so it
+sees exactly what jump can find): each window's frame, its tabs in order
+with the `·sid8` marker resolved to a full sid against `parse_sessions()`,
+and the active tab. It pins every Claude it found, unioned with the
+existing pins (recorded as `pinned_before`), so nothing ages out of the
+monitor while Ghostty is closed, and writes `monitor-layout.json`. Tabs
+with no marker (a plain shell) are kept as placeholders so tab order
+survives; the monitor's own tab (`·MONITOR` in its title) is recognised
+and relaunched as `claude-monitor`.
+
+`restore_layout()` rebuilds through Ghostty's own scripting dictionary:
+`new window` with the first tab's `claude --resume <sid>` command, `new
+tab in <window>` for the rest, `select tab` for the active one. No
+synthetic keystrokes anywhere (any injected key fires Claude Nest's
+push-to-talk, see `resume_session`). Ghostty's dictionary has no frame
+property, so position/size are set via AX, a property set, not an input
+event. What five rounds of live probing taught (2026-08-23), each one a
+scheme that failed on the real Ghostty before the next:
+
+- The AX radio `value()` for the selected tab is a boolean, not 1; the
+  first save recorded every window at tab 0. The window title is a second
+  witness for the selected tab.
+- The new window is NOT `proc.windows()[0]` (that was the monitor). A
+  before/after diff of AX window NAMES collides because fresh windows all
+  wear Ghostty's placeholder title; a diff of frames collides because they
+  all open at the default frame. What works: the plan stamps each window's
+  FIRST tab command with a unique OSC 0 title (`LAYOUT_STAMP_PREFIX`), and
+  the builder finds the AX window carrying that stamp on any of its tabs.
+- Frame AFTER all tabs exist: adding a tab makes Ghostty re-lay the window
+  out (tab bar, width), undoing a frame set before the tabs.
+- Set the frame, then VERIFY it, retrying up to 8 times: a single blind
+  set during Ghostty's post-tab relayout was overridden (660/640 requested
+  came back 852/1252; every width is accepted once settled, so timing, not
+  a minimum). `_ghostty_build_window` returns `ok`, `ok_unframed`, or
+  `failed`, and `restore_layout` reports unframed windows, never swallows.
+
+Sessions whose transcript is gone are reported as `missing`, never
+silently dropped; a window with no surviving tabs is not built. Sessions
+already alive, or whose sid8 is already visible in a terminal title, are
+reported as `skipped_live` and never relaunched (every interactive resume
+path refuses to spawn a duplicate because Claude Code's single-instance
+guard kicks it and leaves a dead tab); the monitor tab is skipped when a
+monitor is already running. The restored active tab follows the surviving
+tab that carried the saved index, not a clamp (a dropped tab before the
+active one shifted it). `save_layout()` refuses to overwrite the previous
+snapshot when the AX read fails or sees no windows (an Accessibility-
+denied shell used to write `windows: []` and exit 0), carries
+`pinned_before` forward across repeated saves so `--restore-pins` can
+roll back to the first one, and takes the running app's session list
+from `Ctrl+L` rather than parsing on the worker (the parse raced the
+refresh worker on the unlocked scan cache and could exit the monitor).
+Keys are normalised with `base_sid()` throughout: a double-resumed
+conversation is listed as `uuid@pid` rows, and `_resume_command_for()`
+(shared with `resume_session()`, which had the same latent bug) builds
+`claude --resume <bare uuid>` and falls back to `~` when the saved cwd no
+longer exists.
+
+`Ctrl+L` in the app reloads `self._pinned` from disk after the save:
+`action_toggle_pin` writes the in-memory set back wholesale, so a stale
+copy would have silently undone the new pins on the next Ctrl+P.
+
 ## Inbox mode (Ctrl+B) hides what does not need you
 
 Max, 2026-08-18: "an 'inbox mode' that changes it so that anything that is
@@ -373,6 +439,7 @@ Plain letters (no modifier) are reserved for the type-ahead group jump below, so
 | `Ctrl+n` | Send `/rename` to selected session |
 | `Ctrl+p` | Pin/unpin session (a pin never expires on its own) |
 | `Ctrl+o` | Hide/show pinned-but-inactive (archived or closed) sessions in the default view (the pin itself is untouched either way) |
+| `Ctrl+l` | Save layout: snapshot every Ghostty window and tab, pin every Claude in them, write `monitor-layout.json`. Restore from a shell with `claude-monitor --restore-layout` (add `--restore-pins` to put the pin list back as it was before the save) |
 | `Ctrl+b` | Inbox mode: hide every working and standby row so only what needs you is left (APPROVE and READY, seen or not). Persists across restarts; an INBOX chip shows in the stats bar while on. Ctrl+I was the ask but it is Tab on the wire and cannot be bound (see above) |
 | `n` | Move the cursor to the next session that needs you (needs_approval, then done, oldest-waiting first), cycling from wherever the cursor is now. Doesn't jump: follow with `Enter` → pick Jump to actually go there |
 | `Ctrl+Shift+N` (global, via `skhd`) | Instantly jump to the next session that needs you, from anywhere on the machine, no monitor window shown — `claude-monitor --jump-next`. Shares a persisted queue position (`next_cursor` in `monitor-prefs.json`) so repeated presses walk the whole queue rather than repeating |
