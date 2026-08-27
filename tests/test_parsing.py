@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import claude_monitor
 from claude_monitor import (
     build_session,
     disambiguate_titles,
@@ -1439,3 +1440,60 @@ class TestResumeCommandForSiblingRows:
                          cwd=str(tmp_path), transcript_path="")
         _, cwd = _resume_command_for(s)
         assert cwd == str(tmp_path)
+
+
+class TestJumpFindsBackgroundTabsOnEverySpace:
+    """Max, 2026-08-27: "can't jump to existing one despite row in monitor
+    existing." The matcher had two discovery paths and a blind spot
+    between them: Ghostty's `windows.name()` reports each window's ACTIVE
+    tab only, and the System Events walk lists only the CURRENT Space's
+    windows. A background tab in a window on another Space was therefore
+    invisible to both, and the Window-menu raise (which does see every
+    window) only ran AFTER a window had already been identified, so it
+    could never rescue the miss. Measured that day: the Ghostty-native
+    walk saw 14 tabs where System Events saw 3.
+
+    The JXA is not unit-testable on its own, so this asserts the shape of
+    the script the matcher actually sends: a Ghostty-native tab walk that
+    runs BEFORE the System Events fallback, with the same typing guard."""
+
+    def _script_for(self, session):
+        from unittest.mock import patch, MagicMock
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["script"] = argv[-1]
+            r = MagicMock()
+            r.stdout, r.stderr, r.returncode = "no_match", "", 0
+            return r
+
+        with patch("claude_monitor.subprocess.run", side_effect=fake_run):
+            claude_monitor.focus_terminal_session(session)
+        return seen["script"]
+
+    def test_walks_ghostty_own_tabs_not_only_system_events(self):
+        s = make_session(session_id="07a7b852-17f0-0000-0000-000000000000", title="frontier-research")
+        js = self._script_for(s)
+        assert "gh.windows()" in js and "w.tabs()" in js, "no Ghostty-native tab walk"
+
+    def test_native_walk_precedes_the_system_events_fallback(self):
+        """Order matters: System Events cannot see other Spaces, so the
+        native walk must get first refusal."""
+        s = make_session(session_id="07a7b852-17f0-0000-0000-000000000000", title="frontier-research")
+        js = self._script_for(s)
+        assert js.index("gh.windows()") < js.index("tabGroups[0].radioButtons()")
+
+    def test_native_walk_keeps_the_wrong_tab_typing_guard(self):
+        """Typing into the wrong tab is unrecoverable, so a send only fires
+        when exactly one tab carries the sid marker."""
+        s = make_session(session_id="07a7b852-17f0-0000-0000-000000000000", title="frontier-research")
+        js = self._script_for(s)
+        native = js[js.index("gh.windows()"):js.index("tabGroups[0].radioButtons()")]
+        assert "abort_tab_type" in native
+        assert "sidHits.length !== 1" in native
+
+    def test_native_walk_matches_on_the_sid_marker(self):
+        s = make_session(session_id="07a7b852-17f0-0000-0000-000000000000", title="frontier-research")
+        js = self._script_for(s)
+        assert "07a7b852" in js
+        assert "tt.includes(sid8)" in js
