@@ -223,6 +223,29 @@ sweep a pinned desk out of view, and the SessionMenu treats it as live
 (Jump/Rename/Kill). It is not in `ACTIONABLE_STATUSES`, so neither `n` nor
 `Ctrl+Shift+N` land on it, and `StatsBar` omits it from every counter.
 
+## Jump discovery must never rely on System Events alone
+
+System Events lists only the windows on the CURRENT Space, and Ghostty's
+`windows.name()` reports each window's ACTIVE tab only. Between those two
+facts sat a blind spot: a background tab in a window on another Space was
+invisible to both discovery paths, so `focus_terminal_session` returned
+`no_match` for a session whose row was sitting right there in the monitor
+(Max, 2026-08-27; measured that day, the Ghostty-native walk saw 14 tabs
+where System Events saw 3). The Window-menu raise does see every window
+across Spaces, but it ran only AFTER a window had been identified, so it
+could never rescue the miss.
+
+Phase 2.5 closes it: walk Ghostty's OWN `windows()` / `tabs()` tree, which
+lists every tab regardless of Space, and `selectTab` the hit so the
+existing raise path (AXRaise, else the Window-menu click that switches
+Spaces natively) can bring its window forward by name. It runs BEFORE the
+System Events walk, which stays as a fallback for other terminals. Any
+new discovery path must carry the same guard the others do: a send only
+fires when exactly one tab carries the sid marker, because typing into
+the wrong session is unrecoverable. `jumpback` already walked the Ghostty
+tree natively, which is why the hotkey kept working while in-app jumps
+failed; keep the two consistent.
+
 ## Layout save/restore (Ctrl+L, --save-layout, --restore-layout)
 
 Max, 2026-08-23: "saves which claudes are pinned, saves which claudes are in

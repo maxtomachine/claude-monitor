@@ -2643,6 +2643,47 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
             }} else if (nameWindow) {{
                 targetName = nameWindow; matchedCand = nameCand;
             }}
+            if (!targetName && appName === "Ghostty") {{
+                // Phase 2.5 (Ghostty only, EVERY Space): walk Ghostty's OWN
+                // window/tab tree. Phase 1 sees each window's ACTIVE tab
+                // only, and the System Events walk below sees only the
+                // CURRENT Space, so a background tab in a window on another
+                // Space was invisible to both: jumping to it returned
+                // no_match while its row sat right there in the monitor
+                // (Max, 2026-08-27). Ghostty's own dictionary lists every
+                // window and every tab regardless of Space. This phase only
+                // DISCOVERS and surfaces the tab; the existing raise below
+                // (AXRaise, else the Window-menu click that switches Spaces
+                // natively) then brings its window forward.
+                try {{
+                    const gh = Application("Ghostty");
+                    const sidHits = [], nameHits = [];
+                    for (const w of gh.windows()) {{
+                        let tabs;
+                        try {{ tabs = w.tabs(); }} catch(e) {{ continue; }}
+                        for (const tab of tabs) {{
+                            let tt = "";
+                            try {{ tt = tab.name() || ""; }} catch(e) {{ continue; }}
+                            if (!tt) continue;
+                            if (tt.includes(sid8)) sidHits.push([tab, tt]);
+                            else if (candidates.slice(1).some(c => nameMatch(tt, c)))
+                                nameHits.push([tab, tt]);
+                        }}
+                    }}
+                    const hit = sidHits[0] || nameHits[0];
+                    if (hit) {{
+                        const [tab, tt] = hit;
+                        // Same typing guard as every other path: type only
+                        // when exactly one tab carries the sid marker.
+                        if (thenText && sidHits.length !== 1)
+                            return "abort_tab_type:" + tt + ":" + sidHits.length;
+                        try {{ gh.selectTab(tab); }} catch(e) {{}}
+                        delay(0.1);
+                        targetName = tt;
+                        matchedCand = sidHits.length ? sid8 : "ghostty_tab_name";
+                    }}
+                }} catch(e) {{}}
+            }}
             if (!targetName) {{
                 // Phase 3 (Ghostty only): a session can be a BACKGROUND TAB in a
                 // tabbed window, whose title never appears in app.windows.name()
