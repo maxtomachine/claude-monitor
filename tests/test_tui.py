@@ -1855,3 +1855,110 @@ class TestRestartHardening:
                     pilot.app.action_restart()  # must not raise
                     await settle(pilot)
                 assert pilot.app.return_code == RESTART_EXIT_CODE
+
+
+class TestSendPromptWithSpace:
+    """Max, 2026-08-28: "make the spacebar allow us to send a prompt to a
+    claude, similar to how it works in claude code pressing left arrow."
+    Space opens a box on the cursor's session; Enter sends the text to
+    that session's terminal and leaves you in the monitor."""
+
+    def _live(self, **kw):
+        return make_session(session_id="live-1", title="alpha", status="done", **kw)
+
+    async def test_space_opens_the_prompt_box_named_for_the_target(self):
+        s = self._live()
+        with _mock_sessions([s]), \
+             patch("claude_monitor._is_session_alive", return_value=True):
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("space")
+                await settle(pilot)
+                from claude_monitor import PromptSend
+                screen = pilot.app.screen
+                assert isinstance(screen, PromptSend)
+                assert screen._target == "alpha"      # box names its target
+                assert screen.query_one("#prompt-input", Input).has_focus
+
+    async def test_enter_sends_the_typed_text_to_that_session(self):
+        s = self._live()
+        with _mock_sessions([s]), \
+             patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor._send_to_terminal_session", return_value=True) as send:
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("space")
+                await settle(pilot)
+                pilot.app.screen.query_one("#prompt-input", Input).value = "ship it"
+                await pilot.press("enter")
+                await settle(pilot)
+                send.assert_called_once()
+                sent_session, sent_text = send.call_args[0][0], send.call_args[0][1]
+                assert sent_session.session_id == "live-1"
+                assert sent_text == "ship it"
+
+    async def test_it_returns_to_the_monitor_rather_than_leaving_you_there(self):
+        s = self._live()
+        with _mock_sessions([s]), \
+             patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor._send_to_terminal_session", return_value=True) as send:
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("space")
+                await settle(pilot)
+                pilot.app.screen.query_one("#prompt-input", Input).value = "hi"
+                await pilot.press("enter")
+                await settle(pilot)
+                assert send.call_args.kwargs.get("return_to_monitor") is True
+
+    async def test_escape_sends_nothing(self):
+        s = self._live()
+        with _mock_sessions([s]), \
+             patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor._send_to_terminal_session") as send:
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("space")
+                await settle(pilot)
+                await pilot.press("escape")
+                await settle(pilot)
+                send.assert_not_called()
+
+    async def test_empty_prompt_sends_nothing(self):
+        s = self._live()
+        with _mock_sessions([s]), \
+             patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor._send_to_terminal_session") as send:
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("space")
+                await settle(pilot)
+                await pilot.press("enter")
+                await settle(pilot)
+                send.assert_not_called()
+
+    async def test_a_session_that_is_not_running_refuses_before_opening(self):
+        """Typing at a dead terminal lands the text nowhere, or worse, in
+        whatever now owns that window."""
+        s = make_session(session_id="gone-1", title="closed one", status="closed")
+        with _mock_sessions([s]), \
+             patch("claude_monitor._is_session_alive", return_value=False), \
+             patch("claude_monitor._send_to_terminal_session") as send:
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("space")
+                await settle(pilot)
+                from claude_monitor import PromptSend
+                assert not isinstance(pilot.app.screen, PromptSend)
+                send.assert_not_called()
+
+    async def test_space_still_does_nothing_on_a_group_header_row(self):
+        with _mock_sessions([self._live()]), \
+             patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor._send_to_terminal_session") as send:
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                with patch.object(pilot.app, "_cursor_session", return_value=None):
+                    await pilot.press("space")
+                    await settle(pilot)
+                send.assert_not_called()

@@ -79,6 +79,7 @@ Plain letters, typed in sequence, are a Finder-style type-ahead: they jump the c
 | `Ctrl+a` | Toggle subagent rows — see spawned agents nested under parents |
 | `Ctrl+z` | Show archived — include closed/old sessions with option to resume |
 | `Ctrl+n` | Send `/rename` to the selected session (patches unnamed sessions) |
+| `space` | Send a prompt to the session under the cursor: type it, Enter sends, and you stay in the monitor |
 | `Ctrl+g` | Toggle grouping by name prefix |
 | `n` | Move the cursor to the next session that needs you (no jump; see below) |
 | `Ctrl+p` | Pin/unpin: a pin never expires on its own |
