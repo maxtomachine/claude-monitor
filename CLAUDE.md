@@ -506,6 +506,7 @@ the README row and the row in this table, run the suite.
 | `R` | Restart monitor (picks up code changes) |
 | `Ctrl+j` | Cursor down |
 | `Ctrl+n` | Send `/rename` to selected session |
+| `space` | Send a prompt to the session under the cursor. Opens a box naming its target, Enter sends the text verbatim to that terminal, focus bounces back to the monitor (Max, 2026-08-28: "make the spacebar allow us to send a prompt to a claude, similar to how it works in claude code pressing left arrow"). Refuses on a session that is not running, and inherits the send path's refusal to type when the session's marker is ambiguous |
 | `Ctrl+p` | Pin/unpin session (a pin never expires on its own) |
 | `Ctrl+o` | Hide/show pinned-but-inactive (archived or closed) sessions in the default view (the pin itself is untouched either way) |
 | `Ctrl+l` | Save layout: snapshot every Ghostty window and tab, pin every Claude in them, write `monitor-layout.json`. Restore from a shell with `claude-monitor --restore-layout` (add `--restore-pins` to put the pin list back as it was before the save) |

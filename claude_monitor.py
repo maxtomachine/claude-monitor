@@ -4103,6 +4103,51 @@ class RenamePrompt(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class PromptSend(ModalScreen[str | None]):
+    """Type a prompt and send it to one session's terminal.
+
+    Max, 2026-08-28: "make the spacebar allow us to send a prompt to a
+    claude, similar to how it works in claude code pressing left arrow."
+    Same shape as RenamePrompt, but the text goes to the session verbatim
+    instead of being wrapped in a command, and the box names its target so
+    a prompt is never typed at the wrong Claude by accident."""
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "submit", "Submit"),
+    ]
+    CSS = """
+    PromptSend { align: center middle; }
+    #prompt-box {
+        width: 78; height: auto; padding: 1 2;
+        background: $panel; border: thick $accent;
+    }
+    #prompt-input { width: 100%; }
+    """
+
+    def __init__(self, target_title: str) -> None:
+        super().__init__()
+        self._target = target_title
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="prompt-box"):
+            yield Label(f"Send to [bold]{_escape_markup(self._target)}[/]"
+                        f"  [dim]Enter sends · Esc cancels[/]")
+            yield Input(placeholder="your prompt…", id="prompt-input")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#prompt-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or None)
+
+    def action_submit(self) -> None:
+        self.dismiss(self.query_one("#prompt-input", Input).value.strip() or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class SessionMenu(ModalScreen[str]):
     BINDINGS = [
         Binding("escape", "dismiss_menu", "Close"),
@@ -4581,6 +4626,7 @@ class ClaudeMonitor(App):
         Binding("n", "jump_next_actionable", "Next"),
         Binding("ctrl+j", "cursor_down", "↓", show=False),
         Binding("ctrl+n", "edit_name", "Name"),
+        Binding("space", "send_prompt", "Prompt"),
         Binding("P", "proactive_group", "/proactive→group", show=False),
         Binding("ctrl+g", "toggle_groups", "Group"),
         Binding("ctrl+v", "toggle_detail", "Info", show=False),
@@ -6013,6 +6059,43 @@ class ClaudeMonitor(App):
         self.query_one("#detail-panel", Static).display = self.show_detail
         self._save_view_state()
         self.notify(f"Preview {'on' if self.show_detail else 'off'}", timeout=2)
+
+    def action_send_prompt(self) -> None:
+        """Space: type a prompt and send it to the session under the cursor,
+        staying in the monitor afterwards (Max, 2026-08-28). The send reuses
+        the same path as rename and the /proactive broadcast, so it inherits
+        their refusal to type when the session's marker is ambiguous: typing
+        a prompt at the wrong Claude is unrecoverable."""
+        s = self._cursor_session()
+        if s is None:
+            return
+        if s.status in INACTIVE_STATUSES or not _is_session_alive(s.session_id):
+            self.notify("That session is not running", timeout=3)
+            return
+
+        def on_submit(text: str | None) -> None:
+            if not text:
+                return
+            self.notify(f"Sending to {s.title}…", timeout=2)
+
+            def work(sess=s, msg=text):
+                ok = _send_to_terminal_session(sess, msg, return_to_monitor=True)
+                mlog("action", "send_prompt", sid=sess.session_id[:12],
+                     title=sess.title, chars=len(msg), ok=ok)
+                self.call_from_thread(
+                    self.notify,
+                    f"Sent to {sess.title}" if ok else
+                    f"Could not reach {sess.title}'s terminal",
+                    timeout=4 if ok else 6,
+                    severity="information" if ok else "warning",
+                )
+                if ok:
+                    self.call_from_thread(self.refresh_sessions)
+            # A send raises a window and types: seconds of JXA, never on the
+            # main thread or the whole TUI freezes mid-send.
+            self.run_worker(work, thread=True)
+
+        self.push_screen(PromptSend(s.title), on_submit)
 
     def action_edit_name(self) -> None:
         """Open inline prompt, then send /rename <name> to the selected session."""
