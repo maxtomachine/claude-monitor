@@ -1416,6 +1416,160 @@ class TestStandbyAppliedOnEveryConstructionPath:
         assert find_next_actionable([desk], None) is None
 
 
+class TestSdkChildProcessesAreNotSessions:
+    """Max, 2026-09-11: "something is weird, maybe cc got an update?" It had.
+    CC 2.1.268 landed that morning and began writing a ~/.claude/sessions PID
+    file for every process the Agent SDK spawns, stamped `kind: "interactive"`
+    exactly like a real session and told apart only by
+    `entrypoint: "sdk-cli"`. A fan-out job in a directory named `data` put ten
+    phantom `data-XX` READY rows on screen at once, each alive for seconds,
+    none of them jumpable and none of them waiting on anyone.
+
+    The same release began deriving a name for every unnamed session
+    (`nameSource: "derived"`, e.g. `work-f6`), which is a placeholder rather
+    than a title and must not outrank the real title or defeat the
+    still-booting guard the way a user's own `/rename` legitimately does.
+    """
+
+    def _record(self, pid, sid, **over):
+        rec = {"pid": pid, "sessionId": sid, "cwd": "/Users/u/work/etl/data",
+               "kind": "interactive", "entrypoint": "cli",
+               "startedAt": int((time.time() - 600) * 1000),
+               "updatedAt": int(time.time() * 1000)}
+        rec.update(over)
+        return rec
+
+    def _run(self, tmp_path, *records, hook=None):
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        projects = tmp_path / "projects"
+        projects.mkdir()
+        for rec in records:
+            (sessions_dir / f"{rec['pid']}.json").write_text(json.dumps(rec))
+        claude_monitor._pid_map_ts = 0   # the real _refresh_pid_map, not a stub:
+        with patch("claude_monitor.CLAUDE_DIR", projects), \
+             patch("claude_monitor.SESSIONS_DIR", sessions_dir), \
+             patch("claude_monitor.os.kill", lambda *a, **k: None), \
+             patch("claude_monitor._pid_map", {}), \
+             patch("claude_monitor._pid_is_claude", return_value=True), \
+             patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor._gc_state_files"), \
+             patch("claude_monitor.load_index_metadata", return_value={}), \
+             patch("claude_monitor._read_session_cache", return_value=""), \
+             patch("claude_monitor.read_hook_state", return_value=hook or {}):
+            try:
+                return parse_sessions(include_archived=False)
+            finally:
+                claude_monitor._pid_map_ts = 0   # don't leave a warm cache
+
+    def test_sdk_child_is_not_a_row(self):
+        """The reported bug: ten of these appeared as READY within seconds."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            rows = self._run(Path(d), self._record(
+                21898, "0d05b945-b5cd-4f37-86f0-924cec3121ed",
+                entrypoint="sdk-cli", name="data-ad", nameSource="derived"))
+        assert rows == []
+
+    def test_every_sdk_entrypoint_is_excluded(self, tmp_path):
+        """sdk, sdk-cli, sdk-ts, sdk-py, sdk-control all ship in 2.1.268."""
+        recs = [self._record(3000 + i, f"sid-{i}", entrypoint=ep)
+                for i, ep in enumerate(("sdk", "sdk-cli", "sdk-ts", "sdk-py",
+                                        "sdk-control"))]
+        assert self._run(tmp_path, *recs) == []
+
+    def test_a_real_terminal_session_still_shows(self, tmp_path):
+        rows = self._run(tmp_path, self._record(19449, "sid-real", name="web-app"))
+        assert [r.title for r in rows] == ["web-app"]
+
+    def test_unknown_entrypoint_still_shows(self, tmp_path):
+        """Denylist on purpose: a phantom row is noise, a missing session is
+        the failure this app exists to prevent. An entrypoint the monitor has
+        never heard of must surface, not vanish."""
+        rows = self._run(tmp_path, self._record(19450, "sid-new", name="whatever",
+                                                entrypoint="something-new-in-2.2"))
+        assert [r.title for r in rows] == ["whatever"]
+
+    def test_derived_name_does_not_outrank_the_real_title(self, tmp_path):
+        rows = self._run(tmp_path,
+                         self._record(19451, "sid-x", name="work-f6", nameSource="derived"),
+                         hook={"title": "api-gateway"})
+        assert [r.title for r in rows] == ["api-gateway"]
+
+    def test_derived_name_still_beats_the_Claude_placeholder(self, tmp_path):
+        rows = self._run(tmp_path,
+                         self._record(19452, "sid-y", name="work-f6", nameSource="derived"))
+        assert [r.title for r in rows] == ["work-f6"]
+
+    def test_a_name_with_no_nameSource_is_a_user_name(self, tmp_path):
+        """Pre-2.1.268 PID files have no nameSource and only ever carried a
+        name a user had set."""
+        rows = self._run(tmp_path, self._record(19453, "sid-z", name="release-tool"),
+                         hook={"title": "stale hook title"})
+        assert [r.title for r in rows] == ["release-tool"]
+
+    def test_booting_session_is_still_skipped_despite_its_derived_name(self, tmp_path):
+        """The guard against unactionable "Claude / WORKING / 0%" rows keyed
+        off an absent name; 2.1.268 fills one in instantly, so it had to move
+        to keying off a USER name."""
+        rows = self._run(tmp_path, self._record(
+            19454, "sid-booting", name="work-0f", nameSource="derived",
+            startedAt=int(time.time() * 1000)))
+        assert rows == []
+
+    def test_a_just_named_session_is_not_treated_as_booting(self, tmp_path):
+        rows = self._run(tmp_path, self._record(
+            19455, "sid-named", name="docs-site",
+            startedAt=int(time.time() * 1000)))
+        assert [r.title for r in rows] == ["docs-site"]
+
+    def _write(self, d, pid, sid, entrypoint, name, source="user"):
+        (d / f"{pid}.json").write_text(json.dumps(
+            {"pid": pid, "sessionId": sid, "cwd": "/Users/u/work",
+             "kind": "interactive", "entrypoint": entrypoint, "name": name,
+             "nameSource": source, "status": "idle",
+             "startedAt": int((time.time() - 600) * 1000),
+             "updatedAt": int(time.time() * 1000)}))
+
+    def _pid_map_for(self, d):
+        import claude_monitor as cm
+        cm._pid_map_ts = 0
+        with patch("claude_monitor.SESSIONS_DIR", d), \
+             patch("claude_monitor.os.kill", lambda *a, **k: None):
+            cm._refresh_pid_map()
+        out = dict(cm._pid_map)
+        cm._pid_map_ts = 0
+        return out
+
+    def test_an_sdk_child_never_displaces_the_session_in_the_pid_map(self, tmp_path):
+        """`claude -p --resume <sid>` beside a live session puts two alive
+        records on one id. The map took the last one it happened to read, so
+        which process a sid pointed at was directory order — and when it
+        landed on the SDK child, the orphan pass read that record back,
+        excluded it, and dropped the real session's row entirely. Caught by
+        driving the app before/after, not by the unit tests: both rows were
+        individually correct. Order must not matter, so both are checked."""
+        sid = "aaaa1111-b5cd-4f37-86f0-924cec3121ed"
+        sdk_first = tmp_path / "a"; sdk_first.mkdir()
+        self._write(sdk_first, 90004, sid, "sdk-cli", "data-9f", "derived")
+        self._write(sdk_first, 90002, sid, "cli", "web-app")
+        assert self._pid_map_for(sdk_first)[sid] == 90002
+
+        cli_first = tmp_path / "b"; cli_first.mkdir()
+        self._write(cli_first, 90002, sid, "cli", "web-app")
+        self._write(cli_first, 90004, sid, "sdk-cli", "data-9f", "derived")
+        assert self._pid_map_for(cli_first)[sid] == 90002
+
+    def test_the_session_survives_an_sdk_child_on_its_own_id(self, tmp_path):
+        """The user-visible half of the bug above: one row, real title."""
+        sid = "aaaa1111-b5cd-4f37-86f0-924cec3121ed"
+        rows = self._run(tmp_path,
+                         self._record(90004, sid, entrypoint="sdk-cli",
+                                      name="data-9f", nameSource="derived"),
+                         self._record(90002, sid, name="web-app"))
+        assert [r.title for r in rows] == ["web-app"]
+
+
 class TestResumeCommandForSiblingRows:
     def test_resume_uses_bare_conversation_id_for_a_sibling_row(self):
         """A double-resumed conversation is listed as 'uuid@pid' rows;

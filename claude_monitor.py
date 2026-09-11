@@ -799,6 +799,47 @@ def _perf(label: str, t0: float) -> float:
     return time.perf_counter()
 
 
+def _pid_record_is_own_session(pdata: dict) -> bool:
+    """Does this ~/.claude/sessions/<pid>.json describe a session a human is
+    sitting in front of?
+
+    Two gates. `kind` has always separated real sessions from bookkeeping
+    records. `entrypoint` became load-bearing on 2026-09-11, when CC
+    2.1.268 started writing a PID file for every process the Agent SDK
+    spawns (`entrypoint: "sdk-cli"`) and stamping it `kind: "interactive"`
+    like any other: a fan-out job spawning SDK children put ten phantom
+    READY rows on screen within an hour of the update (Max, 2026-09-11:
+    "something is weird, maybe cc got an update?"). An SDK child
+    has no terminal to jump to, nothing to ask of anyone, and exits in
+    seconds, so it is never a row.
+
+    Denylist, not allowlist, deliberately: the sdk family is known (`sdk`,
+    `sdk-cli`, `sdk-ts`, `sdk-py`, `sdk-control` in the 2.1.268 bundle), and
+    an entrypoint this monitor has never heard of should surface as a row
+    rather than vanish. A phantom row is noise; a missing session is the
+    failure the whole app exists to prevent.
+    """
+    if pdata.get("kind") != "interactive":
+        return False
+    return not str(pdata.get("entrypoint", "")).startswith("sdk")
+
+
+def _pid_record_user_name(pdata: dict) -> str:
+    """The name a human gave this session, or "".
+
+    CC 2.1.268 (2026-09-11) also auto-derives a name for every unnamed
+    session -- `mk-f6`, `data-ad`: the cwd basename plus two hex digits,
+    marked `nameSource: "derived"`. That is a placeholder, not a title, and
+    must not outrank the hook title or the statusline name the way a real
+    `/rename` does. Older CC wrote no `nameSource` at all and only ever
+    wrote a name a user had set, so a missing field reads as "user".
+    """
+    name = pdata.get("name", "")
+    if not name:
+        return ""
+    return name if pdata.get("nameSource", "user") == "user" else ""
+
+
 def parse_sessions(include_archived: bool = False,
                    include_subagents: bool = False,
                    pinned: set[str] | None = None) -> list[Session]:
@@ -919,21 +960,25 @@ def parse_sessions(include_archived: bool = False,
             pdata = json.loads(pid_file.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        if pdata.get("kind") != "interactive":
+        if not _pid_record_is_own_session(pdata):
             continue
         # Skip sessions still booting — PID file lands before name/transcript,
         # which would surface as an unactionable "Claude" / WORKING / 0% row.
         # They appear correctly on the next 2s refresh once the transcript exists.
+        # The test is for a USER name: since 2.1.268 CC derives one instantly for
+        # every session, so a present `name` stopped meaning "past booting".
         started_ms = pdata.get("startedAt", 0)
-        if not pdata.get("name") and started_ms and (time.time() - started_ms / 1000.0) < 5:
+        user_name = _pid_record_user_name(pdata)
+        if not user_name and started_ms and (time.time() - started_ms / 1000.0) < 5:
             continue
         # Build title from best available source
         hook = read_hook_state(sid)
         sl_name = _read_session_cache("name", sid)
         title = (
-            pdata.get("name")
+            user_name
             or sl_name
             or (hook.get("title") if hook else "")
+            or pdata.get("name", "")  # CC's derived placeholder, better than "Claude"
             or "Claude"
         )
         status = "done"
@@ -990,7 +1035,7 @@ def parse_sessions(include_archived: bool = False,
                 os.kill(pid, 0)
             except (OSError, json.JSONDecodeError, ValueError):
                 continue
-            if pdata.get("kind") != "interactive":
+            if not _pid_record_is_own_session(pdata):
                 continue
             sid_pids.setdefault(sid, []).append(pdata)
 
@@ -1007,12 +1052,12 @@ def parse_sessions(include_archived: bool = False,
             sib = replace(
                 base,
                 session_id=f"{sid}@{pid}",
-                title=pdata.get("name") or base.title,
+                title=_pid_record_user_name(pdata) or base.title,
                 status=("working" if pstatus == "busy" else
                         "done" if pstatus == "idle" else base.status),
                 last_activity=updated or base.last_activity,
                 context_is_estimate=True,
-                status_name=pdata.get("name") or base.status_name,
+                status_name=_pid_record_user_name(pdata) or base.status_name,
                 # Each PID is its own instance: derive the durable surrogate from
                 # this pid's own startedAt, not the base's. replace() would
                 # otherwise copy one instance_id onto every sibling, tripping the
@@ -1262,6 +1307,7 @@ def _refresh_pid_map() -> None:
     if now - _pid_map_ts < 2:
         return
     _pid_map = {}
+    own_pid: set[str] = set()  # sids mapped to the session's OWN process
     if SESSIONS_DIR.is_dir():
         for path in SESSIONS_DIR.iterdir():
             if path.suffix != ".json":
@@ -1272,10 +1318,23 @@ def _refresh_pid_map() -> None:
                 pid = int(data["pid"])
                 try:
                     os.kill(pid, 0)
-                    _pid_map[sid] = pid  # Alive
                 except OSError:
                     if sid not in _pid_map:  # Don't overwrite alive with dead
                         _pid_map[sid] = None
+                    continue
+                # An SDK child (what `claude -p --resume <sid>` looks like)
+                # can claim a live session's id. It is a real process, so it
+                # still answers "is this session running", but it must never
+                # displace the session's own process here: the orphan pass
+                # reads the mapped pid's record back, finds an SDK record,
+                # and would drop the real row entirely. Last-writer-wins on
+                # a bare dict iteration order made that a coin flip (caught
+                # by the headless before/after capture, 2026-09-11).
+                if _pid_record_is_own_session(data):
+                    _pid_map[sid] = pid
+                    own_pid.add(sid)
+                elif sid not in own_pid:
+                    _pid_map[sid] = pid
             except (json.JSONDecodeError, OSError, KeyError, ValueError):
                 continue
     _pid_map_ts = now
