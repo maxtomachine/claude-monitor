@@ -424,6 +424,70 @@ def parse_timestamp(ts: str) -> float:
         return 0.0
 
 
+# A transcript's mtime is when the FILE was last written; it is not when the
+# CONVERSATION last moved, and the two come apart badly. Claude Code's updater
+# rewrites every transcript it can reach when it installs a version: 17 of them
+# were stamped 13:31:07 on 2026-09-11, one second before .last-update-result.json
+# recorded the 2.1.269 install, and the same signature sits in the file times at
+# every previous update (23 files on 09-02, 21 on 08-25, 29 on 08-10). The
+# monitor read last_activity off mtime, so each update raised a wave of dormant
+# sessions to the top of the table as freshly-READY rows, all wearing the same
+# age. Max saw it twice in one day, the second time on a session he had last
+# spoken to five days earlier: "it's not a real user facing agent."
+#
+# So activity is read from the transcript's own last timestamp. The tail is
+# enough (entries are appended, and 64KB covers many), and the result is cached
+# by mtime, so a touched file is re-read once rather than on every 3s refresh.
+_TS_RE = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')  # CC writes it tight, but don't depend on that
+_TAIL_BYTES = 65536
+_activity_cache: dict[str, tuple[float, float]] = {}  # path -> (mtime, activity)
+
+
+def transcript_activity_time(path: str, mtime: float | None = None) -> float:
+    """Timestamp of the last entry in the transcript, or 0.0 if none is
+    readable (callers fall back to mtime)."""
+    try:
+        if mtime is None:
+            mtime = os.path.getmtime(path)
+    except OSError:
+        return 0.0
+    cached = _activity_cache.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    activity = 0.0
+    try:
+        with open(path, "rb") as fh:
+            try:
+                fh.seek(-_TAIL_BYTES, 2)
+            except OSError:
+                fh.seek(0)
+            tail = fh.read().decode("utf-8", "replace")
+        for raw in reversed(_TS_RE.findall(tail)):
+            t = parse_timestamp(raw)
+            if t:
+                activity = t
+                break
+    except OSError:
+        activity = 0.0
+    _activity_cache[path] = (mtime, activity)
+    return activity
+
+
+def transcript_is_fresh(path: str, within: float) -> bool:
+    """Did the conversation move within the last `within` seconds?
+
+    Falls back to the file's own mtime when the transcript carries no readable
+    timestamp (an empty or truncated file), so this is never harsher than the
+    file-time test it replaced: the only case it answers differently is the one
+    it exists for, a file written without the conversation advancing.
+    """
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return False
+    return time.time() - (transcript_activity_time(path, mtime) or mtime) < within
+
+
 _scan_cache: dict[str, tuple[float, dict]] = {}  # path -> (mtime, result)
 _scan_cache_loaded_from_disk = False
 _scan_cache_dirty = False  # set on any miss; parse_sessions() flushes once per cycle
@@ -873,19 +937,22 @@ def parse_sessions(include_archived: bool = False,
         t_rglob += time.perf_counter() - tg
         session_id = jsonl_path.stem
         is_pinned = session_id in pinned
+        # Every age question below, and the row's own last_activity, ask when
+        # the conversation last moved, not when the file was last written.
+        activity = transcript_activity_time(str(jsonl_path), mtime) or mtime
 
         # A pin is a permanent exemption from every age filter here. It stays
         # until you unpin it, full stop (Max: "pins should stay until I unpin
         # them"). Whether an inactive pin actually SHOWS in the default view
         # is a separate, simpler question: the hide_inactive_pins toggle in
         # _refresh_compute() answers it without touching age at all.
-        is_archived = mtime < active_cutoff
+        is_archived = activity < active_cutoff
         if is_archived and not include_archived and not is_pinned:
             if not _is_session_alive(session_id):
                 tg = time.perf_counter()
                 continue
             is_archived = False
-        if mtime < archive_cutoff and not _is_session_alive(session_id) and not is_pinned:
+        if activity < archive_cutoff and not _is_session_alive(session_id) and not is_pinned:
             tg = time.perf_counter()
             continue
         idx = meta.get(session_id, {})
@@ -907,7 +974,7 @@ def parse_sessions(include_archived: bool = False,
             n_full_scan += 1
 
         tb = time.perf_counter()
-        session = build_session(str(jsonl_path), session_id, project, idx, mtime)
+        session = build_session(str(jsonl_path), session_id, project, idx, activity)
         t_build += time.perf_counter() - tb
         if session:
             # Hide ghost sessions: ≤20 output tokens = just the greeting
@@ -1791,11 +1858,8 @@ def _thinking_is_stale(session_id: str, hook: dict, transcript_path: str) -> boo
     if hook_age < _THINKING_STALE_S:
         return False
     if transcript_path:
-        try:
-            if time.time() - os.stat(transcript_path).st_mtime < _THINKING_STALE_S:
-                return False
-        except OSError:
-            pass
+        if transcript_is_fresh(transcript_path, _THINKING_STALE_S):
+            return False
     pid = _pid_map.get(session_id) or hook.get("pid")
     if pid:
         try:
@@ -1855,11 +1919,8 @@ def determine_status(session_id: str, last_assistant_time: float,
         # Hook says idle, but if the transcript itself is being appended to,
         # the model is streaming: slash commands and a few other paths can
         # miss UserPromptSubmit so the hook never flips.
-        try:
-            if time.time() - os.stat(transcript_path).st_mtime < 5:
-                return True
-        except OSError:
-            pass
+        if transcript_is_fresh(transcript_path, 5):
+            return True
         return count_background_activity(transcript_path) > 0
 
     # Tier 1: hook state files (real-time, event-driven)

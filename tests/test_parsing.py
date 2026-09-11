@@ -1570,6 +1570,123 @@ class TestSdkChildProcessesAreNotSessions:
         assert [r.title for r in rows] == ["web-app"]
 
 
+class TestActivityIsConversationTimeNotFileTime:
+    """Claude Code's updater rewrites every transcript it can reach when it
+    installs a version: 17 files were stamped 13:31:07 on 2026-09-11, one
+    second before .last-update-result.json recorded that install, and the same
+    signature sits in the file times at every earlier update (23 files on
+    09-02, 21 on 08-25, 29 on 08-10). last_activity came off the file's mtime,
+    so each update floated a wave of dormant sessions to the top of the table
+    as freshly-READY rows all wearing the same age, and acks were voided with
+    them. Max, twice in one day, on a session he had last spoken to five days
+    earlier: "it's not a real user facing agent."
+    """
+
+    def _transcript(self, tmp_path, age_days, name="t.jsonl"):
+        """A conversation that ended `age_days` ago, in a file touched now."""
+        from datetime import datetime, timedelta, timezone
+        ts = (datetime.now(timezone.utc) - timedelta(days=age_days)).isoformat()
+        p = tmp_path / name
+        p.write_text(make_transcript_jsonl(
+            messages=[{"type": "system", "timestamp": ts}]))
+        now = time.time()
+        import os as _os
+        _os.utime(p, (now, now))           # the touch
+        return p
+
+    def test_a_touched_transcript_keeps_the_conversations_age(self, tmp_path):
+        from claude_monitor import transcript_activity_time
+        p = self._transcript(tmp_path, age_days=5)
+        assert time.time() - p.stat().st_mtime < 5          # file looks brand new
+        activity = transcript_activity_time(str(p))
+        assert 4.5 * 86400 < time.time() - activity < 5.5 * 86400
+
+    def test_a_live_transcript_is_unaffected(self, tmp_path):
+        from claude_monitor import transcript_activity_time
+        p = self._transcript(tmp_path, age_days=0)
+        assert time.time() - transcript_activity_time(str(p)) < 60
+
+    def test_no_readable_timestamp_falls_back_to_the_callers_mtime(self, tmp_path):
+        """Zero means "no answer", and every caller ORs in mtime."""
+        from claude_monitor import transcript_activity_time
+        p = tmp_path / "t.jsonl"
+        p.write_text('{"type":"system","content":"no timestamp here"}\n')
+        assert transcript_activity_time(str(p)) == 0.0
+
+    def test_the_last_timestamp_wins_not_the_first(self, tmp_path):
+        from claude_monitor import transcript_activity_time
+        from datetime import datetime, timedelta, timezone
+        old = (datetime.now(timezone.utc) - timedelta(days=9)).isoformat()
+        new = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        p = tmp_path / "t.jsonl"
+        p.write_text(json.dumps({"type": "user", "timestamp": old}) + "\n" +
+                     json.dumps({"type": "system", "timestamp": new}) + "\n")
+        assert 1.5 * 3600 < time.time() - transcript_activity_time(str(p)) < 2.5 * 3600
+
+    def test_reads_are_cached_until_the_file_changes(self, tmp_path):
+        """151 sessions re-tailed on every 3s refresh would be real work."""
+        import claude_monitor as cm
+        p = self._transcript(tmp_path, age_days=3)
+        first = cm.transcript_activity_time(str(p))
+        mtime = p.stat().st_mtime
+        p.write_text('{"type":"system","timestamp":"2026-01-01T00:00:00Z"}\n')
+        import os as _os
+        _os.utime(p, (mtime, mtime))                        # same mtime, new bytes
+        assert cm.transcript_activity_time(str(p)) == first
+        cm._activity_cache.pop(str(p), None)
+
+    def _run(self, tmp_path, include_archived=False):
+        projects = tmp_path / "projects" / "-Users-u-work"
+        projects.mkdir(parents=True)
+        (tmp_path / "sessions").mkdir()
+        return projects, lambda: self._parse(tmp_path, include_archived)
+
+    def _parse(self, tmp_path, include_archived):
+        with patch("claude_monitor.CLAUDE_DIR", tmp_path / "projects"), \
+             patch("claude_monitor.SESSIONS_DIR", tmp_path / "sessions"), \
+             patch("claude_monitor._refresh_pid_map"), \
+             patch("claude_monitor._pid_map", {}), \
+             patch("claude_monitor._is_session_alive", return_value=False), \
+             patch("claude_monitor._gc_state_files"), \
+             patch("claude_monitor.load_index_metadata", return_value={}), \
+             patch("claude_monitor.read_hook_state", return_value={}):
+            return parse_sessions(include_archived=include_archived)
+
+    def test_a_touched_dormant_session_is_not_resurrected(self, tmp_path):
+        """The reported shape: a five-day-dead session back in the default
+        view, bold and READY, because an update had rewritten its file."""
+        projects, run = self._run(tmp_path)
+        self._transcript(projects, age_days=5,
+                         name="dddddddd-0000-0000-0000-000000000001.jsonl")
+        assert run() == []
+
+    def test_it_still_shows_in_history_mode_at_its_true_age(self, tmp_path):
+        projects, _ = self._run(tmp_path)
+        self._transcript(projects, age_days=5,
+                         name="dddddddd-0000-0000-0000-000000000002.jsonl")
+        rows = self._parse(tmp_path, include_archived=True)
+        assert len(rows) == 1
+        assert 4.5 * 86400 < time.time() - rows[0].last_activity < 5.5 * 86400
+
+    def test_a_session_active_today_survives_and_keeps_its_age(self, tmp_path):
+        projects, run = self._run(tmp_path)
+        self._transcript(projects, age_days=0,
+                         name="dddddddd-0000-0000-0000-000000000003.jsonl")
+        rows = run()
+        assert len(rows) == 1
+        assert time.time() - rows[0].last_activity < 120
+
+    def test_a_touched_transcript_is_not_read_as_streaming(self, tmp_path):
+        """determine_status treated a transcript written in the last 5 seconds
+        as a model mid-stream, so a batch touch briefly turned dormant rows
+        WORKING as well as fresh."""
+        p = self._transcript(tmp_path, age_days=5)
+        with patch("claude_monitor._is_session_alive", return_value=True), \
+             patch("claude_monitor.read_hook_state", return_value={}), \
+             patch("claude_monitor.SIGNALS_DIR", tmp_path / "nope"):
+            assert determine_status("sid", 0, "", str(p)) == "done"
+
+
 class TestResumeCommandForSiblingRows:
     def test_resume_uses_bare_conversation_id_for_a_sibling_row(self):
         """A double-resumed conversation is listed as 'uuid@pid' rows;

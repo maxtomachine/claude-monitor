@@ -223,6 +223,41 @@ sweep a pinned desk out of view, and the SessionMenu treats it as live
 (Jump/Rename/Kill). It is not in `ACTIONABLE_STATUSES`, so neither `n` nor
 `Ctrl+Shift+N` land on it, and `StatsBar` omits it from every counter.
 
+## Activity is when the conversation moved, not when the file changed
+
+`last_activity` used to be the transcript's file mtime. Claude Code's updater
+rewrites every transcript it can reach when it installs a version: 17 files
+carried the identical mtime 13:31:07 on 2026-09-11, one second before
+`.last-update-result.json` recorded that install, and the same signature sits
+in the file times at every earlier update (23 files on 09-02, 21 on 08-25, 29
+on 08-10, 37 on 07-06). Nothing was appended to any of them. The monitor read
+each touch as activity, so every update floated a wave of dormant sessions to
+the top of the table as bold READY rows all wearing the same age. Measured on
+the 13:31 update: seven sessions that had said nothing for a day or more were
+sitting in the default view claiming 12m, one of them a conversation five days
+dead (Max: "it's not a real user facing agent"), and a dozen more were
+misdated, 12m for what was really 17h, 19h, 21h.
+
+`transcript_activity_time()` reads the last timestamp out of the file's tail
+(64KB, cached by mtime, so a touched file is re-read once rather than every
+3s) and that is what feeds `last_activity`, `is_archived`, and the 7-day drop.
+`transcript_is_fresh(path, within)` is the same reading for the two freshness
+tests inside `determine_status` (streaming, and stale-thinking), which used
+raw mtime and so briefly flipped touched rows to WORKING as well. Both fall
+back to mtime when a transcript carries no readable timestamp, so an empty or
+truncated file behaves exactly as before; the only case that answers
+differently is a file written without the conversation advancing.
+
+This also quietly fixes acks. `_effective_seen_count()` voids a seen-mark when
+`last_activity` is newer than the mark, so before this every update un-read
+every READY row Max had already checked, which is some of the "they are
+turning yellow on me" he reported in August and we only half explained then.
+
+The general rule, the same one the PID-file section ends on: the monitor reads
+files it does not own. When a reading can be produced by something other than
+the thing it is meant to measure, measure the thing instead.
+
+
 ## A PID file is not always a session
 
 `~/.claude/sessions/<pid>.json` is the monitor's second source of sessions
