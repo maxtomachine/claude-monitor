@@ -223,6 +223,91 @@ sweep a pinned desk out of view, and the SessionMenu treats it as live
 (Jump/Rename/Kill). It is not in `ACTIONABLE_STATUSES`, so neither `n` nor
 `Ctrl+Shift+N` land on it, and `StatsBar` omits it from every counter.
 
+## Activity is when the conversation moved, not when the file changed
+
+`last_activity` used to be the transcript's file mtime. Claude Code's updater
+rewrites every transcript it can reach when it installs a version: 17 files
+carried the identical mtime 13:31:07 on 2026-09-11, one second before
+`.last-update-result.json` recorded that install, and the same signature sits
+in the file times at every earlier update (23 files on 09-02, 21 on 08-25, 29
+on 08-10, 37 on 07-06). Nothing was appended to any of them. The monitor read
+each touch as activity, so every update floated a wave of dormant sessions to
+the top of the table as bold READY rows all wearing the same age. Measured on
+the 13:31 update: seven sessions that had said nothing for a day or more were
+sitting in the default view claiming 12m, one of them a conversation five days
+dead (Max: "it's not a real user facing agent"), and a dozen more were
+misdated, 12m for what was really 17h, 19h, 21h.
+
+`transcript_activity_time()` reads the last timestamp out of the file's tail
+(64KB, cached by mtime, so a touched file is re-read once rather than every
+3s) and that is what feeds `last_activity`, `is_archived`, and the 7-day drop.
+`transcript_is_fresh(path, within)` is the same reading for the two freshness
+tests inside `determine_status` (streaming, and stale-thinking), which used
+raw mtime and so briefly flipped touched rows to WORKING as well. Both fall
+back to mtime when a transcript carries no readable timestamp, so an empty or
+truncated file behaves exactly as before; the only case that answers
+differently is a file written without the conversation advancing.
+
+This also quietly fixes acks. `_effective_seen_count()` voids a seen-mark when
+`last_activity` is newer than the mark, so before this every update un-read
+every READY row Max had already checked, which is some of the "they are
+turning yellow on me" he reported in August and we only half explained then.
+
+The general rule, the same one the PID-file section ends on: the monitor reads
+files it does not own. When a reading can be produced by something other than
+the thing it is meant to measure, measure the thing instead.
+
+
+## A PID file is not always a session
+
+`~/.claude/sessions/<pid>.json` is the monitor's second source of sessions
+(the orphan pass, for a session with no transcript yet, and the multi-PID
+sibling split). The only gate used to be `kind == "interactive"`. On
+2026-09-11 CC 2.1.268 began writing one of those files for every process
+the Agent SDK spawns, stamped `kind: "interactive"` like any other and
+separated only by `entrypoint: "sdk-cli"`. Within an hour of the update a
+fan-out job running in `a directory named `data`` had put ten phantom
+`data-XX` READY rows on screen, each alive for seconds, none jumpable and
+none waiting on anybody (Max: "something is weird, maybe cc got an
+update?"). Worse, an SDK child sharing a real session's sid (what
+`claude -p --resume <sid>` looks like) tripped the sibling split and tore
+that session into two rows under a bogus group header.
+
+`_pid_record_is_own_session()` is now the one gate, used at both sites: an
+`entrypoint` starting with `sdk` (the 2.1.268 bundle ships `sdk`,
+`sdk-cli`, `sdk-ts`, `sdk-py`, `sdk-control`) is never a row. It is a
+denylist on purpose, so an entrypoint this monitor has never heard of
+surfaces rather than vanishes: a phantom row is noise, a missing session
+is the failure the app exists to prevent.
+
+**The map must point at the session's own process.** `_refresh_pid_map()`
+took the last alive record it happened to read for a sid, so when an SDK
+child claimed a live session's id (what `claude -p --resume <sid>` looks
+like) which process a sid pointed at came down to directory order. Land on
+the SDK child and the orphan pass reads that record back, excludes it, and
+drops the real session's row entirely: the gate above turns a phantom row
+into a missing one. An own-session record now always wins the slot. The
+unit tests missed this because each row was individually correct; the
+before/after capture of the running app is what showed the row gone.
+
+**A derived name is a placeholder, not a title.** The same release started
+auto-naming every unnamed session `<cwd-basename>-<2 hex>` (`work-f6`,
+`data-ad`) with `nameSource: "derived"`. Two things broke quietly. The
+title precedence took `pdata["name"]` first, so a real session rendered as
+`work-f6` instead of its hook title, and `space` then addressed a prompt to a
+name no terminal carries. And the still-booting guard ("skip a PID file
+that has no name yet, or it flashes an unactionable Claude / WORKING / 0%
+row") keyed off an absent name, which 2.1.268 fills in instantly, so the
+guard stopped firing. `_pid_record_user_name()` returns a name only when
+`nameSource == "user"`; a record with no `nameSource` at all is pre-2.1.268
+and its name was always a user's, so it still counts. The derived name is
+kept as a last resort, ahead of the literal "Claude" placeholder.
+
+Assume this class of change recurs: CC owns those files, the monitor only
+reads them. When a new field appears, ask what the monitor was inferring
+from its absence.
+
+
 ## Jump discovery must never rely on System Events alone
 
 System Events lists only the windows on the CURRENT Space, and Ghostty's

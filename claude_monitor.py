@@ -424,6 +424,70 @@ def parse_timestamp(ts: str) -> float:
         return 0.0
 
 
+# A transcript's mtime is when the FILE was last written; it is not when the
+# CONVERSATION last moved, and the two come apart badly. Claude Code's updater
+# rewrites every transcript it can reach when it installs a version: 17 of them
+# were stamped 13:31:07 on 2026-09-11, one second before .last-update-result.json
+# recorded the 2.1.269 install, and the same signature sits in the file times at
+# every previous update (23 files on 09-02, 21 on 08-25, 29 on 08-10). The
+# monitor read last_activity off mtime, so each update raised a wave of dormant
+# sessions to the top of the table as freshly-READY rows, all wearing the same
+# age. Max saw it twice in one day, the second time on a session he had last
+# spoken to five days earlier: "it's not a real user facing agent."
+#
+# So activity is read from the transcript's own last timestamp. The tail is
+# enough (entries are appended, and 64KB covers many), and the result is cached
+# by mtime, so a touched file is re-read once rather than on every 3s refresh.
+_TS_RE = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')  # CC writes it tight, but don't depend on that
+_TAIL_BYTES = 65536
+_activity_cache: dict[str, tuple[float, float]] = {}  # path -> (mtime, activity)
+
+
+def transcript_activity_time(path: str, mtime: float | None = None) -> float:
+    """Timestamp of the last entry in the transcript, or 0.0 if none is
+    readable (callers fall back to mtime)."""
+    try:
+        if mtime is None:
+            mtime = os.path.getmtime(path)
+    except OSError:
+        return 0.0
+    cached = _activity_cache.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    activity = 0.0
+    try:
+        with open(path, "rb") as fh:
+            try:
+                fh.seek(-_TAIL_BYTES, 2)
+            except OSError:
+                fh.seek(0)
+            tail = fh.read().decode("utf-8", "replace")
+        for raw in reversed(_TS_RE.findall(tail)):
+            t = parse_timestamp(raw)
+            if t:
+                activity = t
+                break
+    except OSError:
+        activity = 0.0
+    _activity_cache[path] = (mtime, activity)
+    return activity
+
+
+def transcript_is_fresh(path: str, within: float) -> bool:
+    """Did the conversation move within the last `within` seconds?
+
+    Falls back to the file's own mtime when the transcript carries no readable
+    timestamp (an empty or truncated file), so this is never harsher than the
+    file-time test it replaced: the only case it answers differently is the one
+    it exists for, a file written without the conversation advancing.
+    """
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return False
+    return time.time() - (transcript_activity_time(path, mtime) or mtime) < within
+
+
 _scan_cache: dict[str, tuple[float, dict]] = {}  # path -> (mtime, result)
 _scan_cache_loaded_from_disk = False
 _scan_cache_dirty = False  # set on any miss; parse_sessions() flushes once per cycle
@@ -799,6 +863,53 @@ def _perf(label: str, t0: float) -> float:
     return time.perf_counter()
 
 
+def _pid_record_is_own_session(pdata: dict) -> bool:
+    """Does this ~/.claude/sessions/<pid>.json describe a session a human is
+    sitting in front of?
+
+    Two gates. `kind` has always separated real sessions from bookkeeping
+    records. `entrypoint` became load-bearing on 2026-09-11, when CC
+    2.1.268 started writing a PID file for every process the Agent SDK
+    spawns (`entrypoint: "sdk-cli"`) and stamping it `kind: "interactive"`
+    like any other: a fan-out job spawning SDK children put ten phantom
+    READY rows on screen within an hour of the update (Max, 2026-09-11:
+    "something is weird, maybe cc got an update?"). An SDK child
+    has no terminal to jump to, nothing to ask of anyone, and exits in
+    seconds, so it is never a row.
+
+    Denylist, not allowlist, deliberately: the sdk family is known (`sdk`,
+    `sdk-cli`, `sdk-ts`, `sdk-py`, `sdk-control` in the 2.1.268 bundle), and
+    an entrypoint this monitor has never heard of should surface as a row
+    rather than vanish. A phantom row is noise; a missing session is the
+    failure the whole app exists to prevent.
+
+    Not to be merged with `Session.is_scheduled` (`entrypoint not in ("",
+    "cli")`), which reads the same field to answer a different question. That
+    one asks whether a run that DID leave a transcript is a headless one worth
+    collapsing behind a single `↻` row; this one asks whether a PID record is
+    a session at all. Hence the looser rule there and the narrow denylist here.
+    """
+    if pdata.get("kind") != "interactive":
+        return False
+    return not str(pdata.get("entrypoint", "")).startswith("sdk")
+
+
+def _pid_record_user_name(pdata: dict) -> str:
+    """The name a human gave this session, or "".
+
+    CC 2.1.268 (2026-09-11) also auto-derives a name for every unnamed
+    session -- `mk-f6`, `data-ad`: the cwd basename plus two hex digits,
+    marked `nameSource: "derived"`. That is a placeholder, not a title, and
+    must not outrank the hook title or the statusline name the way a real
+    `/rename` does. Older CC wrote no `nameSource` at all and only ever
+    wrote a name a user had set, so a missing field reads as "user".
+    """
+    name = pdata.get("name", "")
+    if not name:
+        return ""
+    return name if pdata.get("nameSource", "user") == "user" else ""
+
+
 def parse_sessions(include_archived: bool = False,
                    include_subagents: bool = False,
                    pinned: set[str] | None = None) -> list[Session]:
@@ -832,19 +943,22 @@ def parse_sessions(include_archived: bool = False,
         t_rglob += time.perf_counter() - tg
         session_id = jsonl_path.stem
         is_pinned = session_id in pinned
+        # Every age question below, and the row's own last_activity, ask when
+        # the conversation last moved, not when the file was last written.
+        activity = transcript_activity_time(str(jsonl_path), mtime) or mtime
 
         # A pin is a permanent exemption from every age filter here. It stays
         # until you unpin it, full stop (Max: "pins should stay until I unpin
         # them"). Whether an inactive pin actually SHOWS in the default view
         # is a separate, simpler question: the hide_inactive_pins toggle in
         # _refresh_compute() answers it without touching age at all.
-        is_archived = mtime < active_cutoff
+        is_archived = activity < active_cutoff
         if is_archived and not include_archived and not is_pinned:
             if not _is_session_alive(session_id):
                 tg = time.perf_counter()
                 continue
             is_archived = False
-        if mtime < archive_cutoff and not _is_session_alive(session_id) and not is_pinned:
+        if activity < archive_cutoff and not _is_session_alive(session_id) and not is_pinned:
             tg = time.perf_counter()
             continue
         idx = meta.get(session_id, {})
@@ -866,7 +980,7 @@ def parse_sessions(include_archived: bool = False,
             n_full_scan += 1
 
         tb = time.perf_counter()
-        session = build_session(str(jsonl_path), session_id, project, idx, mtime)
+        session = build_session(str(jsonl_path), session_id, project, idx, activity)
         t_build += time.perf_counter() - tb
         if session:
             # Hide ghost sessions: ≤20 output tokens = just the greeting
@@ -919,21 +1033,25 @@ def parse_sessions(include_archived: bool = False,
             pdata = json.loads(pid_file.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        if pdata.get("kind") != "interactive":
+        if not _pid_record_is_own_session(pdata):
             continue
         # Skip sessions still booting — PID file lands before name/transcript,
         # which would surface as an unactionable "Claude" / WORKING / 0% row.
         # They appear correctly on the next 2s refresh once the transcript exists.
+        # The test is for a USER name: since 2.1.268 CC derives one instantly for
+        # every session, so a present `name` stopped meaning "past booting".
         started_ms = pdata.get("startedAt", 0)
-        if not pdata.get("name") and started_ms and (time.time() - started_ms / 1000.0) < 5:
+        user_name = _pid_record_user_name(pdata)
+        if not user_name and started_ms and (time.time() - started_ms / 1000.0) < 5:
             continue
         # Build title from best available source
         hook = read_hook_state(sid)
         sl_name = _read_session_cache("name", sid)
         title = (
-            pdata.get("name")
+            user_name
             or sl_name
             or (hook.get("title") if hook else "")
+            or pdata.get("name", "")  # CC's derived placeholder, better than "Claude"
             or "Claude"
         )
         status = "done"
@@ -990,7 +1108,7 @@ def parse_sessions(include_archived: bool = False,
                 os.kill(pid, 0)
             except (OSError, json.JSONDecodeError, ValueError):
                 continue
-            if pdata.get("kind") != "interactive":
+            if not _pid_record_is_own_session(pdata):
                 continue
             sid_pids.setdefault(sid, []).append(pdata)
 
@@ -1007,12 +1125,12 @@ def parse_sessions(include_archived: bool = False,
             sib = replace(
                 base,
                 session_id=f"{sid}@{pid}",
-                title=pdata.get("name") or base.title,
+                title=_pid_record_user_name(pdata) or base.title,
                 status=("working" if pstatus == "busy" else
                         "done" if pstatus == "idle" else base.status),
                 last_activity=updated or base.last_activity,
                 context_is_estimate=True,
-                status_name=pdata.get("name") or base.status_name,
+                status_name=_pid_record_user_name(pdata) or base.status_name,
                 # Each PID is its own instance: derive the durable surrogate from
                 # this pid's own startedAt, not the base's. replace() would
                 # otherwise copy one instance_id onto every sibling, tripping the
@@ -1262,6 +1380,7 @@ def _refresh_pid_map() -> None:
     if now - _pid_map_ts < 2:
         return
     _pid_map = {}
+    own_pid: set[str] = set()  # sids mapped to the session's OWN process
     if SESSIONS_DIR.is_dir():
         for path in SESSIONS_DIR.iterdir():
             if path.suffix != ".json":
@@ -1272,10 +1391,23 @@ def _refresh_pid_map() -> None:
                 pid = int(data["pid"])
                 try:
                     os.kill(pid, 0)
-                    _pid_map[sid] = pid  # Alive
                 except OSError:
                     if sid not in _pid_map:  # Don't overwrite alive with dead
                         _pid_map[sid] = None
+                    continue
+                # An SDK child (what `claude -p --resume <sid>` looks like)
+                # can claim a live session's id. It is a real process, so it
+                # still answers "is this session running", but it must never
+                # displace the session's own process here: the orphan pass
+                # reads the mapped pid's record back, finds an SDK record,
+                # and would drop the real row entirely. Last-writer-wins on
+                # a bare dict iteration order made that a coin flip (caught
+                # by the headless before/after capture, 2026-09-11).
+                if _pid_record_is_own_session(data):
+                    _pid_map[sid] = pid
+                    own_pid.add(sid)
+                elif sid not in own_pid:
+                    _pid_map[sid] = pid
             except (json.JSONDecodeError, OSError, KeyError, ValueError):
                 continue
     _pid_map_ts = now
@@ -1732,11 +1864,8 @@ def _thinking_is_stale(session_id: str, hook: dict, transcript_path: str) -> boo
     if hook_age < _THINKING_STALE_S:
         return False
     if transcript_path:
-        try:
-            if time.time() - os.stat(transcript_path).st_mtime < _THINKING_STALE_S:
-                return False
-        except OSError:
-            pass
+        if transcript_is_fresh(transcript_path, _THINKING_STALE_S):
+            return False
     pid = _pid_map.get(session_id) or hook.get("pid")
     if pid:
         try:
@@ -1796,11 +1925,8 @@ def determine_status(session_id: str, last_assistant_time: float,
         # Hook says idle, but if the transcript itself is being appended to,
         # the model is streaming: slash commands and a few other paths can
         # miss UserPromptSubmit so the hook never flips.
-        try:
-            if time.time() - os.stat(transcript_path).st_mtime < 5:
-                return True
-        except OSError:
-            pass
+        if transcript_is_fresh(transcript_path, 5):
+            return True
         return count_background_activity(transcript_path) > 0
 
     # Tier 1: hook state files (real-time, event-driven)
