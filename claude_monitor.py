@@ -882,6 +882,12 @@ def _pid_record_is_own_session(pdata: dict) -> bool:
     an entrypoint this monitor has never heard of should surface as a row
     rather than vanish. A phantom row is noise; a missing session is the
     failure the whole app exists to prevent.
+
+    Not to be merged with `Session.is_scheduled` (`entrypoint not in ("",
+    "cli")`), which reads the same field to answer a different question. That
+    one asks whether a run that DID leave a transcript is a headless one worth
+    collapsing behind a single `↻` row; this one asks whether a PID record is
+    a session at all. Hence the looser rule there and the narrow denylist here.
     """
     if pdata.get("kind") != "interactive":
         return False
