@@ -2001,6 +2001,15 @@ class TestASessionWithNoWindowIsNotResumed:
 
     # --- who owns the tty --------------------------------------------------
 
+    def test_it_maps_every_pane_on_every_socket_in_one_probe(self):
+        """The layout save asks about every live session at once; a probe per
+        session would mean a subprocess round per session per socket."""
+        from claude_monitor import tmux_panes_by_tty
+        with self._tmux(self.PANES):
+            panes = tmux_panes_by_tty()
+        assert set(panes) == {"/dev/ttys016", "/dev/ttys021"}
+        assert panes["/dev/ttys016"].target == "work:0.0"
+
     def test_it_finds_the_pane_holding_that_tty(self):
         from claude_monitor import tmux_pane_for_tty
         with self._tmux(self.PANES):

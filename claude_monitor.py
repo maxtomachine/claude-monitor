@@ -1902,19 +1902,15 @@ class TmuxPane(NamedTuple):
         return f"{Path(self.socket).name}:{self.target}"
 
 
-def tmux_pane_for_tty(tty: str) -> TmuxPane | None:
-    """The tmux pane holding this tty, or None.
+def tmux_panes_by_tty() -> dict[str, TmuxPane]:
+    """Every pane on every one of this user's tmux servers, keyed by its tty.
 
-    A session running under tmux holds a pty like any other, so `ps -o tty=`
-    cannot tell it from a session sitting in a Ghostty tab: both answer with a
-    ttysNNN. Only tmux knows which ptys are its own. Called on the jump failure
-    path alone, never on the refresh, and every socket shares one deadline
-    because the menu handler that calls it runs on the UI thread. A machine
-    without tmux simply gets "".
+    One probe answers for the whole fleet. The single-tty lookup used to run
+    its own probe, which was fine for a jump but not for the layout save,
+    where asking per session would have meant one subprocess round per live
+    session against every socket.
     """
-    if not tty:
-        return None
-    want = tty if tty.startswith("/dev/") else "/dev/" + tty
+    panes: dict[str, TmuxPane] = {}
     deadline = time.time() + _TMUX_PROBE_BUDGET_S
     for sock in tmux_socket_paths():
         left = deadline - time.time()
@@ -1930,9 +1926,45 @@ def tmux_pane_for_tty(tty: str) -> TmuxPane | None:
             continue
         for line in out.splitlines():
             pane_tty, _, target = line.partition("\t")
-            if pane_tty == want and target:
-                return TmuxPane(sock, target)
-    return None
+            if pane_tty and target:
+                panes.setdefault(pane_tty, TmuxPane(sock, target))
+    return panes
+
+
+def tmux_pane_for_tty(tty: str, panes: dict[str, TmuxPane] | None = None) -> TmuxPane | None:
+    """The tmux pane holding this tty, or None.
+
+    A session running under tmux holds a pty like any other, so `ps -o tty=`
+    cannot tell it from a session sitting in a Ghostty tab: both answer with a
+    ttysNNN. Only tmux knows which ptys are its own. Called on the jump failure
+    path alone, never on the refresh, and every socket shares one deadline
+    because the menu handler that calls it runs on the UI thread. A machine
+    without tmux simply gets "".
+    """
+    if not tty:
+        return None
+    want = tty if tty.startswith("/dev/") else "/dev/" + tty
+    return (tmux_panes_by_tty() if panes is None else panes).get(want)
+
+
+def tmux_sessions_by_sid(sessions: list["Session"]) -> dict[str, TmuxPane]:
+    """The live sessions that live in a tmux pane, keyed by conversation id.
+
+    A session in a pane has no Ghostty tab, so nothing that reads the window
+    list can see it: it is missing from a layout save, and a restore that
+    cannot name it cannot bring it back.
+    """
+    panes = tmux_panes_by_tty()
+    if not panes:
+        return {}
+    found = {}
+    for sess in sessions:
+        hook = read_hook_state(sess.session_id) or {}
+        tty = hook.get("tty", "")
+        pane = tmux_pane_for_tty(tty, panes) if tty else None
+        if pane:
+            found[base_sid(sess.session_id)] = pane
+    return found
 
 
 def _reach_or_report(session: "Session") -> tuple[bool, str]:
@@ -3462,6 +3494,7 @@ def save_layout(sessions: list[Session] | None = None) -> dict:
         return {"ok": False, "reason": reason,
                 "summary": {"windows": 0, "claudes": 0, "newly_pinned": 0, "unresolved_tabs": 0}}
     layout = _layout_from_snapshot(raw, sessions)
+    _add_tmux_windows(layout, sessions)
     previous = load_layout()
     if previous and "pinned_before" in previous:
         layout["pinned_before"] = previous["pinned_before"]
@@ -3491,6 +3524,33 @@ def save_layout(sessions: list[Session] | None = None) -> dict:
     return layout
 
 
+def _add_tmux_windows(layout: dict, sessions: list[Session]) -> None:
+    """Add the live sessions that live in a tmux pane to a layout read from
+    Ghostty, which by construction cannot see them.
+
+    Each gets a window of its own, so the compaction pass folds them in with
+    every other single-tab window instead of treating them as a group someone
+    arranged on purpose. Mutates `layout`.
+    """
+    have = {base_sid(t["sid"]) for w in layout.get("windows", [])
+            for t in w["tabs"] if t.get("sid")}
+    by_sid = {base_sid(x.session_id): x for x in sessions}
+    added = 0
+    for sid, pane in tmux_sessions_by_sid(sessions).items():
+        if sid in have:
+            continue        # someone is already attached to it in a tab
+        sess = by_sid.get(sid)
+        if sess is None:
+            continue
+        layout.setdefault("windows", []).append({
+            "frame": [0, 0, 0, 0], "active": 0,
+            "tabs": [{"sid": sid, "title": sess.title, "tmux": pane.label}],
+        })
+        added += 1
+    if added:
+        mlog("layout", "tmux_sessions_added", count=added)
+
+
 def load_layout() -> dict | None:
     try:
         return json.loads(LAYOUT_PATH.read_text())
@@ -3505,7 +3565,8 @@ def _restore_plan(layout: dict, sessions: list[Session],
                   live_sids: set[str] | None = None,
                   visible_sid8s: set[str] | None = None,
                   monitor_running: bool = False,
-                  compact: bool = True) -> tuple[list[dict], list[str], list[str]]:
+                  compact: bool = True,
+                  tmux_by_sid: dict[str, TmuxPane] | None = None) -> tuple[list[dict], list[str], list[str]]:
     """Turn a saved layout into concrete launch steps. Pure. Returns
     (windows_to_build, missing_sids, skipped_live_sids).
 
@@ -3523,6 +3584,7 @@ def _restore_plan(layout: dict, sessions: list[Session],
     by_sid = {base_sid(s.session_id): s for s in sessions}
     live_sids = {base_sid(x) for x in (live_sids or set())}
     visible_sid8s = visible_sid8s or set()
+    tmux_by_sid = tmux_by_sid or {}
     plan, missing, skipped_live = [], [], []
     # One conversation, one tab: a layout can hold the same sid twice (the
     # same session open in two terminals at save time). Resuming it twice
@@ -3547,8 +3609,19 @@ def _restore_plan(layout: dict, sessions: list[Session],
                 else:
                     sid = base_sid(sid)
                     sess = by_sid.get(sid)
+                    pane = tmux_by_sid.get(sid)
                     if sess is None or not (sess.transcript_path and Path(sess.transcript_path).exists()):
                         missing.append(sid)
+                    elif pane is not None:
+                        # Living in a pane, not in a window. Being live is
+                        # the reason to attach rather than the reason to
+                        # skip: there is a terminal to reach, just not one
+                        # Ghostty is holding.
+                        if sid not in planned_sids:
+                            planned_sids.add(sid)
+                            entry = {"cmd": _tmux_attach_commands(sess, pane,
+                                                                 stamp=False)[0],
+                                     "label": sess.title}
                     elif sid in live_sids or sid[:8] in visible_sid8s:
                         skipped_live.append(sid)
                     elif sid in planned_sids:
@@ -3738,7 +3811,8 @@ def restore_layout(restore_pins: bool = False, compact: bool = True,
     monitor_running = _a_monitor_is_running()
     plan, missing, skipped_live = _restore_plan(
         layout, sessions, live_sids=live, visible_sid8s=visible,
-        monitor_running=monitor_running, compact=compact)
+        monitor_running=monitor_running, compact=compact,
+        tmux_by_sid=tmux_sessions_by_sid(sessions))
     if dry_run:
         return {"ok": True, "dry_run": True, "windows_planned": len(plan),
                 "tabs_planned": sum(len(w["tabs"]) for w in plan),
@@ -4046,6 +4120,30 @@ def _open_ghostty_window(zsh_cmd: str, fallback_cmd: str) -> str:
         return ""
 
 
+def _tmux_attach_commands(session: "Session", pane: TmuxPane,
+                          stamp: bool = True) -> tuple[str, str]:
+    """(command for a Ghostty surface, plain command) that attach to a pane.
+
+    Shared by the jump and the layout restore, which must open the same
+    window for the same session however it was asked for. Pure.
+
+    `stamp` marks the window with the session's own title so later jumps
+    find it the ordinary way. The layout restore passes False: it applies
+    its own unique stamp to the first tab of every window and finds the
+    window in the AX tree by it, and a second stamp running a microsecond
+    later would erase the one the builder is looking for. (Seen while
+    driving a restore: both printfs in one command, the layout stamp gone
+    before the window could be framed. A resumed tab gets away with it
+    because `claude` takes long enough to start.)
+    """
+    cwd = session.cwd if session.cwd and Path(session.cwd).is_dir() else str(Path.home())
+    cmd = f"tmux -S {shlex.quote(pane.socket)} attach -t {shlex.quote(pane.session)}"
+    name = (session.title or session.session_id[:8])[:32]
+    title = f"✳ {name} ·{session.session_id[:8]}" if stamp else ""
+    return (_ghostty_surface_command(cwd, cmd, title_stamp=title),
+            f"cd {shlex.quote(cwd)} && {cmd}")
+
+
 def attach_tmux_pane(session: "Session", pane: TmuxPane) -> bool:
     """Open a window attached to the tmux pane a session is running in.
 
@@ -4059,12 +4157,8 @@ def attach_tmux_pane(session: "Session", pane: TmuxPane) -> bool:
     session finds the window directly and never reaches this path again (tmux
     only overwrites that title when set-titles is on).
     """
-    cwd = session.cwd if session.cwd and Path(session.cwd).is_dir() else str(Path.home())
-    cmd = f"tmux -S {shlex.quote(pane.socket)} attach -t {shlex.quote(pane.session)}"
-    name = (session.title or session.session_id[:8])[:32]
-    zsh_cmd = _ghostty_surface_command(
-        cwd, cmd, title_stamp=f"✳ {name} ·{session.session_id[:8]}")
-    via = _open_ghostty_window(zsh_cmd, f"cd {shlex.quote(cwd)} && {cmd}")
+    zsh_cmd, plain = _tmux_attach_commands(session, pane)
+    via = _open_ghostty_window(zsh_cmd, plain)
     mlog("jump", "tmux_attach", sid=session.session_id[:12], title=session.title,
          pane=pane.label, via=via or "failed")
     return bool(via)

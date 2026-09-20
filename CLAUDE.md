@@ -394,6 +394,24 @@ shipped the bare command and so never fired on the session it was written for.
 Every socket shares one deadline, because the menu handler calling it runs on
 the UI thread.
 
+The layout knows about panes too. `_snapshot_ghostty_layout()` reads windows,
+so a pane session is invisible to it: it was absent from every save and gone
+after a restore. `_add_tmux_windows()` appends one single-tab window per pane
+session after the snapshot (single so the compaction pass folds them in with
+everything else rather than treating them as a group someone arranged), and
+the restore plan attaches to them instead of skipping them as live. Being live
+is the reason to attach, not the reason to skip: there is a terminal to reach,
+just not one Ghostty is holding. The panes are probed once for the whole fleet
+(`tmux_panes_by_tty()`), since asking per session would mean a subprocess round
+per session per socket.
+
+One rule where those two meet: the restore's attach carries no title stamp of
+its own. The plan stamps each window's first tab with a unique marker and finds
+the window in the AX tree by it; a second stamp a microsecond later erases the
+one the builder is looking for, and the window never gets framed. A resumed tab
+survives the same collision only because `claude` takes long enough to start.
+Seen while driving a restore, not by any test.
+
 Still open: the menu offers Resume on a session that is running, and the row
 does not say where it lives until you jump. Marking such a row, and disabling
 (never deleting, per the phantom-row-versus-missing-session rule above) the
