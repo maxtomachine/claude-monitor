@@ -495,3 +495,121 @@ class TestJumpbackNeverSilentlyNoOps:
 
     def test_walk_error_is_retried_not_treated_as_absence(self):
         assert self._run("err:walk:boom").startswith("err:")
+
+
+class TestASessionInAPaneIsNotLostFromTheLayout:
+    """A session spawned by another session runs in a tmux pane with no
+    Ghostty tab (Max, 2026-09-20, after one such session could not be jumped
+    to). The AX read that builds a layout can only see windows, so without
+    this the session is absent from the save and gone after a restore."""
+
+    PANE = cm.TmuxPane("/private/tmp/tmux-502/claude-2550", "footholds:0.0")
+
+    def _saved(self, tmp_path, monkeypatch, sessions, raw, panes):
+        monkeypatch.setattr(cm, "PINNED_PATH", tmp_path / "pinned.json")
+        monkeypatch.setattr(cm, "LAYOUT_PATH", tmp_path / "layout.json")
+        with patch("claude_monitor._snapshot_ghostty_layout", return_value=raw), \
+             patch("claude_monitor.tmux_sessions_by_sid", return_value=panes):
+            return save_layout(sessions=sessions)
+
+    def test_save_records_a_session_that_has_no_tab(self, tmp_path, monkeypatch):
+        tabbed = make_session(session_id="aaaaaaaa-0000", title="a")
+        paned = make_session(session_id="bbbbbbbb-0000", title="frontier-footholds")
+        raw = [_win((0, 0, 0, 0), ("✳ a ·aaaaaaaa", True))]
+        layout = self._saved(tmp_path, monkeypatch, [tabbed, paned], raw,
+                             {"bbbbbbbb-0000": self.PANE})
+        tabs = [t for w in layout["windows"] for t in w["tabs"]]
+        assert [t["sid"] for t in tabs] == ["aaaaaaaa-0000", "bbbbbbbb-0000"]
+        assert tabs[1]["tmux"] == "claude-2550:footholds:0.0"
+        assert layout["summary"]["claudes"] == 2
+
+    def test_a_pane_session_is_pinned_like_any_other(self, tmp_path, monkeypatch):
+        """Pinning on save is what keeps a session from ageing out of the
+        monitor while Ghostty is closed, and a pane session is exactly the
+        one nothing else would hold on to."""
+        paned = make_session(session_id="bbbbbbbb-0000", title="frontier-footholds")
+        raw = [_win((0, 0, 0, 0), ("plain shell", True))]
+        self._saved(tmp_path, monkeypatch, [paned], raw, {"bbbbbbbb-0000": self.PANE})
+        assert cm.load_pinned_sessions() == {"bbbbbbbb-0000"}
+
+    def test_it_is_not_added_twice_when_a_tab_already_holds_it(self, tmp_path, monkeypatch):
+        """Someone already attached to the pane in a Ghostty tab: that tab is
+        the session's place in the layout, and a second entry would restore a
+        second window onto the same conversation."""
+        paned = make_session(session_id="bbbbbbbb-0000", title="frontier-footholds")
+        raw = [_win((0, 0, 0, 0), ("✳ frontier-footholds ·bbbbbbbb", True))]
+        layout = self._saved(tmp_path, monkeypatch, [paned], raw,
+                             {"bbbbbbbb-0000": self.PANE})
+        assert len([t for w in layout["windows"] for t in w["tabs"]]) == 1
+
+    def test_a_pane_with_no_session_of_ours_is_ignored(self, tmp_path, monkeypatch):
+        """A pane holding something that is not one of these sessions (a
+        shell, another user's work) is not a row to restore."""
+        raw = [_win((0, 0, 0, 0), ("plain shell", True))]
+        layout = self._saved(tmp_path, monkeypatch, [], raw, {"cccccccc-0000": self.PANE})
+        assert [t for w in layout["windows"] for t in w["tabs"] if t.get("sid")] == []
+
+    def _plan(self, live, panes, transcript=True, tmp_path=None):
+        t = (tmp_path / "b.jsonl") if tmp_path else None
+        if t:
+            t.write_text("{}")
+        sess = make_session(session_id="bbbbbbbb-0000", title="frontier-footholds",
+                            transcript_path=str(t) if transcript and t else "/nope/gone.jsonl",
+                            cwd=str(tmp_path) if tmp_path else "/tmp",
+                            project_path=str(tmp_path) if tmp_path else "/tmp")
+        layout = {"windows": [{"frame": [0, 0, 0, 0], "active": 0,
+                               "tabs": [{"sid": "bbbbbbbb-0000", "title": "frontier-footholds"}]}]}
+        return _restore_plan(layout, [sess],
+                             live_sids={"bbbbbbbb-0000"} if live else set(),
+                             tmux_by_sid=panes)
+
+    def test_restore_attaches_to_the_pane_and_never_resumes(self, tmp_path):
+        """Being live is the reason to attach, not the reason to skip: there
+        is a terminal to reach, just not one Ghostty is holding."""
+        plan, missing, skipped = self._plan(live=True, panes={"bbbbbbbb-0000": self.PANE}, tmp_path=tmp_path)
+        cmds = [t["cmd"] for w in plan for t in w["tabs"]]
+        assert len(cmds) == 1
+        assert "tmux -S /private/tmp/tmux-502/claude-2550 attach -t footholds" in cmds[0]
+        assert "--resume" not in cmds[0]
+        assert (missing, skipped) == ([], [])
+
+    def test_a_pane_that_is_gone_by_restore_time_is_handled_as_before(self, tmp_path):
+        """tmux dies with the machine. With no pane the session is just a
+        live session again, and a live session is skipped, never duplicated."""
+        plan, missing, skipped = self._plan(live=True, panes={}, tmp_path=tmp_path)
+        assert (plan, missing, skipped) == ([], [], ["bbbbbbbb-0000"])
+
+    def test_a_dead_session_with_no_pane_still_resumes(self, tmp_path):
+        plan, _, skipped = self._plan(live=False, panes={}, tmp_path=tmp_path)
+        cmds = [t["cmd"] for w in plan for t in w["tabs"]]
+        assert "--resume bbbbbbbb-0000" in cmds[0] and skipped == []
+
+    def test_a_missing_transcript_still_wins_over_a_pane(self, tmp_path):
+        """Nothing to attach to if the conversation itself is gone."""
+        plan, missing, _ = self._plan(live=True, panes={"bbbbbbbb-0000": self.PANE},
+                                      transcript=False, tmp_path=tmp_path)
+        assert (plan, missing) == ([], ["bbbbbbbb-0000"])
+
+    def test_the_same_pane_session_saved_twice_gets_one_tab(self, tmp_path):
+        t = tmp_path / "b.jsonl"; t.write_text("{}")
+        sess = make_session(session_id="bbbbbbbb-0000", title="frontier-footholds",
+                            transcript_path=str(t), cwd=str(tmp_path),
+                            project_path=str(tmp_path))
+        tab = {"sid": "bbbbbbbb-0000", "title": "frontier-footholds"}
+        layout = {"windows": [{"frame": [0, 0, 0, 0], "active": 0, "tabs": [tab, dict(tab)]}]}
+        plan, _, skipped = _restore_plan(layout, [sess], live_sids={"bbbbbbbb-0000"},
+                                         tmux_by_sid={"bbbbbbbb-0000": self.PANE})
+        assert sum(len(w["tabs"]) for w in plan) == 1
+        assert skipped == []      # the duplicate is dropped, not reported as skipped
+
+    def test_the_attach_does_not_stamp_over_the_layout_stamp(self, tmp_path):
+        """The builder finds each window in the AX tree by the unique stamp
+        the plan puts on its first tab. A second stamp a microsecond later
+        erases it, and the window cannot be framed (seen while driving a
+        restore); a resumed tab gets away with it only because `claude`
+        takes long enough to start."""
+        plan, _, _ = self._plan(live=True, panes={"bbbbbbbb-0000": self.PANE},
+                                tmp_path=tmp_path)
+        cmd = plan[0]["tabs"][0]["cmd"]
+        assert cmd.count("\\033]0;") == 1
+        assert cm.LAYOUT_STAMP_PREFIX in cmd

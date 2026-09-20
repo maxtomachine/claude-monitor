@@ -253,9 +253,40 @@ This also quietly fixes acks. `_effective_seen_count()` voids a seen-mark when
 every READY row Max had already checked, which is some of the "they are
 turning yellow on me" he reported in August and we only half explained then.
 
+### Two witnesses, and the later one wins
+
+Reading activity off the transcript alone reads a live session as dormant,
+which is the same bug pointing the other way. Reopening a session appends
+records that carry no timestamp of their own (`mode`, `permission-mode`,
+`atis-latch`, `bridge-session`), so the file grows while its newest timestamp
+stays put. On 2026-09-19 a session Max had resumed minutes earlier still
+answered with its last message, 28 hours back: past the archive cutoff, so
+`parse_sessions()` handed it back labelled `archived`, and being pinned with
+`hide_inactive_pins` on it left the table altogether while he was working in
+it ("frontier-curve is active but not showing in monitor even after a
+refresh"). Measured on the file at 20:03 that evening: mtime seconds old, last
+timestamp anywhere in its final 200KB from 16:15 the day before.
+
+So `last_activity` is now `max(transcript_activity_time, hook_activity_time)`.
+The transcript knows when the conversation moved; the session's own state file
+(`~/.claude/session-states/<sid>.json`, written by the hooks on every state
+change) knows when the SESSION moved, which covers the resume. Nothing
+rewrites those in bulk the way the updater rewrites transcripts: measured the
+same way on the same machine, across 172 of them not one second holds five or
+more, so the touch wave that started all this moves neither witness.
+
+A state-file stamp in the future is not evidence that something just happened,
+so past a minute of clock jitter it is thrown away and the transcript answers
+alone. The first cut clamped it to now instead, which dated a five-day-dead
+session `0s`, caught by driving the app rather than by the tests, which is
+twice in a row now that the before/after capture found what unit tests could
+not.
+
 The general rule, the same one the PID-file section ends on: the monitor reads
 files it does not own. When a reading can be produced by something other than
-the thing it is meant to measure, measure the thing instead.
+the thing it is meant to measure, measure the thing instead. And when one
+witness cannot see the whole thing, add the second witness rather than
+sharpening the first.
 
 
 ## A PID file is not always a session
@@ -307,6 +338,93 @@ Assume this class of change recurs: CC owns those files, the monitor only
 reads them. When a new field appears, ask what the monitor was inferring
 from its absence.
 
+
+## Alive does not mean reachable
+
+The jump had two worlds: the window was found, or the session was dead and
+could be resumed. "Alive but no window" was treated as an anomaly to heal,
+on the premise written into the code itself: "If the session's process is
+alive, its window exists SOMEWHERE."
+
+It does not. A session spawned by another session runs under tmux with no
+window anywhere (Max, 2026-09-19, on one a desk had spawned minutes earlier:
+"both &frontier-curve and &watchman and monitor itself show that
+&frontier-footholds is active, but jumping from monitor to it throws an
+error"). Discovery is title-based, and the `·sid8` marker the hooks stamp
+lands on the tmux pane title, never on a window title, so all three discovery
+phases miss it at once and always will.
+
+The toast then said "Window not found. Press Enter → Resume to open in a new
+tab", which pointed at the one action the code refuses everywhere else: Claude
+Code runs one process per conversation, and a second `claude --resume <sid>`
+is killed by its single-instance guard. The layout restore path has skipped
+live sessions as `skipped_live` from the start and the jump path refuses them
+too, but the menu's own Resume item had no such guard, so the toast routed
+Max to the single unguarded path in the file. That guard now lives in
+`resume_session()` itself, one choke point instead of three call sites, which
+immediately caught a fourth: the `/rename` fallback resumed any session whose
+terminal it could not reach.
+
+`_reach_or_report()` decides between the two worlds by asking tmux, the only
+witness that can tell them apart: a session under tmux holds a pty like any
+other, so `ps -o tty=` reports a ttysNNN for a Ghostty tab and a tmux pane
+alike. If tmux owns the tty, **that is the jump**: a window opens attached to
+it (Max, the morning after: "i want to be able to jump to spawned claudes").
+Attaching a second client shares the view rather than stealing it, and it
+never starts a second process the way resuming would. The window is stamped
+with the session's own `·sid8` title first, so ordinary title discovery finds
+it from then on and the next jump never reaches this path. If tmux does not
+own the tty, this is the 2026-06-21 case (a real tab whose title CC's
+auto-title clobbered) and the heal and retry still happen. Neither outcome
+mentions Resume.
+
+Attaching, rather than requiring every spawner to open a window, is the choice
+that holds, and the reason is worth keeping straight because the founding case
+has since been fixed at its source. The session that spawned this one had
+tried: it ran `cc-spawn` (what `/spawn` calls, Ghostty-only, no tmux anywhere
+in it) and osascript died in its sandbox with a LaunchServices error, so it
+improvised with the Tmux tool and reported the session as spawned. On
+2026-09-20 Max exempted `cc-spawn` from the sandbox
+(`sandbox.excludedCommands`), so `/spawn` opens a real window again from any
+session, and that particular wall is gone.
+
+The monitor still attaches, for three reasons that outlive the fix. A session
+already in a pane stays there. The exemption names one command, so anything
+else that stands a session up outside Ghostty still produces a paneless
+session. And a monitor that can only reach sessions started the blessed way is
+a monitor that reports whatever it can see rather than what is running, which
+is the failure this whole file exists to argue against.
+
+Two things about that probe. It runs on the jump failure path only, never on
+the refresh. And it must name a socket: a bare `tmux list-panes` talks to the
+socket called `default`, which does not exist on this machine, where every
+spawned session gets its own `claude-<pid>` server; the first cut of this fix
+shipped the bare command and so never fired on the session it was written for.
+Every socket shares one deadline, because the menu handler calling it runs on
+the UI thread.
+
+The layout knows about panes too. `_snapshot_ghostty_layout()` reads windows,
+so a pane session is invisible to it: it was absent from every save and gone
+after a restore. `_add_tmux_windows()` appends one single-tab window per pane
+session after the snapshot (single so the compaction pass folds them in with
+everything else rather than treating them as a group someone arranged), and
+the restore plan attaches to them instead of skipping them as live. Being live
+is the reason to attach, not the reason to skip: there is a terminal to reach,
+just not one Ghostty is holding. The panes are probed once for the whole fleet
+(`tmux_panes_by_tty()`), since asking per session would mean a subprocess round
+per session per socket.
+
+One rule where those two meet: the restore's attach carries no title stamp of
+its own. The plan stamps each window's first tab with a unique marker and finds
+the window in the AX tree by it; a second stamp a microsecond later erases the
+one the builder is looking for, and the window never gets framed. A resumed tab
+survives the same collision only because `claude` takes long enough to start.
+Seen while driving a restore, not by any test.
+
+Still open: the menu offers Resume on a session that is running, and the row
+does not say where it lives until you jump. Marking such a row, and disabling
+(never deleting, per the phantom-row-versus-missing-session rule above) the
+Resume item, is the next step.
 
 ## Jump discovery must never rely on System Events alone
 

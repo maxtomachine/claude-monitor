@@ -15,6 +15,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
+from typing import NamedTuple
 
 def _escape_markup(text: str) -> str:
     """Escape all [ for Textual markup (rich.markup.escape misses some)."""
@@ -438,6 +439,17 @@ def parse_timestamp(ts: str) -> float:
 # So activity is read from the transcript's own last timestamp. The tail is
 # enough (entries are appended, and 64KB covers many), and the result is cached
 # by mtime, so a touched file is re-read once rather than on every 3s refresh.
+#
+# That alone reads a live session as dormant, which is the same bug pointing the
+# other way. Reopening a session appends records that carry no timestamp of
+# their own (mode, permission-mode, atis-latch, bridge-session), so on
+# 2026-09-19 a session Max had just resumed still answered with its last
+# message, 28 hours earlier: it crossed the archive cutoff, and being pinned
+# with hide_inactive_pins on, it left the table entirely while he was working in
+# it ("frontier-curve is active but not showing in monitor even after a
+# refresh"). Hence two witnesses, taking the later: the transcript knows when
+# the conversation moved, the session's own state file knows when the session
+# did, and a wave of touched files moves neither.
 _TS_RE = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')  # CC writes it tight, but don't depend on that
 _TAIL_BYTES = 65536
 _activity_cache: dict[str, tuple[float, float]] = {}  # path -> (mtime, activity)
@@ -471,6 +483,30 @@ def transcript_activity_time(path: str, mtime: float | None = None) -> float:
         activity = 0.0
     _activity_cache[path] = (mtime, activity)
     return activity
+
+
+def hook_activity_time(session_id: str) -> float:
+    """When the session's own hooks last said it was doing something.
+
+    The transcript's own timestamps answer that for a conversation, but not
+    for a session that was just reopened: the records Claude Code writes on a
+    resume (mode, permission-mode, bridge-session) carry no timestamp of their
+    own, so a session resumed after a day of silence still reads a day old no
+    matter how much has been appended since. Its state file does carry one, and
+    nothing rewrites those in bulk the way the updater rewrites transcripts:
+    measured the same way on the same machine, across 172 of them not one
+    second holds five or more (2026-09-19). A stamp in the future is not
+    evidence that something just happened, so past a minute of clock jitter it
+    is no evidence at all and the transcript answers alone: a skewed clock
+    should cost this witness its vote, not hand it a veto. Clamping such a
+    stamp to now instead dated a five-day-dead session 0s, seen while driving
+    the app the day this was written.
+    """
+    hook = read_hook_state(session_id)
+    if not hook:
+        return 0.0
+    stamp = parse_timestamp(hook.get("timestamp", ""))
+    return stamp if stamp <= time.time() + 60 else 0.0
 
 
 def transcript_is_fresh(path: str, within: float) -> bool:
@@ -944,8 +980,13 @@ def parse_sessions(include_archived: bool = False,
         session_id = jsonl_path.stem
         is_pinned = session_id in pinned
         # Every age question below, and the row's own last_activity, ask when
-        # the conversation last moved, not when the file was last written.
-        activity = transcript_activity_time(str(jsonl_path), mtime) or mtime
+        # the session last moved, not when its file was last written. Two
+        # witnesses answer that, and the later one wins: neither sees
+        # everything on its own (see the note above _TS_RE).
+        activity = max(
+            transcript_activity_time(str(jsonl_path), mtime),
+            hook_activity_time(session_id),
+        ) or mtime
 
         # A pin is a permanent exemption from every age filter here. It stays
         # until you unpin it, full stop (Max: "pins should stay until I unpin
@@ -1821,6 +1862,140 @@ def _heal_hook_state(session_id: str) -> None:
         mlog("heal", "osc_restamped", sid=session_id[:12], tty=tty, title=title)
     except (OSError, json.JSONDecodeError):
         pass
+
+
+_TMUX_PROBE_BUDGET_S = 2.0  # one budget for every socket, not each
+
+
+def tmux_socket_paths() -> list[str]:
+    """Every tmux server socket belonging to this user.
+
+    A bare `tmux list-panes` talks to the socket named `default`, and on this
+    machine that socket does not exist: each session spawned under tmux gets
+    its own server on a named socket (`claude-<pid>`), so the bare command
+    answers "error connecting to /private/tmp/tmux-502/default" and nothing
+    else. The first cut of this fix shipped that bare command and so never
+    fired on the very session it was written for.
+    """
+    root = os.environ.get("TMUX_TMPDIR") or "/tmp"
+    try:
+        return [str(p) for p in (Path(root) / f"tmux-{os.getuid()}").iterdir()
+                if p.is_socket()]
+    except OSError:
+        return []
+
+
+class TmuxPane(NamedTuple):
+    """Where a session actually lives when it lives in tmux."""
+    socket: str          # the server's socket path, needed to talk to it at all
+    target: str          # session:window.pane, precise enough to name in a message
+
+    @property
+    def session(self) -> str:
+        """What `attach -t` takes. A spawned worker has one window in one
+        session, so attaching by session name lands on it, and the plain form
+        is the one every tmux accepts without argument about it."""
+        return self.target.split(":")[0]
+
+    @property
+    def label(self) -> str:
+        return f"{Path(self.socket).name}:{self.target}"
+
+
+def tmux_panes_by_tty() -> dict[str, TmuxPane]:
+    """Every pane on every one of this user's tmux servers, keyed by its tty.
+
+    One probe answers for the whole fleet. The single-tty lookup used to run
+    its own probe, which was fine for a jump but not for the layout save,
+    where asking per session would have meant one subprocess round per live
+    session against every socket.
+    """
+    panes: dict[str, TmuxPane] = {}
+    deadline = time.time() + _TMUX_PROBE_BUDGET_S
+    for sock in tmux_socket_paths():
+        left = deadline - time.time()
+        if left <= 0:
+            break
+        try:
+            out = subprocess.check_output(
+                ["tmux", "-S", sock, "list-panes", "-a", "-F",
+                 "#{pane_tty}\t#{session_name}:#{window_index}.#{pane_index}"],
+                text=True, timeout=left, stderr=subprocess.DEVNULL,
+            )
+        except (subprocess.SubprocessError, OSError):
+            continue
+        for line in out.splitlines():
+            pane_tty, _, target = line.partition("\t")
+            if pane_tty and target:
+                panes.setdefault(pane_tty, TmuxPane(sock, target))
+    return panes
+
+
+def tmux_pane_for_tty(tty: str, panes: dict[str, TmuxPane] | None = None) -> TmuxPane | None:
+    """The tmux pane holding this tty, or None.
+
+    A session running under tmux holds a pty like any other, so `ps -o tty=`
+    cannot tell it from a session sitting in a Ghostty tab: both answer with a
+    ttysNNN. Only tmux knows which ptys are its own. Called on the jump failure
+    path alone, never on the refresh, and every socket shares one deadline
+    because the menu handler that calls it runs on the UI thread. A machine
+    without tmux simply gets "".
+    """
+    if not tty:
+        return None
+    want = tty if tty.startswith("/dev/") else "/dev/" + tty
+    return (tmux_panes_by_tty() if panes is None else panes).get(want)
+
+
+def tmux_sessions_by_sid(sessions: list["Session"]) -> dict[str, TmuxPane]:
+    """The live sessions that live in a tmux pane, keyed by conversation id.
+
+    A session in a pane has no Ghostty tab, so nothing that reads the window
+    list can see it: it is missing from a layout save, and a restore that
+    cannot name it cannot bring it back.
+    """
+    panes = tmux_panes_by_tty()
+    if not panes:
+        return {}
+    found = {}
+    for sess in sessions:
+        hook = read_hook_state(sess.session_id) or {}
+        tty = hook.get("tty", "")
+        pane = tmux_pane_for_tty(tty, panes) if tty else None
+        if pane:
+            found[base_sid(sess.session_id)] = pane
+    return found
+
+
+def _reach_or_report(session: "Session") -> tuple[bool, str]:
+    """A jump found no window for a session that is still running. Two worlds
+    sit behind that, and they want opposite answers.
+
+    A session spawned by another session runs inside tmux with no window of
+    its own (Max, 2026-09-19, on one a desk had spawned minutes earlier: "both
+    &frontier-curve and &watchman and monitor itself show that
+    &frontier-footholds is active, but jumping from monitor to it throws an
+    error", then: "i want to be able to jump to spawned claudes"). Discovery
+    matches window titles and the hooks stamp the marker onto the tmux pane
+    title, so no title search can ever find it. Attaching is the jump.
+
+    The other world is the one this branch was built for on 2026-06-21: a
+    session that does have a tab, whose title CC's own auto-title clobbered,
+    leaving it reachable by ps but not by title. That one is healed and retried.
+
+    Neither may advise Resume. Resuming a live session starts a second process
+    on one conversation, which is why this branch exists at all, and the text
+    it used to carry sent Max to the one menu item that would do it.
+    """
+    hook = read_hook_state(session.session_id) or {}
+    pane = tmux_pane_for_tty(hook.get("tty", ""))
+    if pane:
+        if attach_tmux_pane(session, pane):
+            return True, f"Attached to {session.title[:24]} ({pane.label})"
+        return False, (f"{session.title[:24]} is headless in tmux ({pane.label}); "
+                       f"could not attach.")
+    _heal_hook_state(session.session_id)
+    return False, f"Re-stamped {session.title[:20]}'s tab title. Press Enter → Jump to retry."
 
 
 _hook_state_cache: dict[str, tuple[float, dict]] = {}  # session_id -> (mtime, data)
@@ -3319,6 +3494,7 @@ def save_layout(sessions: list[Session] | None = None) -> dict:
         return {"ok": False, "reason": reason,
                 "summary": {"windows": 0, "claudes": 0, "newly_pinned": 0, "unresolved_tabs": 0}}
     layout = _layout_from_snapshot(raw, sessions)
+    _add_tmux_windows(layout, sessions)
     previous = load_layout()
     if previous and "pinned_before" in previous:
         layout["pinned_before"] = previous["pinned_before"]
@@ -3348,6 +3524,33 @@ def save_layout(sessions: list[Session] | None = None) -> dict:
     return layout
 
 
+def _add_tmux_windows(layout: dict, sessions: list[Session]) -> None:
+    """Add the live sessions that live in a tmux pane to a layout read from
+    Ghostty, which by construction cannot see them.
+
+    Each gets a window of its own, so the compaction pass folds them in with
+    every other single-tab window instead of treating them as a group someone
+    arranged on purpose. Mutates `layout`.
+    """
+    have = {base_sid(t["sid"]) for w in layout.get("windows", [])
+            for t in w["tabs"] if t.get("sid")}
+    by_sid = {base_sid(x.session_id): x for x in sessions}
+    added = 0
+    for sid, pane in tmux_sessions_by_sid(sessions).items():
+        if sid in have:
+            continue        # someone is already attached to it in a tab
+        sess = by_sid.get(sid)
+        if sess is None:
+            continue
+        layout.setdefault("windows", []).append({
+            "frame": [0, 0, 0, 0], "active": 0,
+            "tabs": [{"sid": sid, "title": sess.title, "tmux": pane.label}],
+        })
+        added += 1
+    if added:
+        mlog("layout", "tmux_sessions_added", count=added)
+
+
 def load_layout() -> dict | None:
     try:
         return json.loads(LAYOUT_PATH.read_text())
@@ -3362,7 +3565,8 @@ def _restore_plan(layout: dict, sessions: list[Session],
                   live_sids: set[str] | None = None,
                   visible_sid8s: set[str] | None = None,
                   monitor_running: bool = False,
-                  compact: bool = True) -> tuple[list[dict], list[str], list[str]]:
+                  compact: bool = True,
+                  tmux_by_sid: dict[str, TmuxPane] | None = None) -> tuple[list[dict], list[str], list[str]]:
     """Turn a saved layout into concrete launch steps. Pure. Returns
     (windows_to_build, missing_sids, skipped_live_sids).
 
@@ -3380,6 +3584,7 @@ def _restore_plan(layout: dict, sessions: list[Session],
     by_sid = {base_sid(s.session_id): s for s in sessions}
     live_sids = {base_sid(x) for x in (live_sids or set())}
     visible_sid8s = visible_sid8s or set()
+    tmux_by_sid = tmux_by_sid or {}
     plan, missing, skipped_live = [], [], []
     # One conversation, one tab: a layout can hold the same sid twice (the
     # same session open in two terminals at save time). Resuming it twice
@@ -3404,8 +3609,19 @@ def _restore_plan(layout: dict, sessions: list[Session],
                 else:
                     sid = base_sid(sid)
                     sess = by_sid.get(sid)
+                    pane = tmux_by_sid.get(sid)
                     if sess is None or not (sess.transcript_path and Path(sess.transcript_path).exists()):
                         missing.append(sid)
+                    elif pane is not None:
+                        # Living in a pane, not in a window. Being live is
+                        # the reason to attach rather than the reason to
+                        # skip: there is a terminal to reach, just not one
+                        # Ghostty is holding.
+                        if sid not in planned_sids:
+                            planned_sids.add(sid)
+                            entry = {"cmd": _tmux_attach_commands(sess, pane,
+                                                                 stamp=False)[0],
+                                     "label": sess.title}
                     elif sid in live_sids or sid[:8] in visible_sid8s:
                         skipped_live.append(sid)
                     elif sid in planned_sids:
@@ -3595,7 +3811,8 @@ def restore_layout(restore_pins: bool = False, compact: bool = True,
     monitor_running = _a_monitor_is_running()
     plan, missing, skipped_live = _restore_plan(
         layout, sessions, live_sids=live, visible_sid8s=visible,
-        monitor_running=monitor_running, compact=compact)
+        monitor_running=monitor_running, compact=compact,
+        tmux_by_sid=tmux_sessions_by_sid(sessions))
     if dry_run:
         return {"ok": True, "dry_run": True, "windows_planned": len(plan),
                 "tabs_planned": sum(len(w["tabs"]) for w in plan),
@@ -3863,6 +4080,90 @@ def _ghostty_surface_command(cwd: str, cmd: str, title_stamp: str = "") -> str:
     return f"/bin/zsh -ic {shlex.quote(inner)}"
 
 
+def _open_ghostty_window(zsh_cmd: str, fallback_cmd: str) -> str:
+    """Open a window running a command, through each app's OWN scripting and
+    never a System Events keystroke: any Accessibility-injected keyboard
+    event, real key or fake modifier, fires Claude Nest's push-to-talk as a
+    side effect (observed live 2026-08-15 from a bare terminal osascript with
+    no monitor involved; it reacts to synthetic input generically, not to a
+    particular key). Returns "Ghostty", "Terminal", or "" if neither opened.
+
+    Shared by resume_session() and the tmux attach so that the collision above
+    has exactly one place to come back through.
+    """
+    jxa = f"""(() => {{
+        const zshCmd = {json.dumps(zsh_cmd)};
+        try {{
+            const ghostty = Application("Ghostty");
+            const w = ghostty.newWindow({{withConfiguration: {{command: zshCmd}}}});
+            ghostty.activateWindow(w);
+            return "Ghostty";
+        }} catch (e) {{}}
+
+        // Fall back to Terminal.app (native doScript, no keystroke here either)
+        const term = Application("Terminal");
+        term.activate();
+        term.doScript({json.dumps(fallback_cmd)});
+        return "Terminal";
+    }})()"""
+    try:
+        result = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", jxa],
+            capture_output=True, text=True, timeout=10,
+        )
+        out = result.stdout.strip()
+        if result.returncode == 0 and out in ("Ghostty", "Terminal"):
+            return out
+        return ""
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        mlog("window", "open_error", error=str(e))
+        return ""
+
+
+def _tmux_attach_commands(session: "Session", pane: TmuxPane,
+                          stamp: bool = True) -> tuple[str, str]:
+    """(command for a Ghostty surface, plain command) that attach to a pane.
+
+    Shared by the jump and the layout restore, which must open the same
+    window for the same session however it was asked for. Pure.
+
+    `stamp` marks the window with the session's own title so later jumps
+    find it the ordinary way. The layout restore passes False: it applies
+    its own unique stamp to the first tab of every window and finds the
+    window in the AX tree by it, and a second stamp running a microsecond
+    later would erase the one the builder is looking for. (Seen while
+    driving a restore: both printfs in one command, the layout stamp gone
+    before the window could be framed. A resumed tab gets away with it
+    because `claude` takes long enough to start.)
+    """
+    cwd = session.cwd if session.cwd and Path(session.cwd).is_dir() else str(Path.home())
+    cmd = f"tmux -S {shlex.quote(pane.socket)} attach -t {shlex.quote(pane.session)}"
+    name = (session.title or session.session_id[:8])[:32]
+    title = f"✳ {name} ·{session.session_id[:8]}" if stamp else ""
+    return (_ghostty_surface_command(cwd, cmd, title_stamp=title),
+            f"cd {shlex.quote(cwd)} && {cmd}")
+
+
+def attach_tmux_pane(session: "Session", pane: TmuxPane) -> bool:
+    """Open a window attached to the tmux pane a session is running in.
+
+    This is the jump for a session that has no window of its own. Attaching a
+    second client shares the view rather than stealing it, so it is safe even
+    when someone is already watching that pane, and it never starts a second
+    Claude process the way resuming would.
+
+    The window is stamped with the session's own `·sid8` title first, which is
+    what ordinary title-based discovery looks for, so the next jump to this
+    session finds the window directly and never reaches this path again (tmux
+    only overwrites that title when set-titles is on).
+    """
+    zsh_cmd, plain = _tmux_attach_commands(session, pane)
+    via = _open_ghostty_window(zsh_cmd, plain)
+    mlog("jump", "tmux_attach", sid=session.session_id[:12], title=session.title,
+         pane=pane.label, via=via or "failed")
+    return bool(via)
+
+
 def resume_session(session: Session) -> bool:
     """Resume a Claude session in a new Ghostty window (falls back to Terminal.app).
 
@@ -3879,6 +4180,18 @@ def resume_session(session: Session) -> bool:
     keystroke-only) is dropped rather than left as a latent repeat of the
     same collision for any iTerm2 user: it falls through to Terminal.app.
     """
+    # A live session must never be resumed. Claude Code allows one process per
+    # conversation, so a second `claude --resume <sid>` is killed by its
+    # single-instance guard, and whichever of the two loses is not something
+    # this app gets to choose: the layout restore path has refused it as
+    # `skipped_live` from the start, and the jump path refuses it too. The one
+    # way in was the toast that used to tell Max to press Enter -> Resume on a
+    # session it had just confirmed alive (2026-09-19). Closed here as well, so
+    # the menu item cannot do it even when chosen directly.
+    if _is_session_alive(session.session_id):
+        mlog("resume", "refused_alive", sid=session.session_id[:12], title=session.title)
+        return False
+
     cmd, cwd = _resume_command_for(session)
 
     # Verify the JSONL transcript exists before trying to resume
@@ -3902,31 +4215,11 @@ def resume_session(session: Session) -> bool:
     # when cwd itself contains a single quote.
     inner_cmd = f"cd {shlex.quote(cwd)} && {cmd}"
     zsh_cmd = _ghostty_surface_command(cwd, cmd)
-    jxa = f"""(() => {{
-        const zshCmd = {json.dumps(zsh_cmd)};
-        try {{
-            const ghostty = Application("Ghostty");
-            const w = ghostty.newWindow({{withConfiguration: {{command: zshCmd}}}});
-            ghostty.activateWindow(w);
-            return "Ghostty";
-        }} catch (e) {{}}
-
-        // Fall back to Terminal.app (native doScript — no keystroke here either)
-        const term = Application("Terminal");
-        term.activate();
-        term.doScript({json.dumps(inner_cmd)});
-        return "Terminal";
-    }})()"""
 
     try:
-        result = subprocess.run(
-            ["osascript", "-l", "JavaScript", "-e", jxa],
-            capture_output=True, text=True, timeout=10,
-        )
-        out = result.stdout.strip()
-        mlog("resume", "launched", sid=session.session_id[:12],
-             via=out, rc=result.returncode)
-        if result.returncode == 0 and out in ("Ghostty", "Terminal"):
+        out = _open_ghostty_window(zsh_cmd, inner_cmd)
+        mlog("resume", "launched", sid=session.session_id[:12], via=out or "failed")
+        if out:
             _recently_resumed[session.session_id] = time.time()
             # Force a fresh PID-map read on the next liveness check. Every
             # caller used to have to remember this itself; one (the jump
@@ -5588,13 +5881,9 @@ class ClaudeMonitor(App):
                         mlog("DIVERGE", "alive_but_unfound",
                              sid=s.session_id[:12], title=s.title,
                              candidates=_resolve_match_candidates(s))
-                        # Heal stale hook state — find the real PID/TTY
-                        _heal_hook_state(s.session_id)
-                        self.notify(
-                            f"Window not found for {s.title[:20]}. "
-                            "Press Enter → Resume to open in a new tab.",
-                            timeout=6, severity="warning",
-                        )
+                        ok, msg = _reach_or_report(s)
+                        self.notify(msg, timeout=6,
+                                    severity="information" if ok else "warning")
                     else:
                         ok = resume_session(s)
                         if ok:
@@ -5608,11 +5897,19 @@ class ClaudeMonitor(App):
             elif action == "edit_name":
                 self.action_edit_name()
             elif action == "resume":
-                ok = resume_session(s)
-                if ok:
-                    self.notify(f"Resuming {s.title[:20]}…", timeout=4)
+                if _is_session_alive(s.session_id):
+                    # Refused in resume_session() itself. A running session is
+                    # reached, never restarted: attach to it when it lives in
+                    # tmux, and say why when it does not.
+                    ok, msg = _reach_or_report(s)
+                    self.notify(msg, timeout=6,
+                                severity="information" if ok else "warning")
                 else:
-                    self.notify("Could not open terminal", timeout=4)
+                    ok = resume_session(s)
+                    if ok:
+                        self.notify(f"Resuming {s.title[:20]}…", timeout=4)
+                    else:
+                        self.notify("Could not open terminal", timeout=4)
                 mlog("menu", "resume_result", sid=s.session_id[:12], success=ok)
                 if ok:
                     self.action_clear_search()
@@ -6271,6 +6568,9 @@ class ClaudeMonitor(App):
         ok = _send_to_terminal_session(s, "/rename")
         if ok:
             self.notify(f"Sent /rename to {s.title[:20]}", timeout=3)
+        elif _is_session_alive(s.session_id):
+            ok, msg = _reach_or_report(s)
+            self.notify(msg, timeout=6, severity="information" if ok else "warning")
         else:
             ok = resume_session(s)
             if ok:
@@ -6779,8 +7079,10 @@ def _focus_or_resume_target(target: "Session") -> tuple[bool, str]:
     if _is_session_alive(target.session_id):
         mlog("DIVERGE", "alive_but_unfound", sid=target.session_id[:12], title=target.title,
              candidates=_resolve_match_candidates(target))
-        _heal_hook_state(target.session_id)
-        return False, f"Window not found for {target.title[:20]}. Press Enter → Resume."
+        ok, msg = _reach_or_report(target)
+        if ok:
+            _mark_ready_seen(target.session_id, target.status, target.last_activity)
+        return ok, msg
     if resume_session(target):
         _mark_ready_seen(target.session_id, target.status, target.last_activity)
         return True, f"Resuming {target.title[:20]} in new window"

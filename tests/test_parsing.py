@@ -1,10 +1,11 @@
 """Tests for transcript parsing and session building."""
 
 import json
+import os
 import threading
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import claude_monitor
 from claude_monitor import (
@@ -462,7 +463,11 @@ class TestSessionLiveness:
         transcript = tmp_path / "t.jsonl"
         transcript.write_text("{}\n")
         s = make_session(session_id="sid-1", transcript_path=str(transcript))
+        # The test above resumes the same sid, which leaves it inside the
+        # 60s "recently resumed" grace, and a live session is now refused
+        # before any window is opened. This test is about what the JXA says.
         with patch("claude_monitor.subprocess.run") as run, \
+             patch("claude_monitor._is_session_alive", return_value=False), \
              patch("claude_monitor._derive_cwd_from_transcript", return_value=None):
             run.return_value = type("R", (), {"stdout": "Ghostty", "returncode": 0})()
             resume_session(s)
@@ -1768,3 +1773,404 @@ class TestJumpFindsBackgroundTabsOnEverySpace:
         js = self._script_for(s)
         assert "07a7b852" in js
         assert "tt.includes(sid8)" in js
+
+
+class TestAResumedSessionIsNotDormant:
+    """Reading activity off the transcript's last timestamp fixed dormant
+    sessions floating up as fresh; it broke the mirror case. Reopening a
+    session appends records that carry no timestamp of their own (mode,
+    permission-mode, atis-latch, bridge-session), so on 2026-09-19 a session
+    Max had resumed minutes earlier still answered with its last message, 28
+    hours before: it fell past the archive cutoff, and being pinned with
+    hide_inactive_pins on it left the table altogether while he was working in
+    it. His words: "frontier-curve is active but not showing in monitor even
+    after a refresh."
+
+    So there are two witnesses and the later one wins. The transcript knows
+    when the conversation moved; the session's own state file knows when the
+    session did.
+    """
+
+    SID = "eeeeeeee-0000-0000-0000-00000000000%d"
+
+    def _stamp(self, seconds_ago):
+        from datetime import datetime, timedelta
+        return (datetime.now() - timedelta(seconds=seconds_ago)).isoformat()
+
+    def _hook(self, states, sid, seconds_ago=None, timestamp=None):
+        states.mkdir(parents=True, exist_ok=True)
+        stamp = timestamp if timestamp is not None else self._stamp(seconds_ago)
+        (states / f"{sid}.json").write_text(json.dumps(
+            {"session_id": sid, "state": "busy", "timestamp": stamp}))
+
+    def _resumed_transcript(self, projects, sid, last_message_days):
+        """Last message `last_message_days` ago, then the untimestamped
+        records a reopen appends after it."""
+        from datetime import datetime, timedelta, timezone
+        ts = (datetime.now(timezone.utc)
+              - timedelta(days=last_message_days)).isoformat()
+        p = projects / f"{sid}.jsonl"
+        p.write_text(
+            make_transcript_jsonl(messages=[{"type": "system", "timestamp": ts}])
+            + "\n"
+            + "\n".join(json.dumps({"type": t}) for t in
+                        ("mode", "permission-mode", "atis-latch", "bridge-session"))
+            + "\n")
+        return p
+
+    # --- the witness itself -------------------------------------------------
+
+    def _read(self, states, sid):
+        import claude_monitor as cm
+        with patch.object(cm, "HOOK_STATE_DIR", states), \
+             patch.object(cm, "_hook_state_cache", {}):
+            return cm.hook_activity_time(sid)
+
+    def test_it_reports_the_sessions_own_stamp(self, tmp_path):
+        sid = self.SID % 1
+        self._hook(tmp_path, sid, seconds_ago=30)
+        assert 20 < time.time() - self._read(tmp_path, sid) < 60
+
+    def test_no_state_file_means_no_opinion(self, tmp_path):
+        assert self._read(tmp_path, self.SID % 2) == 0.0
+
+    def test_an_unreadable_stamp_means_no_opinion(self, tmp_path):
+        sid = self.SID % 3
+        self._hook(tmp_path, sid, timestamp="not a time")
+        assert self._read(tmp_path, sid) == 0.0
+
+    def test_a_future_stamp_is_not_evidence(self, tmp_path):
+        """A skewed clock costs this witness its vote; it must not hand it a
+        veto. Clamping a day-ahead stamp to now dated a five-day-dead session
+        0s instead (seen while driving the app, 2026-09-19)."""
+        sid = self.SID % 4
+        self._hook(tmp_path, sid, seconds_ago=-86400)
+        assert self._read(tmp_path, sid) == 0.0
+
+    def test_ordinary_clock_jitter_still_counts(self, tmp_path):
+        """A stamp a breath ahead is the hook and the clock disagreeing by
+        milliseconds, not a broken clock."""
+        sid = self.SID % 9
+        self._hook(tmp_path, sid, seconds_ago=-0.5)
+        assert self._read(tmp_path, sid) > time.time() - 60
+
+    def test_a_future_stamp_leaves_the_transcript_to_answer(self, tmp_path):
+        """And the row keeps the age the conversation earned."""
+        sid = self.SID % 4
+        projects = tmp_path / "projects" / "-Users-u-work"
+        projects.mkdir(parents=True)
+        self._resumed_transcript(projects, sid, last_message_days=5)
+        self._hook(tmp_path / "states", sid, seconds_ago=-86400)
+        _, rows = self._parse(tmp_path, include_archived=True)
+        assert len(rows) == 1
+        assert 4.5 * 86400 < time.time() - rows[0].last_activity < 5.5 * 86400
+
+    # --- what the table does with it ---------------------------------------
+
+    def _parse(self, tmp_path, include_archived=False):
+        projects = tmp_path / "projects" / "-Users-u-work"
+        projects.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "sessions").mkdir(exist_ok=True)
+        with patch("claude_monitor.CLAUDE_DIR", tmp_path / "projects"), \
+             patch("claude_monitor.SESSIONS_DIR", tmp_path / "sessions"), \
+             patch("claude_monitor.HOOK_STATE_DIR", tmp_path / "states"), \
+             patch("claude_monitor._hook_state_cache", {}), \
+             patch("claude_monitor._refresh_pid_map"), \
+             patch("claude_monitor._pid_map", {}), \
+             patch("claude_monitor._is_session_alive", return_value=False), \
+             patch("claude_monitor._gc_state_files"), \
+             patch("claude_monitor.load_index_metadata", return_value={}):
+            return projects, parse_sessions(include_archived=include_archived)
+
+    def test_a_resumed_session_keeps_its_place(self, tmp_path):
+        """The reported shape: reopened, worked in, gone from the table."""
+        sid = self.SID % 5
+        projects = tmp_path / "projects" / "-Users-u-work"
+        projects.mkdir(parents=True)
+        self._resumed_transcript(projects, sid, last_message_days=2)
+        self._hook(tmp_path / "states", sid, seconds_ago=30)
+        _, rows = self._parse(tmp_path)
+        assert [r.session_id for r in rows] == [sid]
+        assert time.time() - rows[0].last_activity < 120
+
+    def test_a_touched_dormant_session_is_still_not_resurrected(self, tmp_path):
+        """The first bug, guarded: a state file as old as the conversation
+        leaves the verdict where the transcript put it."""
+        sid = self.SID % 6
+        projects = tmp_path / "projects" / "-Users-u-work"
+        projects.mkdir(parents=True)
+        self._resumed_transcript(projects, sid, last_message_days=5)
+        self._hook(tmp_path / "states", sid, seconds_ago=5 * 86400)
+        _, rows = self._parse(tmp_path)
+        assert rows == []
+
+    def test_a_dormant_session_with_no_state_file_is_still_dormant(self, tmp_path):
+        sid = self.SID % 7
+        projects = tmp_path / "projects" / "-Users-u-work"
+        projects.mkdir(parents=True)
+        self._resumed_transcript(projects, sid, last_message_days=5)
+        _, rows = self._parse(tmp_path)
+        assert rows == []
+
+    def test_the_older_witness_never_drags_a_live_session_down(self, tmp_path):
+        """Later wins: a stale state file left by a crashed hook must not
+        archive a session that spoke a minute ago."""
+        sid = self.SID % 8
+        projects = tmp_path / "projects" / "-Users-u-work"
+        projects.mkdir(parents=True)
+        self._resumed_transcript(projects, sid, last_message_days=0)
+        self._hook(tmp_path / "states", sid, seconds_ago=9 * 86400)
+        _, rows = self._parse(tmp_path)
+        assert [r.session_id for r in rows] == [sid]
+        assert time.time() - rows[0].last_activity < 120
+
+
+class TestASessionWithNoWindowIsNotResumed:
+    """A desk spawned a worker at 22:32 on 2026-09-19 that ran with no
+    terminal window of its own. Three sessions could see it running, and the
+    monitor showed it WORKING, but jumping to it said: "Window not found for
+    frontier-footholds. Press Enter → Resume to open in a new tab." (Max:
+    "both &frontier-curve and &watchman and monitor itself show that
+    &frontier-footholds is active, but jumping from monitor to it throws an
+    error".)
+
+    The toast pointed at the one action the code itself refuses to take. Its
+    own comment says why: "If the session's process is alive, its window
+    exists SOMEWHERE - resuming would spawn a duplicate." Claude Code runs one
+    process per conversation, so the duplicate is killed by its single-instance
+    guard, and which of the two dies is not this app's to choose. The premise
+    was also wrong: alive does not imply a window exists. A session can be
+    running under tmux, spawned by another session, with no window anywhere.
+    """
+
+    PANES = ("/dev/ttys016\twork:0.0\n"
+             "/dev/ttys021\tother:1.2\n")
+    SOCKETS = ["/private/tmp/tmux-502/claude-13921",
+               "/private/tmp/tmux-502/claude-2550"]
+
+    def _tmux(self, output=None, error=None, sockets=None):
+        """Patch both halves: which servers exist, and what they answer."""
+        import claude_monitor as cm
+        from contextlib import ExitStack, contextmanager
+
+        @contextmanager
+        def _ctx():
+            with ExitStack() as st:
+                st.enter_context(patch.object(
+                    cm, "tmux_socket_paths",
+                    return_value=self.SOCKETS if sockets is None else sockets))
+                if error is not None:
+                    st.enter_context(patch.object(
+                        cm.subprocess, "check_output", side_effect=error))
+                else:
+                    st.enter_context(patch.object(
+                        cm.subprocess, "check_output", return_value=output))
+                yield
+        return _ctx()
+
+    # --- which servers exist ------------------------------------------------
+
+    def test_it_names_a_socket_rather_than_using_the_default_one(self):
+        """The first cut of this fix ran a bare `tmux list-panes`, which talks
+        to the socket named `default`. On this machine that socket does not
+        exist: each spawned session gets its own `claude-<pid>` server, so the
+        bare command answered "error connecting to .../default" and the fix
+        never fired on the session it was written for (caught in review before
+        it shipped, 2026-09-19)."""
+        import claude_monitor as cm
+        with patch.object(cm, "tmux_socket_paths", return_value=self.SOCKETS), \
+             patch.object(cm.subprocess, "check_output", return_value="") as run:
+            cm.tmux_pane_for_tty("ttys016")
+        asked = [c.args[0] for c in run.call_args_list]
+        assert [a[:3] for a in asked] == [["tmux", "-S", self.SOCKETS[0]],
+                                          ["tmux", "-S", self.SOCKETS[1]]]
+
+    def test_only_sockets_count_as_servers(self, tmp_path):
+        """A stray regular file in the tmux directory is not a server."""
+        import claude_monitor as cm
+        d = tmp_path / f"tmux-{os.getuid()}"
+        d.mkdir()
+        (d / "not-a-socket").write_text("")
+        with patch.dict(os.environ, {"TMUX_TMPDIR": str(tmp_path)}):
+            assert cm.tmux_socket_paths() == []
+
+    def test_no_tmux_directory_at_all(self, tmp_path):
+        import claude_monitor as cm
+        with patch.dict(os.environ, {"TMUX_TMPDIR": str(tmp_path / "nope")}):
+            assert cm.tmux_socket_paths() == []
+
+    # --- who owns the tty --------------------------------------------------
+
+    def test_it_maps_every_pane_on_every_socket_in_one_probe(self):
+        """The layout save asks about every live session at once; a probe per
+        session would mean a subprocess round per session per socket."""
+        from claude_monitor import tmux_panes_by_tty
+        with self._tmux(self.PANES):
+            panes = tmux_panes_by_tty()
+        assert set(panes) == {"/dev/ttys016", "/dev/ttys021"}
+        assert panes["/dev/ttys016"].target == "work:0.0"
+
+    def test_it_finds_the_pane_holding_that_tty(self):
+        from claude_monitor import tmux_pane_for_tty
+        with self._tmux(self.PANES):
+            pane = tmux_pane_for_tty("ttys016")
+        assert (pane.socket, pane.target) == (self.SOCKETS[0], "work:0.0")
+        assert pane.label == "claude-13921:work:0.0"
+
+    def test_a_dev_prefixed_tty_matches_too(self):
+        from claude_monitor import tmux_pane_for_tty
+        with self._tmux(self.PANES):
+            assert tmux_pane_for_tty("/dev/ttys016").target == "work:0.0"
+
+    def test_a_tty_tmux_does_not_own_is_not_a_pane(self):
+        """Every windowed session on the machine has a ttysNNN as well."""
+        from claude_monitor import tmux_pane_for_tty
+        with self._tmux(self.PANES):
+            assert tmux_pane_for_tty("ttys003") is None
+
+    def test_no_tty_no_question(self):
+        from claude_monitor import tmux_pane_for_tty
+        assert tmux_pane_for_tty("") is None
+
+    def test_a_machine_without_tmux_just_says_nothing(self):
+        from claude_monitor import tmux_pane_for_tty
+        with self._tmux(error=FileNotFoundError("tmux")):
+            assert tmux_pane_for_tty("ttys016") is None
+
+    def test_a_dead_socket_does_not_stop_the_search(self):
+        """One server refusing must not hide a pane on the next one."""
+        import claude_monitor as cm
+        import subprocess as sp
+        answers = [sp.CalledProcessError(1, "tmux"), self.PANES]
+        with patch.object(cm, "tmux_socket_paths", return_value=self.SOCKETS), \
+             patch.object(cm.subprocess, "check_output", side_effect=answers):
+            assert cm.tmux_pane_for_tty("ttys016").label == "claude-2550:work:0.0"
+
+    def test_a_tmux_that_hangs_does_not_hang_the_jump(self):
+        """The menu handler runs on the UI thread, so the budget is shared
+        across sockets rather than granted to each: eight unresponsive servers
+        must cost one budget, not eight."""
+        import claude_monitor as cm
+        import subprocess as sp
+
+        def hang(*a, timeout=None, **kw):
+            time.sleep(timeout or 0)          # a real one blocks for its timeout
+            raise sp.TimeoutExpired("tmux", timeout or 0)
+
+        with patch.object(cm, "_TMUX_PROBE_BUDGET_S", 0.2), \
+             patch.object(cm, "tmux_socket_paths", return_value=self.SOCKETS * 4), \
+             patch.object(cm.subprocess, "check_output", side_effect=hang):
+            start = time.monotonic()
+            assert cm.tmux_pane_for_tty("ttys016") is None
+            spent = time.monotonic() - start
+        assert spent < 0.5, f"took {spent:.2f}s: the budget is being granted per socket"
+
+    # --- what the user is told ---------------------------------------------
+
+    def _session(self, tmp_path, tty="ttys016"):
+        states = tmp_path / "states"
+        states.mkdir(exist_ok=True)
+        sid = "106636ae-0000-0000-0000-000000000001"
+        (states / f"{sid}.json").write_text(json.dumps({"tty": tty, "pid": 38260}))
+        return sid, states, make_session(session_id=sid, title="frontier-footholds")
+
+    def _reach(self, tmp_path, panes, heal, attached=True):
+        import claude_monitor as cm
+        sid, states, s = self._session(tmp_path)
+        with patch.object(cm, "HOOK_STATE_DIR", states), \
+             patch.object(cm, "_hook_state_cache", {}), \
+             patch.object(cm, "tmux_socket_paths", return_value=self.SOCKETS), \
+             patch.object(cm.subprocess, "check_output", return_value=panes), \
+             patch.object(cm, "attach_tmux_pane", return_value=attached) as attach, \
+             patch.object(cm, "_heal_hook_state", heal):
+            ok, msg = cm._reach_or_report(s)
+        return ok, msg, attach
+
+    def test_it_attaches_to_the_tmux_pane_it_is_running_in(self, tmp_path):
+        """Max: "i want to be able to jump to spawned claudes"."""
+        heal = MagicMock()
+        ok, msg, attach = self._reach(tmp_path, self.PANES, heal)
+        assert ok and "Attached" in msg and "work:0.0" in msg
+        assert attach.call_args.args[1].target == "work:0.0"
+        heal.assert_not_called()          # its hook state is right, not stale
+
+    def test_a_failed_attach_says_so_rather_than_claiming_a_jump(self, tmp_path):
+        ok, msg, _ = self._reach(tmp_path, self.PANES, MagicMock(), attached=False)
+        assert not ok and "could not attach" in msg
+
+    def test_it_never_tells_you_to_resume_a_running_session(self, tmp_path):
+        """The whole bug in one assertion."""
+        for panes in (self.PANES, "/dev/ttys099\tsomewhere:0.0\n"):
+            for attached in (True, False):
+                assert "Resume" not in self._reach(
+                    tmp_path, panes, MagicMock(), attached)[1]
+
+    def test_a_windowed_session_with_a_clobbered_title_is_still_healed(self, tmp_path):
+        """The case this branch was built for on 2026-06-21 must survive: a
+        session that HAS a tab, whose title CC's auto-title overwrote."""
+        heal = MagicMock()
+        ok, msg, attach = self._reach(tmp_path, "/dev/ttys099\tsomewhere:0.0\n", heal)
+        assert not ok and "Jump" in msg and "retry" in msg
+        heal.assert_called_once()
+        attach.assert_not_called()
+
+    # --- and the action itself ---------------------------------------------
+
+    def test_resume_refuses_a_live_session(self, tmp_path):
+        """Closed at the primitive, not at each caller: the /rename fallback
+        reached it too."""
+        import claude_monitor as cm
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text("{}\n")
+        s = make_session(session_id="live-1", transcript_path=str(transcript))
+        with patch.object(cm, "_is_session_alive", return_value=True), \
+             patch.object(cm.subprocess, "run") as run:
+            assert cm.resume_session(s) is False
+            run.assert_not_called()       # no window was opened for it to kill
+
+    def test_a_dead_session_still_resumes(self, tmp_path):
+        import claude_monitor as cm
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text("{}\n")
+        s = make_session(session_id="dead-1", transcript_path=str(transcript))
+        with patch.object(cm, "_is_session_alive", return_value=False), \
+             patch.object(cm, "_derive_cwd_from_transcript", return_value=None), \
+             patch.object(cm.subprocess, "run") as run:
+            run.return_value = type("R", (), {"stdout": "Ghostty", "returncode": 0})()
+            assert cm.resume_session(s) is True
+
+    def test_the_jump_path_attaches_and_never_resumes(self, tmp_path):
+        import claude_monitor as cm
+        sid, states, s = self._session(tmp_path)
+        with patch.object(cm, "focus_terminal_session", return_value=False), \
+             patch.object(cm, "_is_session_alive", return_value=True), \
+             patch.object(cm, "HOOK_STATE_DIR", states), \
+             patch.object(cm, "_hook_state_cache", {}), \
+             patch.object(cm, "tmux_socket_paths", return_value=self.SOCKETS), \
+             patch.object(cm.subprocess, "check_output", return_value=self.PANES), \
+             patch.object(cm, "attach_tmux_pane", return_value=True), \
+             patch.object(cm, "_mark_ready_seen") as seen, \
+             patch.object(cm, "resume_session") as resume:
+            ok, msg = cm._focus_or_resume_target(s)
+        assert ok is True and "work:0.0" in msg
+        resume.assert_not_called()
+        seen.assert_called_once()         # it was a real visit
+
+    def test_the_attach_command_names_the_socket_and_the_pane(self, tmp_path):
+        """The window it opens is the jump, so what it runs is the contract."""
+        import claude_monitor as cm
+        _, _, s = self._session(tmp_path)
+        pane = cm.TmuxPane("/private/tmp/tmux-502/claude-2550", "work:0.0")
+        with patch.object(cm, "_open_ghostty_window", return_value="Ghostty") as open_w:
+            assert cm.attach_tmux_pane(s, pane) is True
+        zsh_cmd = open_w.call_args.args[0]
+        assert "tmux -S /private/tmp/tmux-502/claude-2550 attach -t work" in zsh_cmd
+        assert "work:0.0" not in zsh_cmd   # attach takes a session, not a pane address
+        assert "·106636ae" in zsh_cmd      # stamped so the NEXT jump finds it by title
+
+    def test_an_attach_that_opens_nothing_is_not_a_jump(self, tmp_path):
+        import claude_monitor as cm
+        _, _, s = self._session(tmp_path)
+        pane = cm.TmuxPane("/sock", "work:0.0")
+        with patch.object(cm, "_open_ghostty_window", return_value=""):
+            assert cm.attach_tmux_pane(s, pane) is False
