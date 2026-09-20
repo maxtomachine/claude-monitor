@@ -365,13 +365,26 @@ Max to the single unguarded path in the file. That guard now lives in
 immediately caught a fourth: the `/rename` fallback resumed any session whose
 terminal it could not reach.
 
-`_unreachable_message()` decides between the two worlds by asking tmux, the
-only witness that can tell them apart: a session under tmux holds a pty like
-any other, so `ps -o tty=` reports a ttysNNN for a Ghostty tab and a tmux pane
-alike. If tmux owns the tty, the session is headless and the message says so
-and names the pane; if not, this is the 2026-06-21 case (a real tab whose
-title CC's auto-title clobbered) and the heal and retry still happen. Neither
-message mentions Resume.
+`_reach_or_report()` decides between the two worlds by asking tmux, the only
+witness that can tell them apart: a session under tmux holds a pty like any
+other, so `ps -o tty=` reports a ttysNNN for a Ghostty tab and a tmux pane
+alike. If tmux owns the tty, **that is the jump**: a window opens attached to
+it (Max, the morning after: "i want to be able to jump to spawned claudes").
+Attaching a second client shares the view rather than stealing it, and it
+never starts a second process the way resuming would. The window is stamped
+with the session's own `·sid8` title first, so ordinary title discovery finds
+it from then on and the next jump never reaches this path. If tmux does not
+own the tty, this is the 2026-06-21 case (a real tab whose title CC's
+auto-title clobbered) and the heal and retry still happen. Neither outcome
+mentions Resume.
+
+Attaching, rather than requiring every spawner to open a window, is the choice
+that holds. The session that spawned this one had tried: it ran `cc-spawn`
+(what `/spawn` calls, Ghostty-only, no tmux anywhere in it) and osascript died
+in its sandbox with a LaunchServices error, so it improvised with the Tmux
+tool. Any session whose sandbox cannot be turned off will hit that same wall,
+so headless peers are a standing fact of this machine rather than a mistake to
+rule out.
 
 Two things about that probe. It runs on the jump failure path only, never on
 the refresh. And it must name a socket: a bare `tmux list-panes` talks to the
@@ -381,11 +394,10 @@ shipped the bare command and so never fired on the session it was written for.
 Every socket shares one deadline, because the menu handler calling it runs on
 the UI thread.
 
-Still open, and the honest version of this fix: the menu still offers Jump and
-Resume on a session that can never be reached, so the truth arrives after the
-attempt rather than before it. Marking such a row, and disabling (never
-deleting, per the phantom-row-versus-missing-session rule above) those two
-items, is the next step.
+Still open: the menu offers Resume on a session that is running, and the row
+does not say where it lives until you jump. Marking such a row, and disabling
+(never deleting, per the phantom-row-versus-missing-session rule above) the
+Resume item, is the next step.
 
 ## Jump discovery must never rely on System Events alone
 

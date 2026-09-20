@@ -2004,27 +2004,29 @@ class TestASessionWithNoWindowIsNotResumed:
     def test_it_finds_the_pane_holding_that_tty(self):
         from claude_monitor import tmux_pane_for_tty
         with self._tmux(self.PANES):
-            assert tmux_pane_for_tty("ttys016") == "claude-13921:work:0.0"
+            pane = tmux_pane_for_tty("ttys016")
+        assert (pane.socket, pane.target) == (self.SOCKETS[0], "work:0.0")
+        assert pane.label == "claude-13921:work:0.0"
 
     def test_a_dev_prefixed_tty_matches_too(self):
         from claude_monitor import tmux_pane_for_tty
         with self._tmux(self.PANES):
-            assert tmux_pane_for_tty("/dev/ttys016").endswith("work:0.0")
+            assert tmux_pane_for_tty("/dev/ttys016").target == "work:0.0"
 
     def test_a_tty_tmux_does_not_own_is_not_a_pane(self):
         """Every windowed session on the machine has a ttysNNN as well."""
         from claude_monitor import tmux_pane_for_tty
         with self._tmux(self.PANES):
-            assert tmux_pane_for_tty("ttys003") == ""
+            assert tmux_pane_for_tty("ttys003") is None
 
     def test_no_tty_no_question(self):
         from claude_monitor import tmux_pane_for_tty
-        assert tmux_pane_for_tty("") == ""
+        assert tmux_pane_for_tty("") is None
 
     def test_a_machine_without_tmux_just_says_nothing(self):
         from claude_monitor import tmux_pane_for_tty
         with self._tmux(error=FileNotFoundError("tmux")):
-            assert tmux_pane_for_tty("ttys016") == ""
+            assert tmux_pane_for_tty("ttys016") is None
 
     def test_a_dead_socket_does_not_stop_the_search(self):
         """One server refusing must not hide a pane on the next one."""
@@ -2033,7 +2035,7 @@ class TestASessionWithNoWindowIsNotResumed:
         answers = [sp.CalledProcessError(1, "tmux"), self.PANES]
         with patch.object(cm, "tmux_socket_paths", return_value=self.SOCKETS), \
              patch.object(cm.subprocess, "check_output", side_effect=answers):
-            assert cm.tmux_pane_for_tty("ttys016") == "claude-2550:work:0.0"
+            assert cm.tmux_pane_for_tty("ttys016").label == "claude-2550:work:0.0"
 
     def test_a_tmux_that_hangs_does_not_hang_the_jump(self):
         """The menu handler runs on the UI thread, so the budget is shared
@@ -2050,7 +2052,7 @@ class TestASessionWithNoWindowIsNotResumed:
              patch.object(cm, "tmux_socket_paths", return_value=self.SOCKETS * 4), \
              patch.object(cm.subprocess, "check_output", side_effect=hang):
             start = time.monotonic()
-            assert cm.tmux_pane_for_tty("ttys016") == ""
+            assert cm.tmux_pane_for_tty("ttys016") is None
             spent = time.monotonic() - start
         assert spent < 0.5, f"took {spent:.2f}s: the budget is being granted per socket"
 
@@ -2063,33 +2065,45 @@ class TestASessionWithNoWindowIsNotResumed:
         (states / f"{sid}.json").write_text(json.dumps({"tty": tty, "pid": 38260}))
         return sid, states, make_session(session_id=sid, title="frontier-footholds")
 
-    def _message(self, tmp_path, panes, heal):
+    def _reach(self, tmp_path, panes, heal, attached=True):
         import claude_monitor as cm
         sid, states, s = self._session(tmp_path)
         with patch.object(cm, "HOOK_STATE_DIR", states), \
              patch.object(cm, "_hook_state_cache", {}), \
+             patch.object(cm, "tmux_socket_paths", return_value=self.SOCKETS), \
              patch.object(cm.subprocess, "check_output", return_value=panes), \
+             patch.object(cm, "attach_tmux_pane", return_value=attached) as attach, \
              patch.object(cm, "_heal_hook_state", heal):
-            return cm._unreachable_message(s)
+            ok, msg = cm._reach_or_report(s)
+        return ok, msg, attach
 
-    def test_it_names_the_tmux_pane_it_is_running_in(self, tmp_path):
+    def test_it_attaches_to_the_tmux_pane_it_is_running_in(self, tmp_path):
+        """Max: "i want to be able to jump to spawned claudes"."""
         heal = MagicMock()
-        msg = self._message(tmp_path, self.PANES, heal)
-        assert "headless" in msg and "work:0.0" in msg
+        ok, msg, attach = self._reach(tmp_path, self.PANES, heal)
+        assert ok and "Attached" in msg and "work:0.0" in msg
+        assert attach.call_args.args[1].target == "work:0.0"
         heal.assert_not_called()          # its hook state is right, not stale
+
+    def test_a_failed_attach_says_so_rather_than_claiming_a_jump(self, tmp_path):
+        ok, msg, _ = self._reach(tmp_path, self.PANES, MagicMock(), attached=False)
+        assert not ok and "could not attach" in msg
 
     def test_it_never_tells_you_to_resume_a_running_session(self, tmp_path):
         """The whole bug in one assertion."""
         for panes in (self.PANES, "/dev/ttys099\tsomewhere:0.0\n"):
-            assert "Resume" not in self._message(tmp_path, panes, MagicMock())
+            for attached in (True, False):
+                assert "Resume" not in self._reach(
+                    tmp_path, panes, MagicMock(), attached)[1]
 
     def test_a_windowed_session_with_a_clobbered_title_is_still_healed(self, tmp_path):
         """The case this branch was built for on 2026-06-21 must survive: a
         session that HAS a tab, whose title CC's auto-title overwrote."""
         heal = MagicMock()
-        msg = self._message(tmp_path, "/dev/ttys099\tsomewhere:0.0\n", heal)
-        assert "Jump" in msg and "retry" in msg
+        ok, msg, attach = self._reach(tmp_path, "/dev/ttys099\tsomewhere:0.0\n", heal)
+        assert not ok and "Jump" in msg and "retry" in msg
         heal.assert_called_once()
+        attach.assert_not_called()
 
     # --- and the action itself ---------------------------------------------
 
@@ -2116,16 +2130,38 @@ class TestASessionWithNoWindowIsNotResumed:
             run.return_value = type("R", (), {"stdout": "Ghostty", "returncode": 0})()
             assert cm.resume_session(s) is True
 
-    def test_the_jump_path_reports_it_and_does_not_resume(self, tmp_path):
+    def test_the_jump_path_attaches_and_never_resumes(self, tmp_path):
         import claude_monitor as cm
         sid, states, s = self._session(tmp_path)
         with patch.object(cm, "focus_terminal_session", return_value=False), \
              patch.object(cm, "_is_session_alive", return_value=True), \
              patch.object(cm, "HOOK_STATE_DIR", states), \
              patch.object(cm, "_hook_state_cache", {}), \
+             patch.object(cm, "tmux_socket_paths", return_value=self.SOCKETS), \
              patch.object(cm.subprocess, "check_output", return_value=self.PANES), \
+             patch.object(cm, "attach_tmux_pane", return_value=True), \
+             patch.object(cm, "_mark_ready_seen") as seen, \
              patch.object(cm, "resume_session") as resume:
             ok, msg = cm._focus_or_resume_target(s)
-        assert ok is False
-        assert "work:0.0" in msg
+        assert ok is True and "work:0.0" in msg
         resume.assert_not_called()
+        seen.assert_called_once()         # it was a real visit
+
+    def test_the_attach_command_names_the_socket_and_the_pane(self, tmp_path):
+        """The window it opens is the jump, so what it runs is the contract."""
+        import claude_monitor as cm
+        _, _, s = self._session(tmp_path)
+        pane = cm.TmuxPane("/private/tmp/tmux-502/claude-2550", "work:0.0")
+        with patch.object(cm, "_open_ghostty_window", return_value="Ghostty") as open_w:
+            assert cm.attach_tmux_pane(s, pane) is True
+        zsh_cmd = open_w.call_args.args[0]
+        assert "tmux -S /private/tmp/tmux-502/claude-2550 attach -t work" in zsh_cmd
+        assert "work:0.0" not in zsh_cmd   # attach takes a session, not a pane address
+        assert "·106636ae" in zsh_cmd      # stamped so the NEXT jump finds it by title
+
+    def test_an_attach_that_opens_nothing_is_not_a_jump(self, tmp_path):
+        import claude_monitor as cm
+        _, _, s = self._session(tmp_path)
+        pane = cm.TmuxPane("/sock", "work:0.0")
+        with patch.object(cm, "_open_ghostty_window", return_value=""):
+            assert cm.attach_tmux_pane(s, pane) is False

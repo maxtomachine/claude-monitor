@@ -15,6 +15,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
+from typing import NamedTuple
 
 def _escape_markup(text: str) -> str:
     """Escape all [ for Textual markup (rich.markup.escape misses some)."""
@@ -1884,8 +1885,25 @@ def tmux_socket_paths() -> list[str]:
         return []
 
 
-def tmux_pane_for_tty(tty: str) -> str:
-    """The tmux pane holding this tty, as `socket:session:window.pane`, or "".
+class TmuxPane(NamedTuple):
+    """Where a session actually lives when it lives in tmux."""
+    socket: str          # the server's socket path, needed to talk to it at all
+    target: str          # session:window.pane, precise enough to name in a message
+
+    @property
+    def session(self) -> str:
+        """What `attach -t` takes. A spawned worker has one window in one
+        session, so attaching by session name lands on it, and the plain form
+        is the one every tmux accepts without argument about it."""
+        return self.target.split(":")[0]
+
+    @property
+    def label(self) -> str:
+        return f"{Path(self.socket).name}:{self.target}"
+
+
+def tmux_pane_for_tty(tty: str) -> TmuxPane | None:
+    """The tmux pane holding this tty, or None.
 
     A session running under tmux holds a pty like any other, so `ps -o tty=`
     cannot tell it from a session sitting in a Ghostty tab: both answer with a
@@ -1895,7 +1913,7 @@ def tmux_pane_for_tty(tty: str) -> str:
     without tmux simply gets "".
     """
     if not tty:
-        return ""
+        return None
     want = tty if tty.startswith("/dev/") else "/dev/" + tty
     deadline = time.time() + _TMUX_PROBE_BUDGET_S
     for sock in tmux_socket_paths():
@@ -1913,38 +1931,39 @@ def tmux_pane_for_tty(tty: str) -> str:
         for line in out.splitlines():
             pane_tty, _, target = line.partition("\t")
             if pane_tty == want and target:
-                return f"{Path(sock).name}:{target}"
-    return ""
+                return TmuxPane(sock, target)
+    return None
 
 
-def _unreachable_message(session: "Session") -> str:
-    """What to say when a jump finds no window for a session that is still
-    running. There are two such worlds and they want opposite advice.
+def _reach_or_report(session: "Session") -> tuple[bool, str]:
+    """A jump found no window for a session that is still running. Two worlds
+    sit behind that, and they want opposite answers.
 
-    A session spawned by another session runs with no terminal window of its
-    own (Max, 2026-09-19, on one a desk had spawned minutes earlier: "both
+    A session spawned by another session runs inside tmux with no window of
+    its own (Max, 2026-09-19, on one a desk had spawned minutes earlier: "both
     &frontier-curve and &watchman and monitor itself show that
     &frontier-footholds is active, but jumping from monitor to it throws an
-    error"). Nothing can jump to it, so saying so is the whole job.
+    error", then: "i want to be able to jump to spawned claudes"). Discovery
+    matches window titles and the hooks stamp the marker onto the tmux pane
+    title, so no title search can ever find it. Attaching is the jump.
 
     The other world is the one this branch was built for on 2026-06-21: a
     session that does have a tab, whose title CC's own auto-title clobbered,
-    leaving it reachable by ps but not by title. That one is healed and
-    retried.
+    leaving it reachable by ps but not by title. That one is healed and retried.
 
-    Neither may advise Resume. Resuming a live session spawns a duplicate that
-    Claude Code's single-instance guard kills, which is why this branch exists
-    at all, and the old text sent Max to the one menu item that would do it.
+    Neither may advise Resume. Resuming a live session starts a second process
+    on one conversation, which is why this branch exists at all, and the text
+    it used to carry sent Max to the one menu item that would do it.
     """
     hook = read_hook_state(session.session_id) or {}
     pane = tmux_pane_for_tty(hook.get("tty", ""))
     if pane:
-        mlog("jump", "headless_no_window", sid=session.session_id[:12],
-             title=session.title, tmux=pane)
-        return (f"{session.title[:24]} is headless in tmux ({pane}), "
-                f"no window to jump to.")
+        if attach_tmux_pane(session, pane):
+            return True, f"Attached to {session.title[:24]} ({pane.label})"
+        return False, (f"{session.title[:24]} is headless in tmux ({pane.label}); "
+                       f"could not attach.")
     _heal_hook_state(session.session_id)
-    return f"Re-stamped {session.title[:20]}'s tab title. Press Enter → Jump to retry."
+    return False, f"Re-stamped {session.title[:20]}'s tab title. Press Enter → Jump to retry."
 
 
 _hook_state_cache: dict[str, tuple[float, dict]] = {}  # session_id -> (mtime, data)
@@ -3987,6 +4006,70 @@ def _ghostty_surface_command(cwd: str, cmd: str, title_stamp: str = "") -> str:
     return f"/bin/zsh -ic {shlex.quote(inner)}"
 
 
+def _open_ghostty_window(zsh_cmd: str, fallback_cmd: str) -> str:
+    """Open a window running a command, through each app's OWN scripting and
+    never a System Events keystroke: any Accessibility-injected keyboard
+    event, real key or fake modifier, fires Claude Nest's push-to-talk as a
+    side effect (observed live 2026-08-15 from a bare terminal osascript with
+    no monitor involved; it reacts to synthetic input generically, not to a
+    particular key). Returns "Ghostty", "Terminal", or "" if neither opened.
+
+    Shared by resume_session() and the tmux attach so that the collision above
+    has exactly one place to come back through.
+    """
+    jxa = f"""(() => {{
+        const zshCmd = {json.dumps(zsh_cmd)};
+        try {{
+            const ghostty = Application("Ghostty");
+            const w = ghostty.newWindow({{withConfiguration: {{command: zshCmd}}}});
+            ghostty.activateWindow(w);
+            return "Ghostty";
+        }} catch (e) {{}}
+
+        // Fall back to Terminal.app (native doScript, no keystroke here either)
+        const term = Application("Terminal");
+        term.activate();
+        term.doScript({json.dumps(fallback_cmd)});
+        return "Terminal";
+    }})()"""
+    try:
+        result = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", jxa],
+            capture_output=True, text=True, timeout=10,
+        )
+        out = result.stdout.strip()
+        if result.returncode == 0 and out in ("Ghostty", "Terminal"):
+            return out
+        return ""
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        mlog("window", "open_error", error=str(e))
+        return ""
+
+
+def attach_tmux_pane(session: "Session", pane: TmuxPane) -> bool:
+    """Open a window attached to the tmux pane a session is running in.
+
+    This is the jump for a session that has no window of its own. Attaching a
+    second client shares the view rather than stealing it, so it is safe even
+    when someone is already watching that pane, and it never starts a second
+    Claude process the way resuming would.
+
+    The window is stamped with the session's own `·sid8` title first, which is
+    what ordinary title-based discovery looks for, so the next jump to this
+    session finds the window directly and never reaches this path again (tmux
+    only overwrites that title when set-titles is on).
+    """
+    cwd = session.cwd if session.cwd and Path(session.cwd).is_dir() else str(Path.home())
+    cmd = f"tmux -S {shlex.quote(pane.socket)} attach -t {shlex.quote(pane.session)}"
+    name = (session.title or session.session_id[:8])[:32]
+    zsh_cmd = _ghostty_surface_command(
+        cwd, cmd, title_stamp=f"✳ {name} ·{session.session_id[:8]}")
+    via = _open_ghostty_window(zsh_cmd, f"cd {shlex.quote(cwd)} && {cmd}")
+    mlog("jump", "tmux_attach", sid=session.session_id[:12], title=session.title,
+         pane=pane.label, via=via or "failed")
+    return bool(via)
+
+
 def resume_session(session: Session) -> bool:
     """Resume a Claude session in a new Ghostty window (falls back to Terminal.app).
 
@@ -4038,31 +4121,11 @@ def resume_session(session: Session) -> bool:
     # when cwd itself contains a single quote.
     inner_cmd = f"cd {shlex.quote(cwd)} && {cmd}"
     zsh_cmd = _ghostty_surface_command(cwd, cmd)
-    jxa = f"""(() => {{
-        const zshCmd = {json.dumps(zsh_cmd)};
-        try {{
-            const ghostty = Application("Ghostty");
-            const w = ghostty.newWindow({{withConfiguration: {{command: zshCmd}}}});
-            ghostty.activateWindow(w);
-            return "Ghostty";
-        }} catch (e) {{}}
-
-        // Fall back to Terminal.app (native doScript — no keystroke here either)
-        const term = Application("Terminal");
-        term.activate();
-        term.doScript({json.dumps(inner_cmd)});
-        return "Terminal";
-    }})()"""
 
     try:
-        result = subprocess.run(
-            ["osascript", "-l", "JavaScript", "-e", jxa],
-            capture_output=True, text=True, timeout=10,
-        )
-        out = result.stdout.strip()
-        mlog("resume", "launched", sid=session.session_id[:12],
-             via=out, rc=result.returncode)
-        if result.returncode == 0 and out in ("Ghostty", "Terminal"):
+        out = _open_ghostty_window(zsh_cmd, inner_cmd)
+        mlog("resume", "launched", sid=session.session_id[:12], via=out or "failed")
+        if out:
             _recently_resumed[session.session_id] = time.time()
             # Force a fresh PID-map read on the next liveness check. Every
             # caller used to have to remember this itself; one (the jump
@@ -5724,8 +5787,9 @@ class ClaudeMonitor(App):
                         mlog("DIVERGE", "alive_but_unfound",
                              sid=s.session_id[:12], title=s.title,
                              candidates=_resolve_match_candidates(s))
-                        self.notify(_unreachable_message(s),
-                                    timeout=6, severity="warning")
+                        ok, msg = _reach_or_report(s)
+                        self.notify(msg, timeout=6,
+                                    severity="information" if ok else "warning")
                     else:
                         ok = resume_session(s)
                         if ok:
@@ -5740,10 +5804,12 @@ class ClaudeMonitor(App):
                 self.action_edit_name()
             elif action == "resume":
                 if _is_session_alive(s.session_id):
-                    # Refused in resume_session() itself; say why rather than
-                    # reporting a terminal that could not be opened.
-                    self.notify(_unreachable_message(s), timeout=6, severity="warning")
-                    ok = False
+                    # Refused in resume_session() itself. A running session is
+                    # reached, never restarted: attach to it when it lives in
+                    # tmux, and say why when it does not.
+                    ok, msg = _reach_or_report(s)
+                    self.notify(msg, timeout=6,
+                                severity="information" if ok else "warning")
                 else:
                     ok = resume_session(s)
                     if ok:
@@ -6409,7 +6475,8 @@ class ClaudeMonitor(App):
         if ok:
             self.notify(f"Sent /rename to {s.title[:20]}", timeout=3)
         elif _is_session_alive(s.session_id):
-            self.notify(_unreachable_message(s), timeout=6, severity="warning")
+            ok, msg = _reach_or_report(s)
+            self.notify(msg, timeout=6, severity="information" if ok else "warning")
         else:
             ok = resume_session(s)
             if ok:
@@ -6918,7 +6985,10 @@ def _focus_or_resume_target(target: "Session") -> tuple[bool, str]:
     if _is_session_alive(target.session_id):
         mlog("DIVERGE", "alive_but_unfound", sid=target.session_id[:12], title=target.title,
              candidates=_resolve_match_candidates(target))
-        return False, _unreachable_message(target)
+        ok, msg = _reach_or_report(target)
+        if ok:
+            _mark_ready_seen(target.session_id, target.status, target.last_activity)
+        return ok, msg
     if resume_session(target):
         _mark_ready_seen(target.session_id, target.status, target.last_activity)
         return True, f"Resuming {target.title[:20]} in new window"
