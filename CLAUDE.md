@@ -379,12 +379,21 @@ auto-title clobbered) and the heal and retry still happen. Neither outcome
 mentions Resume.
 
 Attaching, rather than requiring every spawner to open a window, is the choice
-that holds. The session that spawned this one had tried: it ran `cc-spawn`
-(what `/spawn` calls, Ghostty-only, no tmux anywhere in it) and osascript died
-in its sandbox with a LaunchServices error, so it improvised with the Tmux
-tool. Any session whose sandbox cannot be turned off will hit that same wall,
-so headless peers are a standing fact of this machine rather than a mistake to
-rule out.
+that holds, and the reason is worth keeping straight because the founding case
+has since been fixed at its source. The session that spawned this one had
+tried: it ran `cc-spawn` (what `/spawn` calls, Ghostty-only, no tmux anywhere
+in it) and osascript died in its sandbox with a LaunchServices error, so it
+improvised with the Tmux tool and reported the session as spawned. On
+2026-09-20 Max exempted `cc-spawn` from the sandbox
+(`sandbox.excludedCommands`), so `/spawn` opens a real window again from any
+session, and that particular wall is gone.
+
+The monitor still attaches, for three reasons that outlive the fix. A session
+already in a pane stays there. The exemption names one command, so anything
+else that stands a session up outside Ghostty still produces a paneless
+session. And a monitor that can only reach sessions started the blessed way is
+a monitor that reports whatever it can see rather than what is running, which
+is the failure this whole file exists to argue against.
 
 Two things about that probe. It runs on the jump failure path only, never on
 the refresh. And it must name a socket: a bare `tmux list-panes` talks to the
