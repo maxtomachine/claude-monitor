@@ -339,6 +339,54 @@ reads them. When a new field appears, ask what the monitor was inferring
 from its absence.
 
 
+## Alive does not mean reachable
+
+The jump had two worlds: the window was found, or the session was dead and
+could be resumed. "Alive but no window" was treated as an anomaly to heal,
+on the premise written into the code itself: "If the session's process is
+alive, its window exists SOMEWHERE."
+
+It does not. A session spawned by another session runs under tmux with no
+window anywhere (Max, 2026-09-19, on one a desk had spawned minutes earlier:
+"both &frontier-curve and &watchman and monitor itself show that
+&frontier-footholds is active, but jumping from monitor to it throws an
+error"). Discovery is title-based, and the `·sid8` marker the hooks stamp
+lands on the tmux pane title, never on a window title, so all three discovery
+phases miss it at once and always will.
+
+The toast then said "Window not found. Press Enter → Resume to open in a new
+tab", which pointed at the one action the code refuses everywhere else: Claude
+Code runs one process per conversation, and a second `claude --resume <sid>`
+is killed by its single-instance guard. The layout restore path has skipped
+live sessions as `skipped_live` from the start and the jump path refuses them
+too, but the menu's own Resume item had no such guard, so the toast routed
+Max to the single unguarded path in the file. That guard now lives in
+`resume_session()` itself, one choke point instead of three call sites, which
+immediately caught a fourth: the `/rename` fallback resumed any session whose
+terminal it could not reach.
+
+`_unreachable_message()` decides between the two worlds by asking tmux, the
+only witness that can tell them apart: a session under tmux holds a pty like
+any other, so `ps -o tty=` reports a ttysNNN for a Ghostty tab and a tmux pane
+alike. If tmux owns the tty, the session is headless and the message says so
+and names the pane; if not, this is the 2026-06-21 case (a real tab whose
+title CC's auto-title clobbered) and the heal and retry still happen. Neither
+message mentions Resume.
+
+Two things about that probe. It runs on the jump failure path only, never on
+the refresh. And it must name a socket: a bare `tmux list-panes` talks to the
+socket called `default`, which does not exist on this machine, where every
+spawned session gets its own `claude-<pid>` server; the first cut of this fix
+shipped the bare command and so never fired on the session it was written for.
+Every socket shares one deadline, because the menu handler calling it runs on
+the UI thread.
+
+Still open, and the honest version of this fix: the menu still offers Jump and
+Resume on a session that can never be reached, so the truth arrives after the
+attempt rather than before it. Marking such a row, and disabling (never
+deleting, per the phantom-row-versus-missing-session rule above) those two
+items, is the next step.
+
 ## Jump discovery must never rely on System Events alone
 
 System Events lists only the windows on the CURRENT Space, and Ghostty's

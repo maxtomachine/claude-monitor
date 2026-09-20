@@ -1863,6 +1863,90 @@ def _heal_hook_state(session_id: str) -> None:
         pass
 
 
+_TMUX_PROBE_BUDGET_S = 2.0  # one budget for every socket, not each
+
+
+def tmux_socket_paths() -> list[str]:
+    """Every tmux server socket belonging to this user.
+
+    A bare `tmux list-panes` talks to the socket named `default`, and on this
+    machine that socket does not exist: each session spawned under tmux gets
+    its own server on a named socket (`claude-<pid>`), so the bare command
+    answers "error connecting to /private/tmp/tmux-502/default" and nothing
+    else. The first cut of this fix shipped that bare command and so never
+    fired on the very session it was written for.
+    """
+    root = os.environ.get("TMUX_TMPDIR") or "/tmp"
+    try:
+        return [str(p) for p in (Path(root) / f"tmux-{os.getuid()}").iterdir()
+                if p.is_socket()]
+    except OSError:
+        return []
+
+
+def tmux_pane_for_tty(tty: str) -> str:
+    """The tmux pane holding this tty, as `socket:session:window.pane`, or "".
+
+    A session running under tmux holds a pty like any other, so `ps -o tty=`
+    cannot tell it from a session sitting in a Ghostty tab: both answer with a
+    ttysNNN. Only tmux knows which ptys are its own. Called on the jump failure
+    path alone, never on the refresh, and every socket shares one deadline
+    because the menu handler that calls it runs on the UI thread. A machine
+    without tmux simply gets "".
+    """
+    if not tty:
+        return ""
+    want = tty if tty.startswith("/dev/") else "/dev/" + tty
+    deadline = time.time() + _TMUX_PROBE_BUDGET_S
+    for sock in tmux_socket_paths():
+        left = deadline - time.time()
+        if left <= 0:
+            break
+        try:
+            out = subprocess.check_output(
+                ["tmux", "-S", sock, "list-panes", "-a", "-F",
+                 "#{pane_tty}\t#{session_name}:#{window_index}.#{pane_index}"],
+                text=True, timeout=left, stderr=subprocess.DEVNULL,
+            )
+        except (subprocess.SubprocessError, OSError):
+            continue
+        for line in out.splitlines():
+            pane_tty, _, target = line.partition("\t")
+            if pane_tty == want and target:
+                return f"{Path(sock).name}:{target}"
+    return ""
+
+
+def _unreachable_message(session: "Session") -> str:
+    """What to say when a jump finds no window for a session that is still
+    running. There are two such worlds and they want opposite advice.
+
+    A session spawned by another session runs with no terminal window of its
+    own (Max, 2026-09-19, on one a desk had spawned minutes earlier: "both
+    &frontier-curve and &watchman and monitor itself show that
+    &frontier-footholds is active, but jumping from monitor to it throws an
+    error"). Nothing can jump to it, so saying so is the whole job.
+
+    The other world is the one this branch was built for on 2026-06-21: a
+    session that does have a tab, whose title CC's own auto-title clobbered,
+    leaving it reachable by ps but not by title. That one is healed and
+    retried.
+
+    Neither may advise Resume. Resuming a live session spawns a duplicate that
+    Claude Code's single-instance guard kills, which is why this branch exists
+    at all, and the old text sent Max to the one menu item that would do it.
+    """
+    hook = read_hook_state(session.session_id) or {}
+    pane = tmux_pane_for_tty(hook.get("tty", ""))
+    if pane:
+        mlog("jump", "headless_no_window", sid=session.session_id[:12],
+             title=session.title, tmux=pane)
+        return (f"{session.title[:24]} is headless in tmux ({pane}), "
+                f"no window to jump to.")
+    _heal_hook_state(session.session_id)
+    return f"Re-stamped {session.title[:20]}'s tab title. Press Enter → Jump to retry."
+
+
 _hook_state_cache: dict[str, tuple[float, dict]] = {}  # session_id -> (mtime, data)
 
 
@@ -3919,6 +4003,18 @@ def resume_session(session: Session) -> bool:
     keystroke-only) is dropped rather than left as a latent repeat of the
     same collision for any iTerm2 user: it falls through to Terminal.app.
     """
+    # A live session must never be resumed. Claude Code allows one process per
+    # conversation, so a second `claude --resume <sid>` is killed by its
+    # single-instance guard, and whichever of the two loses is not something
+    # this app gets to choose: the layout restore path has refused it as
+    # `skipped_live` from the start, and the jump path refuses it too. The one
+    # way in was the toast that used to tell Max to press Enter -> Resume on a
+    # session it had just confirmed alive (2026-09-19). Closed here as well, so
+    # the menu item cannot do it even when chosen directly.
+    if _is_session_alive(session.session_id):
+        mlog("resume", "refused_alive", sid=session.session_id[:12], title=session.title)
+        return False
+
     cmd, cwd = _resume_command_for(session)
 
     # Verify the JSONL transcript exists before trying to resume
@@ -5628,13 +5724,8 @@ class ClaudeMonitor(App):
                         mlog("DIVERGE", "alive_but_unfound",
                              sid=s.session_id[:12], title=s.title,
                              candidates=_resolve_match_candidates(s))
-                        # Heal stale hook state — find the real PID/TTY
-                        _heal_hook_state(s.session_id)
-                        self.notify(
-                            f"Window not found for {s.title[:20]}. "
-                            "Press Enter → Resume to open in a new tab.",
-                            timeout=6, severity="warning",
-                        )
+                        self.notify(_unreachable_message(s),
+                                    timeout=6, severity="warning")
                     else:
                         ok = resume_session(s)
                         if ok:
@@ -5648,11 +5739,17 @@ class ClaudeMonitor(App):
             elif action == "edit_name":
                 self.action_edit_name()
             elif action == "resume":
-                ok = resume_session(s)
-                if ok:
-                    self.notify(f"Resuming {s.title[:20]}…", timeout=4)
+                if _is_session_alive(s.session_id):
+                    # Refused in resume_session() itself; say why rather than
+                    # reporting a terminal that could not be opened.
+                    self.notify(_unreachable_message(s), timeout=6, severity="warning")
+                    ok = False
                 else:
-                    self.notify("Could not open terminal", timeout=4)
+                    ok = resume_session(s)
+                    if ok:
+                        self.notify(f"Resuming {s.title[:20]}…", timeout=4)
+                    else:
+                        self.notify("Could not open terminal", timeout=4)
                 mlog("menu", "resume_result", sid=s.session_id[:12], success=ok)
                 if ok:
                     self.action_clear_search()
@@ -6311,6 +6408,8 @@ class ClaudeMonitor(App):
         ok = _send_to_terminal_session(s, "/rename")
         if ok:
             self.notify(f"Sent /rename to {s.title[:20]}", timeout=3)
+        elif _is_session_alive(s.session_id):
+            self.notify(_unreachable_message(s), timeout=6, severity="warning")
         else:
             ok = resume_session(s)
             if ok:
@@ -6819,8 +6918,7 @@ def _focus_or_resume_target(target: "Session") -> tuple[bool, str]:
     if _is_session_alive(target.session_id):
         mlog("DIVERGE", "alive_but_unfound", sid=target.session_id[:12], title=target.title,
              candidates=_resolve_match_candidates(target))
-        _heal_hook_state(target.session_id)
-        return False, f"Window not found for {target.title[:20]}. Press Enter → Resume."
+        return False, _unreachable_message(target)
     if resume_session(target):
         _mark_ready_seen(target.session_id, target.status, target.last_activity)
         return True, f"Resuming {target.title[:20]} in new window"

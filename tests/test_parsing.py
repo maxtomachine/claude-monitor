@@ -1,10 +1,11 @@
 """Tests for transcript parsing and session building."""
 
 import json
+import os
 import threading
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import claude_monitor
 from claude_monitor import (
@@ -462,7 +463,11 @@ class TestSessionLiveness:
         transcript = tmp_path / "t.jsonl"
         transcript.write_text("{}\n")
         s = make_session(session_id="sid-1", transcript_path=str(transcript))
+        # The test above resumes the same sid, which leaves it inside the
+        # 60s "recently resumed" grace, and a live session is now refused
+        # before any window is opened. This test is about what the JXA says.
         with patch("claude_monitor.subprocess.run") as run, \
+             patch("claude_monitor._is_session_alive", return_value=False), \
              patch("claude_monitor._derive_cwd_from_transcript", return_value=None):
             run.return_value = type("R", (), {"stdout": "Ghostty", "returncode": 0})()
             resume_session(s)
@@ -1918,3 +1923,209 @@ class TestAResumedSessionIsNotDormant:
         _, rows = self._parse(tmp_path)
         assert [r.session_id for r in rows] == [sid]
         assert time.time() - rows[0].last_activity < 120
+
+
+class TestASessionWithNoWindowIsNotResumed:
+    """A desk spawned a worker at 22:32 on 2026-09-19 that ran with no
+    terminal window of its own. Three sessions could see it running, and the
+    monitor showed it WORKING, but jumping to it said: "Window not found for
+    frontier-footholds. Press Enter → Resume to open in a new tab." (Max:
+    "both &frontier-curve and &watchman and monitor itself show that
+    &frontier-footholds is active, but jumping from monitor to it throws an
+    error".)
+
+    The toast pointed at the one action the code itself refuses to take. Its
+    own comment says why: "If the session's process is alive, its window
+    exists SOMEWHERE - resuming would spawn a duplicate." Claude Code runs one
+    process per conversation, so the duplicate is killed by its single-instance
+    guard, and which of the two dies is not this app's to choose. The premise
+    was also wrong: alive does not imply a window exists. A session can be
+    running under tmux, spawned by another session, with no window anywhere.
+    """
+
+    PANES = ("/dev/ttys016\twork:0.0\n"
+             "/dev/ttys021\tother:1.2\n")
+    SOCKETS = ["/private/tmp/tmux-502/claude-13921",
+               "/private/tmp/tmux-502/claude-2550"]
+
+    def _tmux(self, output=None, error=None, sockets=None):
+        """Patch both halves: which servers exist, and what they answer."""
+        import claude_monitor as cm
+        from contextlib import ExitStack, contextmanager
+
+        @contextmanager
+        def _ctx():
+            with ExitStack() as st:
+                st.enter_context(patch.object(
+                    cm, "tmux_socket_paths",
+                    return_value=self.SOCKETS if sockets is None else sockets))
+                if error is not None:
+                    st.enter_context(patch.object(
+                        cm.subprocess, "check_output", side_effect=error))
+                else:
+                    st.enter_context(patch.object(
+                        cm.subprocess, "check_output", return_value=output))
+                yield
+        return _ctx()
+
+    # --- which servers exist ------------------------------------------------
+
+    def test_it_names_a_socket_rather_than_using_the_default_one(self):
+        """The first cut of this fix ran a bare `tmux list-panes`, which talks
+        to the socket named `default`. On this machine that socket does not
+        exist: each spawned session gets its own `claude-<pid>` server, so the
+        bare command answered "error connecting to .../default" and the fix
+        never fired on the session it was written for (caught in review before
+        it shipped, 2026-09-19)."""
+        import claude_monitor as cm
+        with patch.object(cm, "tmux_socket_paths", return_value=self.SOCKETS), \
+             patch.object(cm.subprocess, "check_output", return_value="") as run:
+            cm.tmux_pane_for_tty("ttys016")
+        asked = [c.args[0] for c in run.call_args_list]
+        assert [a[:3] for a in asked] == [["tmux", "-S", self.SOCKETS[0]],
+                                          ["tmux", "-S", self.SOCKETS[1]]]
+
+    def test_only_sockets_count_as_servers(self, tmp_path):
+        """A stray regular file in the tmux directory is not a server."""
+        import claude_monitor as cm
+        d = tmp_path / f"tmux-{os.getuid()}"
+        d.mkdir()
+        (d / "not-a-socket").write_text("")
+        with patch.dict(os.environ, {"TMUX_TMPDIR": str(tmp_path)}):
+            assert cm.tmux_socket_paths() == []
+
+    def test_no_tmux_directory_at_all(self, tmp_path):
+        import claude_monitor as cm
+        with patch.dict(os.environ, {"TMUX_TMPDIR": str(tmp_path / "nope")}):
+            assert cm.tmux_socket_paths() == []
+
+    # --- who owns the tty --------------------------------------------------
+
+    def test_it_finds_the_pane_holding_that_tty(self):
+        from claude_monitor import tmux_pane_for_tty
+        with self._tmux(self.PANES):
+            assert tmux_pane_for_tty("ttys016") == "claude-13921:work:0.0"
+
+    def test_a_dev_prefixed_tty_matches_too(self):
+        from claude_monitor import tmux_pane_for_tty
+        with self._tmux(self.PANES):
+            assert tmux_pane_for_tty("/dev/ttys016").endswith("work:0.0")
+
+    def test_a_tty_tmux_does_not_own_is_not_a_pane(self):
+        """Every windowed session on the machine has a ttysNNN as well."""
+        from claude_monitor import tmux_pane_for_tty
+        with self._tmux(self.PANES):
+            assert tmux_pane_for_tty("ttys003") == ""
+
+    def test_no_tty_no_question(self):
+        from claude_monitor import tmux_pane_for_tty
+        assert tmux_pane_for_tty("") == ""
+
+    def test_a_machine_without_tmux_just_says_nothing(self):
+        from claude_monitor import tmux_pane_for_tty
+        with self._tmux(error=FileNotFoundError("tmux")):
+            assert tmux_pane_for_tty("ttys016") == ""
+
+    def test_a_dead_socket_does_not_stop_the_search(self):
+        """One server refusing must not hide a pane on the next one."""
+        import claude_monitor as cm
+        import subprocess as sp
+        answers = [sp.CalledProcessError(1, "tmux"), self.PANES]
+        with patch.object(cm, "tmux_socket_paths", return_value=self.SOCKETS), \
+             patch.object(cm.subprocess, "check_output", side_effect=answers):
+            assert cm.tmux_pane_for_tty("ttys016") == "claude-2550:work:0.0"
+
+    def test_a_tmux_that_hangs_does_not_hang_the_jump(self):
+        """The menu handler runs on the UI thread, so the budget is shared
+        across sockets rather than granted to each: eight unresponsive servers
+        must cost one budget, not eight."""
+        import claude_monitor as cm
+        import subprocess as sp
+
+        def hang(*a, timeout=None, **kw):
+            time.sleep(timeout or 0)          # a real one blocks for its timeout
+            raise sp.TimeoutExpired("tmux", timeout or 0)
+
+        with patch.object(cm, "_TMUX_PROBE_BUDGET_S", 0.2), \
+             patch.object(cm, "tmux_socket_paths", return_value=self.SOCKETS * 4), \
+             patch.object(cm.subprocess, "check_output", side_effect=hang):
+            start = time.monotonic()
+            assert cm.tmux_pane_for_tty("ttys016") == ""
+            spent = time.monotonic() - start
+        assert spent < 0.5, f"took {spent:.2f}s: the budget is being granted per socket"
+
+    # --- what the user is told ---------------------------------------------
+
+    def _session(self, tmp_path, tty="ttys016"):
+        states = tmp_path / "states"
+        states.mkdir(exist_ok=True)
+        sid = "106636ae-0000-0000-0000-000000000001"
+        (states / f"{sid}.json").write_text(json.dumps({"tty": tty, "pid": 38260}))
+        return sid, states, make_session(session_id=sid, title="frontier-footholds")
+
+    def _message(self, tmp_path, panes, heal):
+        import claude_monitor as cm
+        sid, states, s = self._session(tmp_path)
+        with patch.object(cm, "HOOK_STATE_DIR", states), \
+             patch.object(cm, "_hook_state_cache", {}), \
+             patch.object(cm.subprocess, "check_output", return_value=panes), \
+             patch.object(cm, "_heal_hook_state", heal):
+            return cm._unreachable_message(s)
+
+    def test_it_names_the_tmux_pane_it_is_running_in(self, tmp_path):
+        heal = MagicMock()
+        msg = self._message(tmp_path, self.PANES, heal)
+        assert "headless" in msg and "work:0.0" in msg
+        heal.assert_not_called()          # its hook state is right, not stale
+
+    def test_it_never_tells_you_to_resume_a_running_session(self, tmp_path):
+        """The whole bug in one assertion."""
+        for panes in (self.PANES, "/dev/ttys099\tsomewhere:0.0\n"):
+            assert "Resume" not in self._message(tmp_path, panes, MagicMock())
+
+    def test_a_windowed_session_with_a_clobbered_title_is_still_healed(self, tmp_path):
+        """The case this branch was built for on 2026-06-21 must survive: a
+        session that HAS a tab, whose title CC's auto-title overwrote."""
+        heal = MagicMock()
+        msg = self._message(tmp_path, "/dev/ttys099\tsomewhere:0.0\n", heal)
+        assert "Jump" in msg and "retry" in msg
+        heal.assert_called_once()
+
+    # --- and the action itself ---------------------------------------------
+
+    def test_resume_refuses_a_live_session(self, tmp_path):
+        """Closed at the primitive, not at each caller: the /rename fallback
+        reached it too."""
+        import claude_monitor as cm
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text("{}\n")
+        s = make_session(session_id="live-1", transcript_path=str(transcript))
+        with patch.object(cm, "_is_session_alive", return_value=True), \
+             patch.object(cm.subprocess, "run") as run:
+            assert cm.resume_session(s) is False
+            run.assert_not_called()       # no window was opened for it to kill
+
+    def test_a_dead_session_still_resumes(self, tmp_path):
+        import claude_monitor as cm
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text("{}\n")
+        s = make_session(session_id="dead-1", transcript_path=str(transcript))
+        with patch.object(cm, "_is_session_alive", return_value=False), \
+             patch.object(cm, "_derive_cwd_from_transcript", return_value=None), \
+             patch.object(cm.subprocess, "run") as run:
+            run.return_value = type("R", (), {"stdout": "Ghostty", "returncode": 0})()
+            assert cm.resume_session(s) is True
+
+    def test_the_jump_path_reports_it_and_does_not_resume(self, tmp_path):
+        import claude_monitor as cm
+        sid, states, s = self._session(tmp_path)
+        with patch.object(cm, "focus_terminal_session", return_value=False), \
+             patch.object(cm, "_is_session_alive", return_value=True), \
+             patch.object(cm, "HOOK_STATE_DIR", states), \
+             patch.object(cm, "_hook_state_cache", {}), \
+             patch.object(cm.subprocess, "check_output", return_value=self.PANES), \
+             patch.object(cm, "resume_session") as resume:
+            ok, msg = cm._focus_or_resume_target(s)
+        assert ok is False
+        assert "work:0.0" in msg
+        resume.assert_not_called()
