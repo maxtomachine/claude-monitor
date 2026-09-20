@@ -1768,3 +1768,153 @@ class TestJumpFindsBackgroundTabsOnEverySpace:
         js = self._script_for(s)
         assert "07a7b852" in js
         assert "tt.includes(sid8)" in js
+
+
+class TestAResumedSessionIsNotDormant:
+    """Reading activity off the transcript's last timestamp fixed dormant
+    sessions floating up as fresh; it broke the mirror case. Reopening a
+    session appends records that carry no timestamp of their own (mode,
+    permission-mode, atis-latch, bridge-session), so on 2026-09-19 a session
+    Max had resumed minutes earlier still answered with its last message, 28
+    hours before: it fell past the archive cutoff, and being pinned with
+    hide_inactive_pins on it left the table altogether while he was working in
+    it. His words: "frontier-curve is active but not showing in monitor even
+    after a refresh."
+
+    So there are two witnesses and the later one wins. The transcript knows
+    when the conversation moved; the session's own state file knows when the
+    session did.
+    """
+
+    SID = "eeeeeeee-0000-0000-0000-00000000000%d"
+
+    def _stamp(self, seconds_ago):
+        from datetime import datetime, timedelta
+        return (datetime.now() - timedelta(seconds=seconds_ago)).isoformat()
+
+    def _hook(self, states, sid, seconds_ago=None, timestamp=None):
+        states.mkdir(parents=True, exist_ok=True)
+        stamp = timestamp if timestamp is not None else self._stamp(seconds_ago)
+        (states / f"{sid}.json").write_text(json.dumps(
+            {"session_id": sid, "state": "busy", "timestamp": stamp}))
+
+    def _resumed_transcript(self, projects, sid, last_message_days):
+        """Last message `last_message_days` ago, then the untimestamped
+        records a reopen appends after it."""
+        from datetime import datetime, timedelta, timezone
+        ts = (datetime.now(timezone.utc)
+              - timedelta(days=last_message_days)).isoformat()
+        p = projects / f"{sid}.jsonl"
+        p.write_text(
+            make_transcript_jsonl(messages=[{"type": "system", "timestamp": ts}])
+            + "\n"
+            + "\n".join(json.dumps({"type": t}) for t in
+                        ("mode", "permission-mode", "atis-latch", "bridge-session"))
+            + "\n")
+        return p
+
+    # --- the witness itself -------------------------------------------------
+
+    def _read(self, states, sid):
+        import claude_monitor as cm
+        with patch.object(cm, "HOOK_STATE_DIR", states), \
+             patch.object(cm, "_hook_state_cache", {}):
+            return cm.hook_activity_time(sid)
+
+    def test_it_reports_the_sessions_own_stamp(self, tmp_path):
+        sid = self.SID % 1
+        self._hook(tmp_path, sid, seconds_ago=30)
+        assert 20 < time.time() - self._read(tmp_path, sid) < 60
+
+    def test_no_state_file_means_no_opinion(self, tmp_path):
+        assert self._read(tmp_path, self.SID % 2) == 0.0
+
+    def test_an_unreadable_stamp_means_no_opinion(self, tmp_path):
+        sid = self.SID % 3
+        self._hook(tmp_path, sid, timestamp="not a time")
+        assert self._read(tmp_path, sid) == 0.0
+
+    def test_a_future_stamp_is_not_evidence(self, tmp_path):
+        """A skewed clock costs this witness its vote; it must not hand it a
+        veto. Clamping a day-ahead stamp to now dated a five-day-dead session
+        0s instead (seen while driving the app, 2026-09-19)."""
+        sid = self.SID % 4
+        self._hook(tmp_path, sid, seconds_ago=-86400)
+        assert self._read(tmp_path, sid) == 0.0
+
+    def test_ordinary_clock_jitter_still_counts(self, tmp_path):
+        """A stamp a breath ahead is the hook and the clock disagreeing by
+        milliseconds, not a broken clock."""
+        sid = self.SID % 9
+        self._hook(tmp_path, sid, seconds_ago=-0.5)
+        assert self._read(tmp_path, sid) > time.time() - 60
+
+    def test_a_future_stamp_leaves_the_transcript_to_answer(self, tmp_path):
+        """And the row keeps the age the conversation earned."""
+        sid = self.SID % 4
+        projects = tmp_path / "projects" / "-Users-u-work"
+        projects.mkdir(parents=True)
+        self._resumed_transcript(projects, sid, last_message_days=5)
+        self._hook(tmp_path / "states", sid, seconds_ago=-86400)
+        _, rows = self._parse(tmp_path, include_archived=True)
+        assert len(rows) == 1
+        assert 4.5 * 86400 < time.time() - rows[0].last_activity < 5.5 * 86400
+
+    # --- what the table does with it ---------------------------------------
+
+    def _parse(self, tmp_path, include_archived=False):
+        projects = tmp_path / "projects" / "-Users-u-work"
+        projects.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "sessions").mkdir(exist_ok=True)
+        with patch("claude_monitor.CLAUDE_DIR", tmp_path / "projects"), \
+             patch("claude_monitor.SESSIONS_DIR", tmp_path / "sessions"), \
+             patch("claude_monitor.HOOK_STATE_DIR", tmp_path / "states"), \
+             patch("claude_monitor._hook_state_cache", {}), \
+             patch("claude_monitor._refresh_pid_map"), \
+             patch("claude_monitor._pid_map", {}), \
+             patch("claude_monitor._is_session_alive", return_value=False), \
+             patch("claude_monitor._gc_state_files"), \
+             patch("claude_monitor.load_index_metadata", return_value={}):
+            return projects, parse_sessions(include_archived=include_archived)
+
+    def test_a_resumed_session_keeps_its_place(self, tmp_path):
+        """The reported shape: reopened, worked in, gone from the table."""
+        sid = self.SID % 5
+        projects = tmp_path / "projects" / "-Users-u-work"
+        projects.mkdir(parents=True)
+        self._resumed_transcript(projects, sid, last_message_days=2)
+        self._hook(tmp_path / "states", sid, seconds_ago=30)
+        _, rows = self._parse(tmp_path)
+        assert [r.session_id for r in rows] == [sid]
+        assert time.time() - rows[0].last_activity < 120
+
+    def test_a_touched_dormant_session_is_still_not_resurrected(self, tmp_path):
+        """The first bug, guarded: a state file as old as the conversation
+        leaves the verdict where the transcript put it."""
+        sid = self.SID % 6
+        projects = tmp_path / "projects" / "-Users-u-work"
+        projects.mkdir(parents=True)
+        self._resumed_transcript(projects, sid, last_message_days=5)
+        self._hook(tmp_path / "states", sid, seconds_ago=5 * 86400)
+        _, rows = self._parse(tmp_path)
+        assert rows == []
+
+    def test_a_dormant_session_with_no_state_file_is_still_dormant(self, tmp_path):
+        sid = self.SID % 7
+        projects = tmp_path / "projects" / "-Users-u-work"
+        projects.mkdir(parents=True)
+        self._resumed_transcript(projects, sid, last_message_days=5)
+        _, rows = self._parse(tmp_path)
+        assert rows == []
+
+    def test_the_older_witness_never_drags_a_live_session_down(self, tmp_path):
+        """Later wins: a stale state file left by a crashed hook must not
+        archive a session that spoke a minute ago."""
+        sid = self.SID % 8
+        projects = tmp_path / "projects" / "-Users-u-work"
+        projects.mkdir(parents=True)
+        self._resumed_transcript(projects, sid, last_message_days=0)
+        self._hook(tmp_path / "states", sid, seconds_ago=9 * 86400)
+        _, rows = self._parse(tmp_path)
+        assert [r.session_id for r in rows] == [sid]
+        assert time.time() - rows[0].last_activity < 120

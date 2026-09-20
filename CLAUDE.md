@@ -253,9 +253,40 @@ This also quietly fixes acks. `_effective_seen_count()` voids a seen-mark when
 every READY row Max had already checked, which is some of the "they are
 turning yellow on me" he reported in August and we only half explained then.
 
+### Two witnesses, and the later one wins
+
+Reading activity off the transcript alone reads a live session as dormant,
+which is the same bug pointing the other way. Reopening a session appends
+records that carry no timestamp of their own (`mode`, `permission-mode`,
+`atis-latch`, `bridge-session`), so the file grows while its newest timestamp
+stays put. On 2026-09-19 a session Max had resumed minutes earlier still
+answered with its last message, 28 hours back: past the archive cutoff, so
+`parse_sessions()` handed it back labelled `archived`, and being pinned with
+`hide_inactive_pins` on it left the table altogether while he was working in
+it ("frontier-curve is active but not showing in monitor even after a
+refresh"). Measured on the file at 20:03 that evening: mtime seconds old, last
+timestamp anywhere in its final 200KB from 16:15 the day before.
+
+So `last_activity` is now `max(transcript_activity_time, hook_activity_time)`.
+The transcript knows when the conversation moved; the session's own state file
+(`~/.claude/session-states/<sid>.json`, written by the hooks on every state
+change) knows when the SESSION moved, which covers the resume. Nothing
+rewrites those in bulk the way the updater rewrites transcripts: measured the
+same way on the same machine, across 172 of them not one second holds five or
+more, so the touch wave that started all this moves neither witness.
+
+A state-file stamp in the future is not evidence that something just happened,
+so past a minute of clock jitter it is thrown away and the transcript answers
+alone. The first cut clamped it to now instead, which dated a five-day-dead
+session `0s`, caught by driving the app rather than by the tests, which is
+twice in a row now that the before/after capture found what unit tests could
+not.
+
 The general rule, the same one the PID-file section ends on: the monitor reads
 files it does not own. When a reading can be produced by something other than
-the thing it is meant to measure, measure the thing instead.
+the thing it is meant to measure, measure the thing instead. And when one
+witness cannot see the whole thing, add the second witness rather than
+sharpening the first.
 
 
 ## A PID file is not always a session

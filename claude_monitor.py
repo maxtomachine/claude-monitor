@@ -438,6 +438,17 @@ def parse_timestamp(ts: str) -> float:
 # So activity is read from the transcript's own last timestamp. The tail is
 # enough (entries are appended, and 64KB covers many), and the result is cached
 # by mtime, so a touched file is re-read once rather than on every 3s refresh.
+#
+# That alone reads a live session as dormant, which is the same bug pointing the
+# other way. Reopening a session appends records that carry no timestamp of
+# their own (mode, permission-mode, atis-latch, bridge-session), so on
+# 2026-09-19 a session Max had just resumed still answered with its last
+# message, 28 hours earlier: it crossed the archive cutoff, and being pinned
+# with hide_inactive_pins on, it left the table entirely while he was working in
+# it ("frontier-curve is active but not showing in monitor even after a
+# refresh"). Hence two witnesses, taking the later: the transcript knows when
+# the conversation moved, the session's own state file knows when the session
+# did, and a wave of touched files moves neither.
 _TS_RE = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')  # CC writes it tight, but don't depend on that
 _TAIL_BYTES = 65536
 _activity_cache: dict[str, tuple[float, float]] = {}  # path -> (mtime, activity)
@@ -471,6 +482,30 @@ def transcript_activity_time(path: str, mtime: float | None = None) -> float:
         activity = 0.0
     _activity_cache[path] = (mtime, activity)
     return activity
+
+
+def hook_activity_time(session_id: str) -> float:
+    """When the session's own hooks last said it was doing something.
+
+    The transcript's own timestamps answer that for a conversation, but not
+    for a session that was just reopened: the records Claude Code writes on a
+    resume (mode, permission-mode, bridge-session) carry no timestamp of their
+    own, so a session resumed after a day of silence still reads a day old no
+    matter how much has been appended since. Its state file does carry one, and
+    nothing rewrites those in bulk the way the updater rewrites transcripts:
+    measured the same way on the same machine, across 172 of them not one
+    second holds five or more (2026-09-19). A stamp in the future is not
+    evidence that something just happened, so past a minute of clock jitter it
+    is no evidence at all and the transcript answers alone: a skewed clock
+    should cost this witness its vote, not hand it a veto. Clamping such a
+    stamp to now instead dated a five-day-dead session 0s, seen while driving
+    the app the day this was written.
+    """
+    hook = read_hook_state(session_id)
+    if not hook:
+        return 0.0
+    stamp = parse_timestamp(hook.get("timestamp", ""))
+    return stamp if stamp <= time.time() + 60 else 0.0
 
 
 def transcript_is_fresh(path: str, within: float) -> bool:
@@ -944,8 +979,13 @@ def parse_sessions(include_archived: bool = False,
         session_id = jsonl_path.stem
         is_pinned = session_id in pinned
         # Every age question below, and the row's own last_activity, ask when
-        # the conversation last moved, not when the file was last written.
-        activity = transcript_activity_time(str(jsonl_path), mtime) or mtime
+        # the session last moved, not when its file was last written. Two
+        # witnesses answer that, and the later one wins: neither sees
+        # everything on its own (see the note above _TS_RE).
+        activity = max(
+            transcript_activity_time(str(jsonl_path), mtime),
+            hook_activity_time(session_id),
+        ) or mtime
 
         # A pin is a permanent exemption from every age filter here. It stays
         # until you unpin it, full stop (Max: "pins should stay until I unpin
