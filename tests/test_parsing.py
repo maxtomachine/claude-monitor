@@ -782,6 +782,107 @@ class TestTranscriptCustomTitle:
         assert st.read_transcript_custom_title(str(t)) == ""
 
 
+class TestHookPidTtyAcrossResume:
+    """A resumed session keeps its sid and gets a new process and tab. The
+    hook used to keep whatever pid/tty the state file already held, on every
+    event including SessionStart, so after a hand-run `claude --resume` the
+    file named a dead pid forever, the `·sid8` title went to the old tty, and
+    the monitor logged DIVERGE/stale_hook_pid on every tick (5,839 lines in
+    fifteen minutes, 2026-09-20). Mutation-checked: putting the bare
+    `if existing_pid and existing_tty:` back fails three of these five (the
+    SessionStart one, the dead-pid one, and the failed-rediscovery one)."""
+
+    SID = "resumed0-0000-0000-0000-000000000000"
+    OLD = (111, "ttys001")
+    NEW = (4242, "ttys099")
+
+    def _hook(self, tmp_path, monkeypatch, *, alive, found=None):
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / "hooks"))
+        import session_tracker as st
+        monkeypatch.setattr(st, "LOCAL_STATE_DIR", tmp_path)
+        walks, titles = [], []
+        found = self.NEW if found is None else found
+
+        def fake_find(sid):
+            walks.append(sid)
+            return found
+
+        monkeypatch.setattr(st, "find_claude_pid_and_tty", fake_find)
+        monkeypatch.setattr(st, "_pid_alive", lambda pid: alive)
+        # Never let a test write an escape sequence to a real terminal.
+        monkeypatch.setattr(
+            st, "set_terminal_title",
+            lambda tty, state, sid, name: titles.append(tty))
+        (tmp_path / f"{self.SID}.json").write_text(json.dumps({
+            "session_id": self.SID, "state": "idle", "cwd": "/tmp/proj",
+            "pid": self.OLD[0], "tty": self.OLD[1],
+            "started_at": "2026-09-20T16:00:00",
+            "state_entered_at": "2026-09-20T16:00:00",
+        }))
+        return st, walks, titles
+
+    def _stored(self, tmp_path):
+        d = json.loads((tmp_path / f"{self.SID}.json").read_text())
+        return d["pid"], d["tty"]
+
+    def test_session_start_rediscovers_even_when_the_old_pid_looks_alive(
+            self, tmp_path, monkeypatch):
+        # alive=True is pid reuse: the old number belongs to someone else now.
+        st, walks, titles = self._hook(tmp_path, monkeypatch, alive=True)
+        st.write_state(self.SID, "idle", "/tmp/proj", event="session_start")
+        assert walks == [self.SID]
+        assert self._stored(tmp_path) == self.NEW
+        assert titles == ["ttys099"], "the marker must land on the NEW tab"
+
+    def test_live_process_keeps_its_cached_pid_and_pays_no_ps_walk(
+            self, tmp_path, monkeypatch):
+        st, walks, titles = self._hook(tmp_path, monkeypatch, alive=True)
+        st.write_state(self.SID, "idle", "/tmp/proj")
+        assert walks == [], "the cache exists to spare a ps walk per tool call"
+        assert self._stored(tmp_path) == self.OLD
+        assert titles == [], "nothing changed, so the tty is left alone"
+
+    def test_dead_cached_pid_is_rediscovered_on_any_event(
+            self, tmp_path, monkeypatch):
+        # A session resumed before this fix, or whose SessionStart never ran.
+        st, walks, titles = self._hook(tmp_path, monkeypatch, alive=False)
+        st.write_state(self.SID, "idle", "/tmp/proj")
+        assert walks == [self.SID]
+        assert self._stored(tmp_path) == self.NEW
+        assert titles == ["ttys099"], "a new tab is stamped once, right away"
+
+    def test_failed_rediscovery_is_never_worse_than_before(
+            self, tmp_path, monkeypatch):
+        st, walks, _ = self._hook(tmp_path, monkeypatch, alive=False,
+                                  found=(0, ""))
+        st.write_state(self.SID, "idle", "/tmp/proj")
+        assert walks == [self.SID]
+        assert self._stored(tmp_path) == self.OLD
+
+    def test_pid_alive_reads_the_os_without_a_subprocess(self):
+        import subprocess
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / "hooks"))
+        import session_tracker as st
+        assert st._pid_alive(os.getpid()) is True
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        assert st._pid_alive(child.pid) is False
+        # pid 1 exists and is not ours: EPERM means alive, not dead.
+        assert st._pid_alive(1) is True
+
+    def test_a_damaged_pid_field_reads_as_dead_and_never_raises(self):
+        # Driving the hook's command line with these in a state file crashed
+        # it (TypeError, OverflowError) before the guard; -1 read as alive,
+        # since signal 0 to pid -1 means "everyone I may signal".
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / "hooks"))
+        import session_tracker as st
+        for bad in ("abc", 123.5, -1, 0, 1 << 40, None, True, [4242]):
+            assert st._pid_alive(bad) is False, bad
+
+
 class TestSessionMemoryTitle:
     def test_missing_file(self, tmp_path):
         assert read_session_memory_title(str(tmp_path / "fake.jsonl")) == ""

@@ -107,3 +107,28 @@ transcript at `~/.claude/projects/<slug>/<sid>.jsonl`.
 
 Jump, layout save/restore and anything else touching Accessibility or
 Ghostty cannot run headless or sandboxed. Say so rather than guessing.
+
+## The hook is a second surface (`hooks/session_tracker.py`)
+
+It is live the moment you save it: `~/.claude/hooks/session_tracker.py` is
+a symlink into this checkout, and every session on the machine runs it on
+every event. `python3 -m py_compile` it right after each edit.
+
+Its surface is `~/.claude/session-states/<sid>.json` and the tab title,
+and the harness runs it OUTSIDE the sandbox, where `ps` works. Piped from
+the Bash tool it runs inside, where `ps` is "operation not permitted" and
+`find_claude_pid_and_tty()` returns `(0, "")`. So:
+
+- **Real path:** stage your OWN session's state file (write it atomically,
+  keep `state: "thinking"`, since tool events return early on `idle`), and
+  the next tool call's PostToolUse fires the real hook. Read the file back
+  in the following call. Bash calls issued in one block fire all their
+  PreToolUse hooks up front; commands and PostToolUse then go in order.
+  Use a tty like `ttys999` when staging so a fallback write reaches no
+  one's tab. For a before/after, put `git show HEAD:hooks/...` live for
+  one call, stage, read, put the new build back.
+- **Edge probes:** `HOME=$(mktemp -d)` with a seeded
+  `.claude/session-states/<sid>.json`, tty `"??"`, and pipe
+  `{"session_id": ..., "cwd": ...}` into `session_tracker.py <event>`.
+  Check the exit code: a traceback here is a hook error on every tool
+  call in the real thing.

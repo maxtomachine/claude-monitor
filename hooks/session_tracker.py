@@ -65,6 +65,23 @@ def find_claude_pid_and_tty(session_id: str) -> tuple[int, str]:
     return 0, ""
 
 
+def _pid_alive(pid) -> bool:
+    """False when the OS says there is no such process, or when the stored
+    value could not be a pid at all: a hand-edited or damaged state file
+    must never crash a hook that runs on every tool call. Signal 0 costs no
+    subprocess, so this can run on every hook event."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, OverflowError):
+        return False
+    except OSError:
+        # EPERM and friends: something owns that pid, just not us.
+        return True
+    return True
+
+
 STATE_EMOJI = {
     "thinking": "⠐",
     "idle": "✳",
@@ -395,7 +412,16 @@ def write_state(
             except (ValueError, TypeError):
                 pass
 
-    if existing_pid and existing_tty:
+    # The stored pid/tty spare a `ps` walk on every tool call, but they are
+    # only good for the process that wrote them. A resumed session keeps its
+    # sid and gets a new process and usually a new tab: kept blindly, the
+    # file named a dead pid forever, the `·sid8` title went to the old tty,
+    # and the monitor logged stale_hook_pid on every tick (2026-09-20, a
+    # hand-run `claude --resume`). So SessionStart always re-discovers, and
+    # any other event re-discovers once the stored pid is gone, which also
+    # heals a session whose SessionStart ran before this fix or never ran.
+    if (existing_pid and existing_tty and event != "session_start"
+            and _pid_alive(existing_pid)):
         pid, tty = existing_pid, existing_tty
     else:
         pid, tty = find_claude_pid_and_tty(session_id)
@@ -435,10 +461,12 @@ def write_state(
 
     # Only touch TTY on state/title/display-name changes — writing escape
     # sequences on every tool call corrupts the input buffer when background
-    # tasks fire hooks while the user is typing.
+    # tasks fire hooks while the user is typing. A changed tty is a new tab
+    # that has never carried the marker, so it gets stamped once, now.
     old_cwd_name = Path(existing_cwd).name if existing_cwd else ""
     old_display = existing_title or old_cwd_name or "Claude"
-    if state != existing_state or display_name != old_display or event == "session_start":
+    if (state != existing_state or display_name != old_display
+            or event == "session_start" or tty != existing_tty):
         set_terminal_title(tty, state, session_id, display_name)
 
     # On Stop, Claude overwrites our title with its auto-generated summary
