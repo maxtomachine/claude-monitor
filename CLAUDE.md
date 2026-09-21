@@ -758,6 +758,7 @@ This project layers multiple technologies in unusual ways: bash statusline scrip
 
 ## Key conventions
 
+- **This checkout is live. Keep it on `main`; develop in a worktree.** `install.sh` points everything at this working tree: `~/.claude/hooks/session_tracker.py` is a symlink into it, and so are `jumpback`, `claude-jump` and the `claude-monitor` launcher. The hook is the one that bites: every Claude session on the machine runs whatever `hooks/session_tracker.py` this tree holds, on every event, from the moment a file is saved or a branch is switched, and nothing announces it. A half-saved edit is a hook error in every session; a `git switch`, stash, bisect or rebase here quietly takes a merged fix off live (2026-09-20: a fix sat on a side branch in this checkout for an hour and only stayed live because the checkout stayed on that branch). So: `git worktree add ../claude-monitor-<topic> -b <branch>` for any work, tests there, and put a hook change live only on purpose (the verify skill says how to drive it). After a merge, `git pull --ff-only` here is the deploy.
 - **No direct pushes to main** — all changes go through PRs
 - **Python 3.12+** (venv is 3.12.13, `requires-python>=3.12`): modern syntax (union types, etc.) is fine; 3.14-only syntax is not
 - **Dependencies**: `textual` for TUI, `rich` for markup. Dev: `pytest`, `pytest-asyncio`
