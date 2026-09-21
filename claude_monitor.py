@@ -2037,6 +2037,31 @@ def read_hook_state(session_id: str) -> dict | None:
 _THINKING_STALE_S = 180  # hook silence before we stop trusting "thinking"
 
 
+def _cc_says_busy(session_id: str, hook: dict | None = None) -> bool:
+    """Does Claude Code itself say this session is mid-turn?
+
+    CC writes its own status into ~/.claude/sessions/<pid>.json and flips it
+    to idle when the turn ends, so the field is edge-triggered rather than a
+    heartbeat: a stale updatedAt on a "busy" record is normal and means the
+    turn is still the one that set it. It is the only witness that can tell
+    "thinking for ninety seconds with nothing to show yet" apart from
+    "finished and waiting for Max", which no file mtime can.
+
+    Measured across eight live sessions on 2026-09-20 it agreed with the
+    truth on all eight, while the hook state said "idle" for four sessions
+    that were working. Trusted only alongside _is_session_alive, which is
+    what stops a crashed process's last "busy" from being believed.
+    """
+    pid = _pid_map.get(session_id) or (hook or {}).get("pid")
+    if not pid:
+        return False
+    try:
+        pdata = json.loads((SESSIONS_DIR / f"{pid}.json").read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    return pdata.get("sessionId") == session_id and pdata.get("status") == "busy"
+
+
 def _thinking_is_stale(session_id: str, hook: dict, transcript_path: str) -> bool:
     """A hook 'thinking' state is an event-log entry, not a liveness signal:
     if the turn's Stop event never fires (slash-command / subagent /
@@ -2056,14 +2081,8 @@ def _thinking_is_stale(session_id: str, hook: dict, transcript_path: str) -> boo
     if transcript_path:
         if transcript_is_fresh(transcript_path, _THINKING_STALE_S):
             return False
-    pid = _pid_map.get(session_id) or hook.get("pid")
-    if pid:
-        try:
-            pdata = json.loads((SESSIONS_DIR / f"{pid}.json").read_text())
-            if pdata.get("sessionId") == session_id and pdata.get("status") == "busy":
-                return False
-        except (OSError, json.JSONDecodeError, ValueError):
-            pass
+    if _cc_says_busy(session_id, hook):
+        return False
     return True
 
 
@@ -2142,7 +2161,18 @@ def determine_status(session_id: str, last_assistant_time: float,
     if not alive:
         return "closed"
 
+    hook = read_hook_state(session_id)
+
     def _is_streaming_or_background() -> bool:
+        # CC's own pid record first: the hook writes "idle" between tool
+        # calls, so most working sessions arrive here, and a turn that is
+        # thinking or running one long tool touches no file at all. Both
+        # tests below are mtime windows of seconds (5s and 15s), which
+        # cannot see a session that is busy and quiet - Max, 2026-09-20,
+        # on a session 1h40m into one turn: "some agents that are working
+        # are getting misclassified as ready".
+        if _cc_says_busy(session_id, hook):
+            return True
         if not transcript_path:
             return False
         # Hook says idle, but if the transcript itself is being appended to,
@@ -2153,7 +2183,6 @@ def determine_status(session_id: str, last_assistant_time: float,
         return count_background_activity(transcript_path) > 0
 
     # Tier 1: hook state files (real-time, event-driven)
-    hook = read_hook_state(session_id)
     if hook:
         hook_state = hook.get("state", "")
         if hook_state == "thinking":

@@ -2417,3 +2417,82 @@ class TestATransitionSaysWhatItWasReadFrom:
             w = cm._status_witnesses("no-such-sid")
         assert w["hook"] == "-"
         assert w["pid_status"] == ""
+
+
+class TestCCsOwnBusyFlagIsAWitness:
+    """Max, 2026-09-20, pointing at a session 1h40m into a single turn that
+    the table called READY 1h: "some agents that are working are getting
+    misclassified as ready". The hook writes "idle" between tool calls, so
+    almost every working session lands in the idle branch, and that branch
+    asked only two questions, both mtime windows of seconds: did the
+    transcript move in the last 5s, did a subagent write in the last 15s. A
+    session thinking with max effort, or running one long tool, touches no
+    file at all and answers no to both. CC's own pid record says busy for
+    exactly that session, and was right on all eight live sessions sampled
+    that evening while the hook state was wrong on four."""
+
+    SID = "feed0000-0000-0000-0000-000000000001"
+
+    def _world(self, tmp_path, pid_status="busy", serves=None, write_pid=True,
+               hook_state="idle"):
+        import claude_monitor as cm
+        sessions = tmp_path / "sessions"; sessions.mkdir(exist_ok=True)
+        if write_pid:
+            (sessions / "7777.json").write_text(json.dumps(
+                {"pid": 7777, "sessionId": serves or self.SID, "status": pid_status}))
+        quiet = tmp_path / "quiet.jsonl"          # no subagents, never touched
+        quiet.write_text("{}")
+        os.utime(quiet, (time.time() - 3600, time.time() - 3600))
+        return patch.multiple(
+            "claude_monitor",
+            _is_session_alive=MagicMock(return_value=True),
+            _pid_map={self.SID: 7777},
+            SESSIONS_DIR=sessions,
+            read_hook_state=MagicMock(return_value={"state": hook_state, "pid": 7777}),
+            SIGNALS_DIR=tmp_path / "no-signals",
+        ), str(quiet)
+
+    def test_busy_and_quiet_is_working_not_ready(self, tmp_path):
+        """The reported bug: nothing has been written for an hour because the
+        model is thinking, and CC says the turn is still running."""
+        import claude_monitor as cm
+        world, quiet = self._world(tmp_path, pid_status="busy")
+        with world:
+            assert cm.determine_status(self.SID, 0, "frontier-footholds", quiet) == "working"
+
+    def test_idle_and_quiet_is_still_ready(self, tmp_path):
+        """The fix must not pin every row to working: a finished session has
+        the same silence, and CC says so."""
+        import claude_monitor as cm
+        world, quiet = self._world(tmp_path, pid_status="idle")
+        with world:
+            assert cm.determine_status(self.SID, 0, "frontier-strategy", quiet) == "done"
+
+    def test_a_recycled_pid_does_not_lend_its_busy_to_someone_else(self, tmp_path):
+        import claude_monitor as cm
+        world, quiet = self._world(tmp_path, pid_status="busy", serves="other-sid")
+        with world:
+            assert cm.determine_status(self.SID, 0, "x", quiet) == "done"
+
+    def test_a_missing_pid_record_falls_back_rather_than_raising(self, tmp_path):
+        import claude_monitor as cm
+        world, quiet = self._world(tmp_path, write_pid=False)
+        with world:
+            assert cm.determine_status(self.SID, 0, "x", quiet) == "done"
+
+    def test_the_thinking_staleness_guard_still_honours_busy(self, tmp_path):
+        """Regression: _thinking_is_stale used its own inline copy of this
+        check before the helper existed."""
+        import claude_monitor as cm
+        world, quiet = self._world(tmp_path, pid_status="busy", hook_state="thinking")
+        old = {"state": "thinking", "pid": 7777,
+               "timestamp": "2020-01-01T00:00:00"}       # silent for years
+        with world:
+            assert cm._thinking_is_stale(self.SID, old, quiet) is False
+
+    def test_a_stale_thinking_hook_with_nothing_behind_it_is_still_stale(self, tmp_path):
+        import claude_monitor as cm
+        world, quiet = self._world(tmp_path, pid_status="idle", hook_state="thinking")
+        old = {"state": "thinking", "pid": 7777, "timestamp": "2020-01-01T00:00:00"}
+        with world:
+            assert cm._thinking_is_stale(self.SID, old, quiet) is True
