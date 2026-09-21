@@ -2174,3 +2174,145 @@ class TestASessionWithNoWindowIsNotResumed:
         pane = cm.TmuxPane("/sock", "work:0.0")
         with patch.object(cm, "_open_ghostty_window", return_value=""):
             assert cm.attach_tmux_pane(s, pane) is False
+
+
+class TestAStandingConditionIsLoggedOnceNotPerTick:
+    """A hook state whose PID now serves a different sid stays true on every
+    refresh until the session dies. On 2026-09-20 that one fact wrote 5,839
+    lines in fifteen minutes and made up 82% of monitor.log, rotating away
+    the jump history a live diagnosis was being read out of. The condition
+    must be logged when it CHANGES, never per tick."""
+
+    def setup_method(self):
+        import claude_monitor as cm
+        cm._stale_hook_pid_seen.clear()
+
+    @staticmethod
+    def _stale(tmp_path, serves="unrelated-sid", pid=4538):
+        (tmp_path / f"{pid}.json").write_text(
+            '{"sessionId": "%s", "pid": %d}' % (serves, pid))
+        return patch.multiple(
+            "claude_monitor",
+            _pid_map={},
+            _refresh_pid_map=MagicMock(),
+            _recently_resumed={},
+            read_hook_state=MagicMock(return_value={"pid": pid}),
+            _pid_is_claude=MagicMock(return_value=True),
+            SESSIONS_DIR=tmp_path,
+        )
+
+    def test_it_logs_the_same_stale_pid_once_however_often_it_is_asked(self, tmp_path):
+        with self._stale(tmp_path), patch("claude_monitor.mlog") as m:
+            for _ in range(50):
+                assert _is_session_alive("old-sid") is False
+        stale = [c for c in m.call_args_list if c.args[:2] == ("DIVERGE", "stale_hook_pid")]
+        assert len(stale) == 1, f"{len(stale)} copies of one standing fact"
+
+    def test_it_speaks_again_when_the_pid_starts_serving_someone_else(self, tmp_path):
+        with self._stale(tmp_path, serves="second-sid"), patch("claude_monitor.mlog") as m:
+            _is_session_alive("old-sid")
+            _is_session_alive("old-sid")
+        with self._stale(tmp_path, serves="third-sid"), patch("claude_monitor.mlog") as m2:
+            _is_session_alive("old-sid")
+            _is_session_alive("old-sid")
+        assert len([c for c in m.call_args_list
+                    if c.args[:2] == ("DIVERGE", "stale_hook_pid")]) == 1
+        assert len([c for c in m2.call_args_list
+                    if c.args[:2] == ("DIVERGE", "stale_hook_pid")]) == 1
+
+    def test_it_forgets_once_the_session_is_healthy_so_a_relapse_is_heard(self, tmp_path):
+        with self._stale(tmp_path), patch("claude_monitor.mlog"):
+            _is_session_alive("old-sid")
+        # The PID file now names old-sid itself: the session is alive again.
+        with self._stale(tmp_path, serves="old-sid"), patch("claude_monitor.mlog"):
+            assert _is_session_alive("old-sid") is True
+        with self._stale(tmp_path), patch("claude_monitor.mlog") as m:
+            _is_session_alive("old-sid")
+        assert len([c for c in m.call_args_list
+                    if c.args[:2] == ("DIVERGE", "stale_hook_pid")]) == 1
+
+    def test_it_remembers_per_session_not_globally(self, tmp_path):
+        with self._stale(tmp_path), patch("claude_monitor.mlog") as m:
+            _is_session_alive("one-sid")
+            _is_session_alive("one-sid")
+            _is_session_alive("other-sid")
+            _is_session_alive("other-sid")
+        stale = [c for c in m.call_args_list if c.args[:2] == ("DIVERGE", "stale_hook_pid")]
+        assert len(stale) == 2
+        assert {c.kwargs["sid"] for c in stale} == {"one-sid", "other-sid"}
+
+    def test_quieting_the_log_does_not_change_the_verdict(self, tmp_path):
+        """Dedupe touches what is SAID, never what is decided."""
+        with self._stale(tmp_path), patch("claude_monitor.mlog"):
+            assert [_is_session_alive("old-sid") for _ in range(5)] == [False] * 5
+
+
+class TestATransitionSaysWhatItWasReadFrom:
+    """Max, 2026-09-20: "monitor is showing you as ready right now (when you
+    are working)". The row flapped working/done every 10-20s in his running
+    monitor and could not be reproduced from outside it, because by the time
+    anyone looks, every witness file has changed. So a transition carries the
+    witnesses that produced it."""
+
+    def _hook(self, tmp_path, **over):
+        from datetime import datetime
+        sid = "cafe0000-0000-0000-0000-000000000001"
+        states = tmp_path / "states"; states.mkdir(exist_ok=True)
+        state = {"state": "thinking", "pid": 4538, "tool": "Bash",
+                 "timestamp": datetime.now().isoformat()}
+        state.update(over)
+        (states / f"{sid}.json").write_text(json.dumps(state))
+        return sid, states
+
+    def test_it_names_the_hook_state_and_the_tool_in_flight(self, tmp_path):
+        import claude_monitor as cm
+        sid, states = self._hook(tmp_path)
+        sessions = tmp_path / "sessions"; sessions.mkdir()
+        (sessions / "4538.json").write_text(json.dumps({"sessionId": sid, "status": "busy"}))
+        with patch.object(cm, "HOOK_STATE_DIR", states), \
+             patch.object(cm, "_hook_state_cache", {}), \
+             patch.object(cm, "SESSIONS_DIR", sessions), \
+             patch.object(cm, "_pid_map", {}):
+            w = cm._status_witnesses(sid)
+        assert w["hook"] == "thinking"
+        assert w["tool"] == "Bash"
+        assert w["pid_status"] == "busy"
+        assert 0 <= w["hook_age"] < 5
+
+    def test_it_says_when_the_pid_now_serves_a_different_session(self, tmp_path):
+        import claude_monitor as cm
+        sid, states = self._hook(tmp_path)
+        sessions = tmp_path / "sessions"; sessions.mkdir()
+        (sessions / "4538.json").write_text(
+            json.dumps({"sessionId": "dddddddd-0000", "status": "busy"}))
+        with patch.object(cm, "HOOK_STATE_DIR", states), \
+             patch.object(cm, "_hook_state_cache", {}), \
+             patch.object(cm, "SESSIONS_DIR", sessions), \
+             patch.object(cm, "_pid_map", {}):
+            w = cm._status_witnesses(sid)
+        assert w["pid_status"] == "serves:dddddddd"
+
+    def test_a_logger_never_throws_on_junk(self, tmp_path):
+        """Nothing here may raise: it runs inside the refresh that draws the
+        table, so a bad timestamp or a missing pid file must degrade, not
+        take the screen down."""
+        import claude_monitor as cm
+        sid, states = self._hook(tmp_path, timestamp="not-a-time")
+        with patch.object(cm, "HOOK_STATE_DIR", states), \
+             patch.object(cm, "_hook_state_cache", {}), \
+             patch.object(cm, "SESSIONS_DIR", tmp_path / "nope"), \
+             patch.object(cm, "_pid_map", {}):
+            w = cm._status_witnesses(sid, "/nonexistent/x.jsonl")
+        assert w["hook_age"] == -1.0
+        assert w["pid_status"] == "unreadable"
+        assert w["fresh5"] is False
+
+    def test_no_hook_state_at_all_is_reported_not_guessed(self, tmp_path):
+        import claude_monitor as cm
+        states = tmp_path / "states"; states.mkdir()
+        with patch.object(cm, "HOOK_STATE_DIR", states), \
+             patch.object(cm, "_hook_state_cache", {}), \
+             patch.object(cm, "_pid_map", {}):
+            w = cm._status_witnesses("no-such-sid")
+        assert w["hook"] == "-"
+        assert w["pid_status"] == ""

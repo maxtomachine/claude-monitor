@@ -1501,6 +1501,16 @@ def _pid_is_claude(pid: int) -> bool:
             and ".app" not in comm)
 
 
+# A hook state whose PID now serves a different sid is a standing condition,
+# not an event: it stays true on every refresh until the session dies or the
+# sweep heals it. Logging it per tick buries the log the log exists for -
+# 5,839 copies of two facts in fifteen minutes on 2026-09-20, 82% of the
+# file, evicting the jump history a diagnosis was being read out of. So
+# remember what was already said and speak only on a change, the same shape
+# as _last_discrepancy_keys in the reconcile sweep.
+_stale_hook_pid_seen: dict[str, str] = {}
+
+
 def _is_session_alive(session_id: str, display_title: str = "") -> bool:
     """Check if the Claude process for this session is still running.
 
@@ -1546,9 +1556,13 @@ def _is_session_alive(session_id: str, display_title: str = "") -> bool:
                 except (OSError, json.JSONDecodeError):
                     pass
                 if now_serves and now_serves != session_id:
-                    mlog("DIVERGE", "stale_hook_pid", sid=session_id[:12], pid=pid,
-                         now_serves=now_serves[:12])
+                    seen = f"{pid}:{now_serves}"
+                    if _stale_hook_pid_seen.get(session_id) != seen:
+                        _stale_hook_pid_seen[session_id] = seen
+                        mlog("DIVERGE", "stale_hook_pid", sid=session_id[:12],
+                             pid=pid, now_serves=now_serves[:12])
                 else:
+                    _stale_hook_pid_seen.pop(session_id, None)
                     return True
         except ValueError:
             pass
@@ -1794,6 +1808,7 @@ def _reconcile_sessions() -> None:
                     if sf.exists() and (now - sf.stat().st_mtime) > 3600:
                         sf.unlink()
                         _hook_state_cache.pop(sid, None)
+                        _stale_hook_pid_seen.pop(sid, None)
                         pruned += 1
                 except OSError:
                     pass
@@ -2050,6 +2065,39 @@ def _thinking_is_stale(session_id: str, hook: dict, transcript_path: str) -> boo
         except (OSError, json.JSONDecodeError, ValueError):
             pass
     return True
+
+
+def _status_witnesses(session_id: str, transcript_path: str = "") -> dict:
+    """What a status was read FROM, recorded beside every transition.
+
+    A status that flaps (Max, 2026-09-20: "monitor is showing you as ready
+    right now when you are working") cannot be diagnosed from prev/new alone,
+    and it cannot be reproduced from outside his running process either: the
+    witnesses are files that have since changed. So the row says who voted
+    at the moment it flipped, and the next flap explains itself.
+    """
+    hook = read_hook_state(session_id) or {}
+    age = None
+    if hook.get("timestamp"):
+        try:
+            # parse_timestamp answers 0 for what it cannot read; an age of
+            # 56 years would read as a number rather than as "unreadable".
+            ts = parse_timestamp(hook["timestamp"])
+            age = round(time.time() - ts, 1) if ts else -1.0
+        except (ValueError, TypeError):
+            age = -1.0
+    pid = _pid_map.get(session_id) or hook.get("pid")
+    pid_status = ""
+    if pid:
+        try:
+            pdata = json.loads((SESSIONS_DIR / f"{pid}.json").read_text())
+            pid_status = pdata.get("status", "") if pdata.get("sessionId") == session_id \
+                else f"serves:{str(pdata.get('sessionId'))[:8]}"
+        except (OSError, json.JSONDecodeError, ValueError):
+            pid_status = "unreadable"
+    return {"hook": hook.get("state", "-"), "hook_age": age,
+            "tool": str(hook.get("tool", ""))[:16], "pid_status": pid_status,
+            "fresh5": transcript_is_fresh(transcript_path, 5) if transcript_path else None}
 
 
 def _apply_standby_to_all(sessions: list["Session"]) -> None:
@@ -5758,7 +5806,8 @@ class ClaudeMonitor(App):
             prev = self._prev_statuses.get(s.session_id)
             if prev and prev != s.status:
                 mlog("status", "transition", sid=s.session_id[:12],
-                     title=s.title, prev=prev, new=s.status)
+                     title=s.title, prev=prev, new=s.status,
+                     **_status_witnesses(s.session_id, s.transcript_path))
                 if s.status == "needs_approval":
                     self._bell[s.session_id] = {"rang_at": time.time(), "acked": False}
             if s.status != "needs_approval":
