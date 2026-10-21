@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """
 Claude Code session state tracker (hook script).
 
@@ -7,6 +7,7 @@ Called by Claude Code hooks on each event. Writes JSON state files to
 
 States: thinking, idle, approval, exited
 """
+from __future__ import annotations
 
 import json
 import os
