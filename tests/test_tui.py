@@ -332,6 +332,35 @@ class TestColumnPicker:
                 await settle(pilot)
                 assert (first_key in picker.selected_cols) != was_selected
 
+    async def test_shift_down_reorders_columns(self, sample_sessions):
+        """shift+up/down must reach the picker's move bindings, not the app's
+        priority extend_selection bindings (which stole the keys; 2026-10-25)."""
+        with _mock_sessions(sample_sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("ctrl+c")
+                await settle(pilot)
+                picker = pilot.app.screen
+                before = list(picker._col_keys)
+                await pilot.press("shift+down")
+                await settle(pilot)
+                assert picker._col_keys[0] == before[1]
+                assert picker._col_keys[1] == before[0]
+                # And the table selection stayed untouched behind the modal
+                assert not pilot.app._selection
+                await pilot.press("shift+up")
+                await settle(pilot)
+                assert picker._col_keys == before
+
+    async def test_shift_down_still_extends_selection_without_modal(self, sample_sessions):
+        """check_action must only yield while a modal is up."""
+        with _mock_sessions(sample_sessions):
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("shift+down")
+                await settle(pilot)
+                assert len(pilot.app._selection) >= 2
+
 
 class TestSearch:
     async def test_search_filters_sessions(self, sample_sessions):
