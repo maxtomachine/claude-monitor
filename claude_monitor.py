@@ -6359,6 +6359,16 @@ class ClaudeMonitor(App):
         self._set_selection(sids)
         table.move_cursor(row=nr)
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        # Priority bindings fire before the active screen's own bindings, so
+        # while a modal is up they would steal its keys (e.g. shift+up/down in
+        # the ColumnPicker). Yield to the modal instead.
+        if isinstance(self.screen, ModalScreen) and action in (
+            "extend_selection", "prev_group", "next_group", "table_home", "table_end",
+        ):
+            return False
+        return True
+
     def action_toggle_pin(self) -> None:
         cur = self._cursor_session()
         if cur is None:
