@@ -7586,6 +7586,16 @@ def main():
         ok, message, _target = jump_to_next_actionable()
         mlog("jump", "cli_next", ok=ok, message=message)
         sys.exit(0 if ok else 1)
+    elif len(sys.argv) > 1 and sys.argv[1].startswith("-"):
+        # An unknown flag used to fall through to the TUI. That is fine at a
+        # terminal and wrong everywhere else: a script asking an older build
+        # for a subcommand it does not have got a full-screen app started
+        # inside its pipe, with nothing to read it and no way to quit it.
+        print(f"claude-monitor: unknown option {sys.argv[1]}\n"
+              "  --log [filter] --reconcile --restart --jump-next\n"
+              "  --save-layout --restore-layout [--dry-run|--exact|--restore-pins]\n"
+              "  --save-roster --restore-plan [--json]", file=sys.stderr)
+        sys.exit(2)
     else:
         app = ClaudeMonitor()
         app.run()
