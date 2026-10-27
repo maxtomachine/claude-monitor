@@ -92,7 +92,7 @@ class TestRestorePlan:
         plan, missing, skipped = _restore_plan(layout, [a, b])
         assert missing == [] and skipped == []
         assert [t["label"] for t in plan[0]["tabs"]] == ["beta", "alpha"]
-        assert "claude --resume b" in plan[0]["tabs"][0]["cmd"]
+        assert "CC_RESUME=b " in plan[0]["tabs"][0]["cmd"]
         assert str(pb) in plan[0]["tabs"][0]["cmd"]
         assert plan[0]["active"] == 1
         assert plan[0]["frame"] == [1, 2, 3, 4]
@@ -182,8 +182,8 @@ class TestRestorePlan:
                                "tabs": [self._t("cafecafe-0000@99999")]})
         plan, missing, _ = _restore_plan(layout, [sib])
         assert missing == []
-        assert "claude --resume cafecafe-0000" in plan[0]["tabs"][0]["cmd"]
-        assert "@" not in plan[0]["tabs"][0]["cmd"].split("--resume")[1].split("'")[0]
+        assert "CC_RESUME=cafecafe-0000 " in plan[0]["tabs"][0]["cmd"]
+        assert "@" not in plan[0]["tabs"][0]["cmd"].split("CC_RESUME=")[1].split(" ")[0]
 
 
 class TestSaveLayoutPins:
@@ -290,7 +290,7 @@ class TestWindowStamp:
                                "tabs": [{"sid": "a", "monitor": False}]}]}
         plan, _, _ = _restore_plan(layout, [a])
         cmd = plan[0]["tabs"][0]["cmd"]
-        assert cmd.index("printf") < cmd.index("claude --resume a")
+        assert cmd.index("printf") < cmd.index("CC_RESUME=a ")
         assert "\\033]0;" in cmd and "\\007" in cmd  # OSC 0 title sequence
 
     def test_restamp_of_an_empty_placeholder_yields_a_shell(self):
@@ -582,7 +582,7 @@ class TestASessionInAPaneIsNotLostFromTheLayout:
     def test_a_dead_session_with_no_pane_still_resumes(self, tmp_path):
         plan, _, skipped = self._plan(live=False, panes={}, tmp_path=tmp_path)
         cmds = [t["cmd"] for w in plan for t in w["tabs"]]
-        assert "--resume bbbbbbbb-0000" in cmds[0] and skipped == []
+        assert "CC_RESUME=bbbbbbbb-0000 " in cmds[0] and skipped == []
 
     def test_a_missing_transcript_still_wins_over_a_pane(self, tmp_path):
         """Nothing to attach to if the conversation itself is gone."""
@@ -613,3 +613,240 @@ class TestASessionInAPaneIsNotLostFromTheLayout:
         cmd = plan[0]["tabs"][0]["cmd"]
         assert cmd.count("\\033]0;") == 1
         assert cm.LAYOUT_STAMP_PREFIX in cmd
+
+
+# ── The quit-time roster and the family restore (Max, 2026-10-27) ────────────
+# "when I quit, save the state of all the claudes, and then when I reopen it,
+# it uses /spawn ... in their prefix-family windows (so all EBC- go in one tab
+# not various single tabs) ... Ensure that we're staying local."
+
+
+def _entry(title, sid, cwd="/Users/mk", transcript=__file__):
+    return {"sid": sid, "title": title, "group": cm._group_key(title),
+            "cwd": cwd, "transcript": transcript, "last_activity": 0.0}
+
+
+def _roster(*entries, reason="quit"):
+    return {"version": 1, "saved_at": "2026-10-27T11:00:00-07:00",
+            "reason": reason, "sessions": list(entries)}
+
+
+class TestQuitRecordsWhichClaudesWereOpen:
+    """The roster is written on the way out AND every refresh. Writing it
+    only at Ctrl+Q would miss the quit Max actually performs: closing
+    Ghostty, or restarting, neither of which reaches action_quit."""
+
+    def test_the_roster_round_trips_through_disk(self, tmp_path):
+        sessions = [make_session(session_id="aaaa0001-0000-0000-0000-000000000001",
+                                 title="EBC-Qantas", project_path=str(tmp_path)),
+                    make_session(session_id="bbbb0001-0000-0000-0000-000000000002",
+                                 title="frontier-curve", project_path=str(tmp_path))]
+        with patch.object(cm, "_is_session_alive", return_value=True):
+            r = cm.save_restore_roster(sessions, reason="quit", min_interval_s=0.0)
+        assert r["ok"] and r["claudes"] == 2
+        back = cm.load_restore_roster()
+        assert back["reason"] == "quit"
+        assert [e["title"] for e in back["sessions"]] == ["EBC-Qantas", "frontier-curve"]
+        assert [e["group"] for e in back["sessions"]] == ["EBC", "frontier"]
+        assert all(e["cwd"] == str(tmp_path) for e in back["sessions"])
+
+    def test_a_dead_session_is_not_recorded_as_something_to_bring_back(self):
+        alive = make_session(session_id="aaaa0001-0000-0000-0000-000000000001", title="live-one")
+        dead = make_session(session_id="dddd0001-0000-0000-0000-000000000002", title="dead-one")
+        with patch.object(cm, "_is_session_alive",
+                          side_effect=lambda sid, title="": sid.startswith("aaaa")):
+            cm.save_restore_roster([alive, dead], reason="quit", min_interval_s=0.0)
+        assert [e["title"] for e in cm.load_restore_roster()["sessions"]] == ["live-one"]
+
+    def test_subagents_are_left_out_they_have_no_terminal_of_their_own(self):
+        parent = make_session(session_id="aaaa0001-0000-0000-0000-000000000001", title="parent")
+        kid = make_session(session_id="aaaa0002-0000-0000-0000-000000000002",
+                           title="kid", is_subagent=True)
+        with patch.object(cm, "_is_session_alive", return_value=True):
+            cm.save_restore_roster([parent, kid], reason="quit", min_interval_s=0.0)
+        assert [e["title"] for e in cm.load_restore_roster()["sessions"]] == ["parent"]
+
+    def test_an_unchanged_tick_does_not_rewrite_but_a_quit_always_does(self):
+        s = [make_session(session_id="aaaa0001-0000-0000-0000-000000000001", title="one")]
+        with patch.object(cm, "_is_session_alive", return_value=True):
+            first = cm.save_restore_roster(s, reason="tick", min_interval_s=60.0)
+            second = cm.save_restore_roster(s, reason="tick", min_interval_s=60.0)
+            third = cm.save_restore_roster(s, reason="quit", min_interval_s=0.0)
+        assert first["ok"] and "skipped" not in first
+        assert second.get("skipped") == "unchanged"
+        assert third["ok"] and "skipped" not in third
+        assert cm.load_restore_roster()["reason"] == "quit"
+
+    def test_a_changed_session_set_rewrites_even_inside_the_throttle(self):
+        one = [make_session(session_id="aaaa0001-0000-0000-0000-000000000001", title="one")]
+        two = one + [make_session(session_id="aaaa0002-0000-0000-0000-000000000002", title="two")]
+        with patch.object(cm, "_is_session_alive", return_value=True):
+            cm.save_restore_roster(one, reason="tick", min_interval_s=600.0)
+            r = cm.save_restore_roster(two, reason="tick", min_interval_s=600.0)
+        assert "skipped" not in r
+        assert len(cm.load_restore_roster()["sessions"]) == 2
+
+    def test_the_write_is_atomic_and_leaves_no_half_file_behind(self):
+        s = [make_session(session_id="aaaa0001-0000-0000-0000-000000000001", title="one")]
+        with patch.object(cm, "_is_session_alive", return_value=True):
+            cm.save_restore_roster(s, reason="quit", min_interval_s=0.0)
+        assert cm.RESTORE_PATH.exists()
+        assert not cm.RESTORE_PATH.with_suffix(".json.tmp").exists()
+
+
+class TestEveryEBCLandsInOneWindow:
+    """Max's words: 'so all EBC- go in one tab not various single tabs.'"""
+
+    def test_one_family_becomes_one_window_of_tabs(self):
+        plan = cm.restore_families(_roster(
+            _entry("EBC-Qantas", "aaaa0001-0000-0000-0000-000000000001"),
+            _entry("EBC-UHG", "aaaa0002-0000-0000-0000-000000000002"),
+            _entry("EBC-Akamai", "aaaa0003-0000-0000-0000-000000000003"),
+        ), live_sids=set())
+        assert [f["group"] for f in plan["families"]] == ["EBC"]
+        assert len(plan["families"][0]["sessions"]) == 3
+        assert plan["total"] == 3
+
+    def test_two_families_get_a_window_each(self):
+        plan = cm.restore_families(_roster(
+            _entry("EBC-Qantas", "aaaa0001-0000-0000-0000-000000000001"),
+            _entry("EBC-UHG", "aaaa0002-0000-0000-0000-000000000002"),
+            _entry("frontier-curve", "bbbb0001-0000-0000-0000-000000000003"),
+            _entry("frontier-sweep", "bbbb0002-0000-0000-0000-000000000004"),
+        ), live_sids=set())
+        assert {f["group"]: len(f["sessions"]) for f in plan["families"]} == {"EBC": 2, "frontier": 2}
+
+    def test_singletons_pool_into_one_window_instead_of_one_each(self):
+        """A family of one is not a family; left alone they would each take a
+        whole window, which is the thing being avoided."""
+        plan = cm.restore_families(_roster(
+            _entry("tools-monitor", "cccc0001-0000-0000-0000-000000000001"),
+            _entry("config-LEAD", "dddd0001-0000-0000-0000-000000000002"),
+            _entry("idea-thing", "eeee0001-0000-0000-0000-000000000003"),
+        ), live_sids=set())
+        assert [f["group"] for f in plan["families"]] == ["misc"]
+        assert len(plan["families"][0]["sessions"]) == 3
+
+    def test_a_lone_session_keeps_its_own_name_not_a_misc_window_of_one(self):
+        plan = cm.restore_families(
+            _roster(_entry("tools-monitor", "cccc0001-0000-0000-0000-000000000001")),
+            live_sids=set())
+        assert [f["group"] for f in plan["families"]] == ["tools"]
+
+    def test_a_family_bigger_than_a_window_splits_rather_than_piling_up(self):
+        plan = cm.restore_families(_roster(*[
+            _entry(f"EBC-{i:02d}", f"ffff{i:04d}-0000-0000-0000-000000000000")
+            for i in range(11)]), live_sids=set())
+        assert [(f["group"], len(f["sessions"])) for f in plan["families"]] == [
+            ("EBC", 8), ("EBC (2)", 3)]
+
+    def test_a_session_already_running_is_reported_not_reopened(self):
+        """Resuming a live conversation twice just makes Claude Code's
+        single-instance guard kill one of the terminals."""
+        plan = cm.restore_families(_roster(
+            _entry("EBC-Qantas", "aaaa0001-0000-0000-0000-000000000001"),
+            _entry("EBC-UHG", "aaaa0002-0000-0000-0000-000000000002"),
+        ), live_sids={"aaaa0002-0000-0000-0000-000000000002"})
+        assert plan["already_live"] == ["EBC-UHG"]
+        assert plan["total"] == 1
+        assert [s["title"] for s in plan["families"][0]["sessions"]] == ["EBC-Qantas"]
+
+    def test_a_session_whose_transcript_is_gone_is_missing_not_planned(self):
+        plan = cm.restore_families(_roster(
+            _entry("EBC-Qantas", "aaaa0001-0000-0000-0000-000000000001"),
+            _entry("EBC-Ghost", "aaaa0002-0000-0000-0000-000000000002",
+                   transcript="/definitely/not/here.jsonl"),
+        ), live_sids=set())
+        assert plan["missing"] == ["EBC-Ghost"]
+        assert plan["total"] == 1
+
+    def test_the_same_conversation_listed_twice_gets_one_tab(self):
+        sid = "aaaa0001-0000-0000-0000-000000000001"
+        plan = cm.restore_families(_roster(
+            _entry("EBC-Qantas", sid), _entry("EBC-Qantas", sid),
+            _entry("EBC-UHG", "aaaa0002-0000-0000-0000-000000000002"),
+        ), live_sids=set())
+        assert plan["total"] == 2
+
+    def test_no_roster_is_a_clean_no_not_a_crash(self, tmp_path):
+        plan = cm.restore_families({}, live_sids=set())
+        assert plan["ok"] is False and "no saved roster" in plan["reason"]
+        assert plan["families"] == [] and plan["total"] == 0
+
+
+class TestARestoredSessionNeverLandsInTheCloud:
+    """Max, 2026-10-21 and again 2026-10-26: every launch runs on this Mac.
+    cc-shell carries --local on both of its exec lines and cc-spawn refuses
+    a launcher that has lost it; the monitor's own resume was still building
+    a bare `claude --resume`, which takes the cloud default."""
+
+    def test_resume_goes_through_the_one_launcher(self, tmp_path):
+        shell = tmp_path / "cc-shell"
+        shell.write_text("#!/bin/zsh\n")
+        with patch.object(cm, "CC_SHELL", shell):
+            cmd = cm._launch_command_for_resume("cafecafe-0000-0000-0000-000000000000")
+        assert cmd == f"CC_RESUME=cafecafe-0000-0000-0000-000000000000 exec {shell}"
+        assert "claude --resume" not in cmd  # never the bare, cloud-defaulting form
+
+    def test_without_cc_shell_the_local_flag_is_spelled_out(self, tmp_path):
+        with patch.object(cm, "CC_SHELL", tmp_path / "not-installed"):
+            cmd = cm._launch_command_for_resume("cafecafe-0000-0000-0000-000000000000")
+        assert "--local" in cmd
+        assert cmd == "claude --local --resume cafecafe-0000-0000-0000-000000000000"
+
+    def test_the_real_cc_shell_still_carries_the_local_flag(self):
+        """Guards the launcher itself, not just our call into it: if someone
+        edits cc-shell and drops --local, every resume goes to the cloud and
+        nothing else in this repo would notice."""
+        if not cm.CC_SHELL.exists():
+            return
+        execs = [ln for ln in cm.CC_SHELL.read_text().splitlines()
+                 if ln.strip().startswith("exec claude")]
+        assert execs, "cc-shell has no exec claude line"
+        assert all("--local" in ln for ln in execs), execs
+
+    def test_a_sibling_row_still_resumes_the_bare_conversation_id(self, tmp_path):
+        shell = tmp_path / "cc-shell"
+        shell.write_text("#!/bin/zsh\n")
+        sib = make_session(session_id="cafecafe-0000@12345", project_path=str(tmp_path))
+        with patch.object(cm, "CC_SHELL", shell):
+            cmd, cwd = cm._resume_command_for(sib)
+        assert "cafecafe-0000@12345" not in cmd
+        assert "CC_RESUME=cafecafe-0000 " in cmd
+        assert cwd == str(tmp_path)
+
+
+class TestAMonitorIsSeenEvenWhereThePortCannotBeProbed:
+    """A Claude session's Bash runs sandboxed, and the sandbox refuses even a
+    loopback connect: connect_ex comes back EPERM, which reads exactly like
+    'nothing is listening'. Measured 2026-10-27 against a monitor that was
+    holding the port. Trusting that alone opens a second monitor on top of
+    the first, so a file heartbeat is the second witness."""
+
+    def test_a_fresh_scan_cache_says_a_monitor_is_alive(self):
+        cm.SCAN_CACHE_PATH.write_text("{}")
+        with patch.object(cm, "_a_monitor_is_running", return_value=False):
+            assert cm._monitor_is_running_locally() == (True, "heartbeat")
+
+    def test_the_port_answer_wins_when_it_can_be_asked(self):
+        with patch.object(cm, "_a_monitor_is_running", return_value=True):
+            assert cm._monitor_is_running_locally() == (True, "port")
+
+    def test_a_sandbox_error_on_the_probe_is_not_an_answer(self):
+        with patch.object(cm, "_a_monitor_is_running", side_effect=PermissionError):
+            running, how = cm._monitor_is_running_locally()
+        assert how in ("", "heartbeat")  # never a crash
+
+    def test_stale_files_and_a_silent_port_mean_no_monitor(self, monkeypatch):
+        monkeypatch.setattr(cm, "MONITOR_HEARTBEAT_S", -1.0)
+        cm.SCAN_CACHE_PATH.write_text("{}")
+        with patch.object(cm, "_a_monitor_is_running", return_value=False):
+            assert cm._monitor_is_running_locally() == (False, "")
+
+    def test_a_roster_that_said_goodbye_is_not_a_heartbeat(self):
+        """The quit-time write is fresh by construction; it is the one
+        timestamp that must NOT be read as 'still running'."""
+        cm.RESTORE_PATH.write_text('{"version": 1, "reason": "quit", "sessions": []}')
+        with patch.object(cm, "_a_monitor_is_running", return_value=False):
+            running, how = cm._monitor_is_running_locally()
+        assert (running, how) == (False, "")

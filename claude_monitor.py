@@ -113,7 +113,19 @@ PREFS_PATH = _STATE_HOME / "monitor-prefs.json"
 HIDDEN_PATH = _STATE_HOME / "monitor-hidden.json"
 PINNED_PATH = _STATE_HOME / "monitor-pinned.json"
 LAYOUT_PATH = _STATE_HOME / "monitor-layout.json"
+# The roster of live Claudes, rewritten every refresh and once more on quit.
+# Deliberately NOT the same file as the layout: save_layout() reads Ghostty
+# through Accessibility and refuses to write when that read fails or comes
+# back empty, which is exactly what happens when Ghostty is the thing going
+# away. The roster needs no Accessibility at all, so it survives the quit
+# that actually matters -- closing Ghostty, a reboot, a crash -- and is what
+# /monitor reads to bring the sessions back.
+RESTORE_PATH = _STATE_HOME / "monitor-restore.json"
 SCAN_CACHE_PATH = _STATE_HOME / "monitor-scan-cache.json"
+# The one launcher: cc-spawn hands every surface it opens to this script, and
+# the monitor's own resumes go through it too so the two cannot drift apart
+# on flags (--local above all; see _launch_command_for_resume).
+CC_SHELL = Path.home() / ".local" / "bin" / "cc-shell"
 BELL_DECAY_S = 300
 
 
@@ -1432,7 +1444,17 @@ def _refresh_pid_map() -> None:
                 pid = int(data["pid"])
                 try:
                     os.kill(pid, 0)
-                except OSError:
+                except PermissionError:
+                    # The process EXISTS; we are merely not allowed to signal
+                    # it. Reading that as "dead" is how every session looked
+                    # dead to a Claude session's own Bash, whose sandbox
+                    # refuses os.kill on anything it did not start: the
+                    # --restore-plan CLI then offered to reopen conversations
+                    # that were already on screen (measured 2026-10-27, "0
+                    # Claude(s)" against a machine full of them). Signal 0 is
+                    # an existence probe, so EPERM is a yes, not a no.
+                    pass
+                except OSError:  # ESRCH and anything else: treat as gone
                     if sid not in _pid_map:  # Don't overwrite alive with dead
                         _pid_map[sid] = None
                     continue
@@ -3635,6 +3657,209 @@ def load_layout() -> dict | None:
         return None
 
 
+# ── The restore roster: which Claudes were open, and how to get them back ────
+
+RESTORE_ROSTER_VERSION = 1
+RESTORE_TABS_PER_WINDOW = 8
+_roster_last_write: list = ["", 0.0]  # [fingerprint, monotonic seconds]
+
+
+def _roster_entry(s: Session) -> dict:
+    """One session, reduced to what it takes to bring it back: the bare
+    conversation id, the directory Claude hashes to find it, and the name
+    the family grouping reads."""
+    _, cwd = _resume_command_for(s)
+    return {
+        "sid": base_sid(s.session_id),
+        "title": s.title,
+        "group": _group_key(s.title),
+        "cwd": cwd,
+        "transcript": s.transcript_path,
+        "last_activity": s.last_activity,
+    }
+
+
+def save_restore_roster(sessions: list[Session], reason: str = "tick",
+                        min_interval_s: float = 20.0) -> dict:
+    """Write the set of Claudes that are open right now, so a later /monitor
+    can bring them back.
+
+    Called on every refresh as well as on quit, and that is the point. The
+    quit Max actually performs is closing Ghostty or restarting the Mac,
+    which kills the monitor without ever reaching action_quit; a roster
+    written only at Ctrl+Q would be empty or months old exactly when it is
+    needed. Writing each tick costs one small JSON file and makes the worst
+    case "one refresh out of date" instead of "nothing".
+
+    Archived rows and subagents are left out: a subagent has no terminal of
+    its own and an archived row names a conversation nobody is in.
+    """
+    live = []
+    for s in sessions:
+        if s.is_subagent or not s.session_id:
+            continue
+        try:
+            if not _is_session_alive(s.session_id, s.title):
+                continue
+        except Exception:  # never let a liveness probe cost us the roster
+            pass
+        live.append(_roster_entry(s))
+    live.sort(key=lambda e: (e["group"], e["title"]))
+    fingerprint = ",".join(e["sid"] for e in live)
+    now = time.monotonic()
+    if (reason == "tick" and fingerprint == _roster_last_write[0]
+            and now - _roster_last_write[1] < min_interval_s):
+        return {"ok": True, "skipped": "unchanged", "claudes": len(live)}
+    roster = {
+        "version": RESTORE_ROSTER_VERSION,
+        "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "reason": reason,
+        "sessions": live,
+    }
+    try:
+        # Atomic: the file is read by a different process (the --restore-plan
+        # CLI, and through it /monitor), so a half-written roster must never
+        # be readable. Same discipline as the hook's own state writes.
+        tmp = RESTORE_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(roster, indent=2))
+        os.replace(tmp, RESTORE_PATH)
+    except OSError as e:
+        mlog("restore", "roster_write_failed", error=str(e))
+        return {"ok": False, "reason": str(e), "claudes": len(live)}
+    _roster_last_write[0], _roster_last_write[1] = fingerprint, now
+    if reason != "tick":
+        mlog("restore", "roster_saved", why=reason, claudes=len(live))
+    return {"ok": True, "claudes": len(live), "path": str(RESTORE_PATH)}
+
+
+def load_restore_roster() -> dict | None:
+    try:
+        return json.loads(RESTORE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _fold_into_families(entries: list[dict],
+                        per_window: int = RESTORE_TABS_PER_WINDOW) -> list[dict]:
+    """Group sessions by name prefix into one window per family.
+
+    The same rule the table groups by and the layout restore compacts by:
+    every EBC-* lands in one window of tabs rather than a window each. A
+    family of one is not a family -- those would each still take a whole
+    window, which is the thing being avoided -- so the singletons pool into
+    `misc`. A family larger than `per_window` splits across numbered
+    windows rather than making one unusable wall of tabs.
+    """
+    groups: dict[str, list[dict]] = {}
+    for e in entries:
+        groups.setdefault(e.get("group") or _group_key(e["title"]), []).append(e)
+    loners = [e for k, v in groups.items() if len(v) < 2 for e in v]
+    real = {k: v for k, v in groups.items() if len(v) > 1}
+    if len(loners) > 1:
+        real["misc"] = sorted(loners, key=lambda e: e["title"])
+    elif loners:
+        real[loners[0].get("group") or "misc"] = loners
+    families = []
+    for key in sorted(real):
+        members = real[key]
+        for i in range(0, len(members), per_window):
+            chunk = members[i:i + per_window]
+            name = key if i == 0 else f"{key} ({i // per_window + 1})"
+            families.append({"group": name, "sessions": chunk})
+    return families
+
+
+MONITOR_HEARTBEAT_S = 60.0
+
+
+def _monitor_is_running_locally() -> tuple[bool, str]:
+    """Is a monitor already up? Returns (running, how it was established).
+
+    Two signals, because the precise one is unavailable exactly where it
+    matters. `_a_monitor_is_running()` asks who holds the jump port, which
+    is exact -- but a Claude session's Bash runs in a sandbox that refuses
+    even a loopback connect, so connect_ex comes back EPERM, which is
+    indistinguishable from "nothing is listening" (measured 2026-10-27
+    against a monitor that was demonstrably holding the port). A sandboxed
+    caller trusting that alone concludes no monitor is running and opens a
+    second one on top of the first.
+
+    The second signal is a file mtime, which is readable anywhere: a live
+    monitor rewrites its scan cache every 3-second refresh and its roster
+    whenever the set of Claudes changes, so a stamp younger than a minute
+    says one is alive. A roster last written with reason "quit" is the
+    counter-signal: that monitor said goodbye.
+    """
+    try:
+        if _a_monitor_is_running():
+            return True, "port"
+    except Exception:
+        pass
+    now = time.time()
+    for path in (RESTORE_PATH, SCAN_CACHE_PATH):
+        try:
+            if now - path.stat().st_mtime > MONITOR_HEARTBEAT_S:
+                continue
+        except OSError:
+            continue
+        if path is RESTORE_PATH and (load_restore_roster() or {}).get("reason") == "quit":
+            continue
+        return True, "heartbeat"
+    return False, ""
+
+
+def restore_families(roster: dict | None = None,
+                     live_sids: set[str] | None = None,
+                     per_window: int = RESTORE_TABS_PER_WINDOW) -> dict:
+    """Turn the saved roster into a per-family restore plan.
+
+    Pure, and deliberately so: no Ghostty, no Accessibility, no osascript,
+    no subprocess. A Claude session runs its Bash inside a sandbox that
+    blocks Apple Events, so it can never open a window itself -- but it can
+    read this plan and then drive cc-spawn, which is excluded from the
+    sandbox. That split is why the planning and the opening are separate
+    things: the monitor knows what should come back, /spawn knows how to
+    open it.
+
+    Sessions already running are dropped (resuming one twice just makes
+    Claude Code's single-instance guard kill a terminal), and ones whose
+    transcript is gone are reported as missing rather than planned.
+    """
+    roster = load_restore_roster() if roster is None else roster
+    if not roster or not isinstance(roster.get("sessions"), list):
+        return {"ok": False, "reason": f"no saved roster at {RESTORE_PATH}",
+                "families": [], "already_live": [], "missing": [], "total": 0}
+    if live_sids is None:
+        live_sids = set()
+        for e in roster["sessions"]:
+            try:
+                if _is_session_alive(e["sid"], e.get("title", "")):
+                    live_sids.add(e["sid"])
+            except Exception:
+                pass
+    live_sids = {base_sid(x) for x in live_sids}
+    to_open, already_live, missing, seen = [], [], [], set()
+    for e in roster["sessions"]:
+        sid = base_sid(e.get("sid", ""))
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        if sid in live_sids:
+            already_live.append(e.get("title") or sid[:8])
+        elif e.get("transcript") and not Path(e["transcript"]).exists():
+            missing.append(e.get("title") or sid[:8])
+        else:
+            to_open.append(e)
+    families = _fold_into_families(to_open, per_window=per_window)
+    monitor_running, how = _monitor_is_running_locally()
+    return {"ok": True, "saved_at": roster.get("saved_at", ""),
+            "reason": roster.get("reason", ""), "monitor_running": monitor_running,
+            "monitor_seen_by": how,
+            "families": families, "already_live": sorted(already_live),
+            "missing": sorted(missing),
+            "total": sum(len(f["sessions"]) for f in families)}
+
+
 LAYOUT_STAMP_PREFIX = "·layout-"
 
 
@@ -4113,6 +4338,27 @@ def _auto_rename_after_resume(old_name: str, expected_sid8: str) -> None:
         mlog("resume", "auto_rename_error", name=old_name, new_sid8=new_sid8)
 
 
+def _launch_command_for_resume(sid: str) -> str:
+    """The command a Ghostty surface runs to bring conversation `sid` back.
+
+    Goes through cc-shell, the single launcher cc-spawn hands every surface
+    it opens to, so a resume started from the monitor carries exactly the
+    flags a resume started from /spawn carries. The one that matters is
+    `--local`: Max's ruling of 2026-10-21, restated 2026-10-26, is that
+    every launch runs on this Mac. A bare `claude --resume` takes the cloud
+    default, and a cloud session has none of his skills, memory store or
+    ~/EBCs -- the Trafigura room of 2026-10-16 was lost that way. This path
+    was still building a bare `claude --resume`, so the monitor's Resume and
+    its layout restore were the last two routes that could put a session in
+    the cloud. Falling back to an explicit `claude --local --resume` when
+    cc-shell is not installed keeps the flag either way.
+    """
+    quoted = shlex.quote(sid)
+    if CC_SHELL.exists():
+        return f"CC_RESUME={quoted} exec {shlex.quote(str(CC_SHELL))}"
+    return f"claude --local --resume {quoted}"
+
+
 def _resume_command_for(session: Session) -> tuple[str, str]:
     """(command, cwd) to relaunch this session. Claude CLI resolves sessions
     by hashing the cwd, so the original launch directory matters:
@@ -4122,7 +4368,7 @@ def _resume_command_for(session: Session) -> tuple[str, str]:
     # `claude --resume` wants the bare conversation id. The layout restore
     # test caught this building `--resume uuid@12345` (2026-08-23); the
     # same row reaches resume_session via the menu, so the fix lives here.
-    cmd = f"claude --resume {base_sid(session.session_id)}"
+    cmd = _launch_command_for_resume(base_sid(session.session_id))
     candidates = (
         session.project_path,
         _derive_cwd_from_transcript(session.transcript_path),
@@ -5760,6 +6006,16 @@ class ClaudeMonitor(App):
             rendered = [(s, render_row(s, visible_cols, acked_ready=acked_ready, dark=sys_dark))
                        for s in flat]
 
+            # The restore roster, written here on the worker rather than at
+            # quit alone: the quit that loses the sessions is Ghostty going
+            # away or the Mac restarting, and neither reaches action_quit.
+            # Throttled to a write only when the set of Claudes changed.
+            if "PYTEST_CURRENT_TEST" not in os.environ:
+                try:
+                    save_restore_roster(sessions, reason="tick")
+                except Exception as e:
+                    mlog("restore", "roster_tick_failed", error=str(e))
+
             # Post to main thread for UI update
             self.call_from_thread(
                 self._refresh_apply, sessions, flat, rendered, cleaned,
@@ -6818,7 +7074,30 @@ class ClaudeMonitor(App):
 
     async def action_quit(self) -> None:
         self._save_view_state()
+        self._save_restore_state("quit")
         self.exit()
+
+    def _save_restore_state(self, reason: str) -> None:
+        """Record what should come back next time, on the way out.
+
+        Two files, because they answer two questions and fail differently.
+        The roster (which Claudes, and how to resume each) never fails: it
+        is pure file IO, and it is what /monitor reads. The layout (where
+        the windows were) needs Ghostty through Accessibility and refuses
+        to write when that read comes back empty, so it is best-effort and
+        goes last -- a refusal there must not cost us the roster or hold up
+        the exit.
+        """
+        try:
+            save_restore_roster(self.sessions, reason=reason, min_interval_s=0.0)
+        except Exception as e:
+            mlog("restore", "roster_quit_failed", error=str(e))
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            return  # the layout half talks to Ghostty; never from a test run
+        try:
+            save_layout(self.sessions)
+        except Exception as e:
+            mlog("layout", "quit_save_failed", error=str(e))
 
     def _sync_system_theme(self, sys_dark: bool) -> None:
         """Always follow macOS appearance."""
@@ -7258,6 +7537,43 @@ def main():
             for sid in r["missing"]:
                 print(f"    {sid}")
         sys.exit(0 if r["ok"] else 1)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--restore-plan":
+        # Read-only and Ghostty-free by design: this is the one restore
+        # entry point a sandboxed Claude session can run, and /monitor
+        # drives cc-spawn from what it prints.
+        plan = restore_families()
+        if "--json" in sys.argv:
+            print(json.dumps(plan, indent=2))
+            sys.exit(0 if plan["ok"] else 1)
+        if not plan["ok"]:
+            print(plan["reason"])
+            sys.exit(1)
+        print(f"Roster saved {plan['saved_at']} ({plan['reason']}); "
+              f"{plan['total']} session(s) to bring back "
+              f"in {len(plan['families'])} window(s)")
+        if plan["monitor_running"]:
+            print("  a monitor is already running")
+        for fam in plan["families"]:
+            print(f"  [{fam['group']}]")
+            for e in fam["sessions"]:
+                print(f"    {e['title']:<28} {e['sid'][:8]}  {e['cwd']}")
+        if plan["already_live"]:
+            print(f"  {len(plan['already_live'])} already running, not reopened: "
+                  f"{', '.join(plan['already_live'])}")
+        if plan["missing"]:
+            print(f"  {len(plan['missing'])} no longer resumable (transcript gone): "
+                  f"{', '.join(plan['missing'])}")
+        sys.exit(0)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--save-roster":
+        # The quit-time save, callable by hand: for a monitor that is about
+        # to be killed rather than quit, and for proving the path works.
+        r = save_restore_roster(parse_sessions(include_archived=False,
+                                               include_subagents=False,
+                                               pinned=load_pinned_sessions()),
+                                reason="cli", min_interval_s=0.0)
+        print(f"Saved {r.get('claudes', 0)} Claude(s) to {RESTORE_PATH}"
+              if r.get("ok") else f"Not saved: {r.get('reason')}")
+        sys.exit(0 if r.get("ok") else 1)
     elif len(sys.argv) > 1 and sys.argv[1] == "--jump-next":
         # Ephemeral: no TUI, no visible window of its own. Fast path first:
         # hand off to an already-running monitor's warm session list
@@ -7270,6 +7586,16 @@ def main():
         ok, message, _target = jump_to_next_actionable()
         mlog("jump", "cli_next", ok=ok, message=message)
         sys.exit(0 if ok else 1)
+    elif len(sys.argv) > 1 and sys.argv[1].startswith("-"):
+        # An unknown flag used to fall through to the TUI. That is fine at a
+        # terminal and wrong everywhere else: a script asking an older build
+        # for a subcommand it does not have got a full-screen app started
+        # inside its pipe, with nothing to read it and no way to quit it.
+        print(f"claude-monitor: unknown option {sys.argv[1]}\n"
+              "  --log [filter] --reconcile --restart --jump-next\n"
+              "  --save-layout --restore-layout [--dry-run|--exact|--restore-pins]\n"
+              "  --save-roster --restore-plan [--json]", file=sys.stderr)
+        sys.exit(2)
     else:
         app = ClaudeMonitor()
         app.run()

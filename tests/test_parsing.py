@@ -1801,7 +1801,9 @@ class TestResumeCommandForSiblingRows:
         from claude_monitor import _resume_command_for
         sib = make_session(session_id="cafecafe-0000@12345", project_path=str(Path.home()))
         cmd, cwd = _resume_command_for(sib)
-        assert cmd == "claude --resume cafecafe-0000"
+        assert "cafecafe-0000@12345" not in cmd
+        assert cmd.startswith("CC_RESUME=cafecafe-0000 ") or \
+            cmd == "claude --local --resume cafecafe-0000"
         assert cwd == str(Path.home())
 
     def test_resume_falls_back_to_home_when_every_cwd_candidate_is_gone(self):
@@ -2496,3 +2498,42 @@ class TestCCsOwnBusyFlagIsAWitness:
         old = {"state": "thinking", "pid": 7777, "timestamp": "2020-01-01T00:00:00"}
         with world:
             assert cm._thinking_is_stale(self.SID, old, quiet) is True
+
+
+class TestASessionIsNotDeadJustBecauseWeMayNotSignalIt:
+    """`os.kill(pid, 0)` is an existence probe. EPERM means the process is
+    there and we are not allowed to touch it; ESRCH means it is gone. The pid
+    map caught OSError for both, so inside a Claude session's Bash sandbox --
+    which refuses os.kill on any process it did not start -- every session on
+    the machine read as dead. Measured 2026-10-27: `--save-roster` recorded
+    "0 Claude(s)" on a machine running ten of them, and the restore plan
+    offered to reopen conversations that were already on screen."""
+
+    def _sessions_dir(self, tmp_path, pid=424242):
+        d = tmp_path / "sessions"
+        d.mkdir()
+        (d / f"{pid}.json").write_text(json.dumps(
+            {"sessionId": "sid-1", "pid": pid, "status": "busy"}))
+        return d
+
+    def _map(self, tmp_path, kill_error):
+        import claude_monitor as cm
+        with patch("claude_monitor.SESSIONS_DIR", self._sessions_dir(tmp_path)), \
+             patch("claude_monitor._pid_map_ts", 0), \
+             patch("claude_monitor.os.kill", side_effect=kill_error):
+            cm._refresh_pid_map()
+            return dict(cm._pid_map)
+
+    def test_eperm_means_the_process_is_there(self, tmp_path):
+        assert self._map(tmp_path, PermissionError(1, "Operation not permitted")) == {"sid-1": 424242}
+
+    def test_esrch_still_means_gone(self, tmp_path):
+        assert self._map(tmp_path, ProcessLookupError(3, "No such process")) == {"sid-1": None}
+
+    def test_a_signalable_process_is_alive_as_before(self, tmp_path):
+        import claude_monitor as cm
+        with patch("claude_monitor.SESSIONS_DIR", self._sessions_dir(tmp_path)), \
+             patch("claude_monitor._pid_map_ts", 0), \
+             patch("claude_monitor.os.kill", return_value=None):
+            cm._refresh_pid_map()
+            assert cm._pid_map == {"sid-1": 424242}
