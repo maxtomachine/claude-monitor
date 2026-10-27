@@ -93,6 +93,10 @@ def _isolate_monitor_state_files(tmp_path, monkeypatch):
     # carries one test's fingerprint into the next and makes a legitimate
     # write look like a no-op.
     monkeypatch.setattr(cm, "_roster_last_write", ["", 0.0])
+    # Same reason: the set of sessions THIS process has watched running
+    # decides what a tick carries forward, so one test's sightings must
+    # not decide the next test's roster.
+    monkeypatch.setattr(cm, "_seen_alive", set())
 
 
 @pytest.fixture
