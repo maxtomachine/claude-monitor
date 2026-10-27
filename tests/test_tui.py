@@ -1991,3 +1991,34 @@ class TestSendPromptWithSpace:
                     await pilot.press("space")
                     await settle(pilot)
                 send.assert_not_called()
+
+
+class TestQuittingRecordsWhatShouldComeBack:
+    """Max, 2026-10-27: "when I quit, save the state of all the claudes, and
+    then when I reopen it, it uses /spawn". Ctrl+Q is the explicit half; the
+    refresh tick covers the quit he actually performs (closing Ghostty)."""
+
+    async def test_ctrl_q_writes_the_roster_the_restore_reads(self):
+        import claude_monitor as cm
+        sessions = [
+            make_session(session_id="aaaa0001-0000-0000-0000-000000000001",
+                         title="EBC-Qantas", transcript_path=__file__),
+            make_session(session_id="aaaa0002-0000-0000-0000-000000000002",
+                         title="EBC-UHG", transcript_path=__file__),
+            make_session(session_id="cccc0001-0000-0000-0000-000000000003",
+                         title="tools-monitor", transcript_path=__file__),
+        ]
+        with _mock_sessions(sessions), \
+                patch.object(cm, "_is_session_alive", return_value=True):
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.app.action_quit()
+        roster = cm.load_restore_roster()
+        assert roster is not None, "quitting left nothing to restore from"
+        assert roster["reason"] == "quit"
+        assert sorted(e["title"] for e in roster["sessions"]) == [
+            "EBC-Qantas", "EBC-UHG", "tools-monitor"]
+        # and that roster is directly usable: the two EBCs share one window.
+        plan = cm.restore_families(roster, live_sids=set())
+        assert [f["group"] for f in plan["families"]] == ["EBC", "tools"]
+        assert len(plan["families"][0]["sessions"]) == 2

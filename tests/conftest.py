@@ -17,6 +17,10 @@ _REAL_STATE_PATHS = frozenset(
     p.resolve() for p in (
         _cm.PREFS_PATH, _cm.HIDDEN_PATH, _cm.PINNED_PATH,
         _cm.SCAN_CACHE_PATH, _cm.JUMP_REQUEST_PATH, _cm.LAYOUT_PATH,
+        # The restore roster is written atomically, so the write_text the
+        # canary sees lands on the .tmp sibling and os.replace moves it
+        # into place: guard both names or the alarm never fires for it.
+        _cm.RESTORE_PATH, _cm.RESTORE_PATH.with_suffix(".json.tmp"),
     )
 )
 
@@ -84,6 +88,11 @@ def _isolate_monitor_state_files(tmp_path, monkeypatch):
     monkeypatch.setattr(cm, "SCAN_CACHE_PATH", tmp_path / "monitor-scan-cache.json")
     monkeypatch.setattr(cm, "JUMP_REQUEST_PATH", tmp_path / "jump-request")
     monkeypatch.setattr(cm, "LAYOUT_PATH", tmp_path / "monitor-layout.json")
+    monkeypatch.setattr(cm, "RESTORE_PATH", tmp_path / "monitor-restore.json")
+    # The write throttle is module state, not instance state: left alone it
+    # carries one test's fingerprint into the next and makes a legitimate
+    # write look like a no-op.
+    monkeypatch.setattr(cm, "_roster_last_write", ["", 0.0])
 
 
 @pytest.fixture
