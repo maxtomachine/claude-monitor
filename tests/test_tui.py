@@ -7,6 +7,7 @@ that UI interactions work correctly — no real terminal needed.
 from unittest.mock import patch
 
 import time
+from pathlib import Path
 
 import pytest
 
@@ -2022,3 +2023,138 @@ class TestQuittingRecordsWhatShouldComeBack:
         plan = cm.restore_families(roster, live_sids=set())
         assert [f["group"] for f in plan["families"]] == ["EBC", "tools"]
         assert len(plan["families"][0]["sessions"]) == 2
+
+
+class TestTheLaunchOffer:
+    """Max, 2026-10-27: "would be nice to have monitor launch with a 'would
+    you like to resume where you left off' and a list of sessions that that
+    means would spawn back." The list is the point: the answer is given with
+    the consequence in view, not from the word "resume" alone."""
+
+    def _stage_pack(self, name="last", titles=("EBC-Qantas", "EBC-UHG", "frontier-curve")):
+        import claude_monitor as cm
+        import time as _t
+        cm.save_packs({"version": 2, "default_pack": "last", "packs": {name: {
+            "saved_at": "2026-10-27T11:00:00-07:00", "reason": "quit",
+            "label": "last active" if name == "last" else name,
+            "sessions": [{"sid": f"{i:04d}aaaa-0000-0000-0000-00000000000{i}",
+                          "title": t, "group": cm._group_key(t), "cwd": str(Path.home()),
+                          "transcript": __file__, "last_activity": 0,
+                          "last_seen": _t.time()}
+                         for i, t in enumerate(titles)]}}})
+
+    def _world(self, live=(), alive=False):
+        """The patches a launch runs under. A plain context manager, not an
+        async generator: unwinding Textual's run_test() from inside one
+        crosses asyncio contexts and the app refuses to tear down."""
+        from contextlib import contextmanager
+        import claude_monitor as cm
+
+        @contextmanager
+        def _ctx():
+            with _mock_sessions(list(live)), \
+                    patch.object(cm, "_is_session_alive", return_value=alive), \
+                    patch.object(cm, "_a_monitor_is_running", return_value=False):
+                yield
+
+        return _ctx()
+
+    async def test_the_offer_lists_what_would_come_back(self):
+        from claude_monitor import ResumeOnLaunch
+        self._stage_pack()
+        with self._world():
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                assert isinstance(pilot.app.screen, ResumeOnLaunch)
+                text = pilot.app.screen._summary("last")
+                assert "EBC-Qantas" in text and "EBC-UHG" in text and "frontier-curve" in text
+                assert "EBC" in text and "frontier" in text   # grouped by window
+
+    async def test_choosing_a_pack_restores_that_pack(self):
+        import claude_monitor as cm
+        self._stage_pack()
+        called = {}
+        with self._world(), patch.object(
+                cm, "restore_pack_now",
+                side_effect=lambda p: called.setdefault("pack", p) or
+                {"ok": True, "tabs": 3, "windows_built": 2, "windows_planned": 2}):
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("enter")
+                await settle(pilot)
+        assert called.get("pack") == "last"
+
+    async def test_not_now_restores_nothing(self):
+        import claude_monitor as cm
+        self._stage_pack()
+        with self._world(), patch.object(cm, "restore_pack_now") as restore:
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("escape")
+                await settle(pilot)
+        restore.assert_not_called()
+
+    async def test_a_second_pack_is_offered_beside_the_default(self):
+        from claude_monitor import ResumeOnLaunch
+        from textual.widgets import OptionList
+        self._stage_pack()
+        self._stage_pack  # keep the default, then add a named one
+        import claude_monitor as cm
+        data = cm.load_packs()
+        data["packs"]["rooms"] = {"saved_at": "2026-10-20T09:00:00-07:00", "reason": "named",
+                                  "label": "the EBC board", "sessions":
+                                  data["packs"]["last"]["sessions"][:1]}
+        cm.save_packs(data)
+        with self._world():
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                assert isinstance(pilot.app.screen, ResumeOnLaunch)
+                ol = pilot.app.screen.query_one("#resume-options", OptionList)
+                ids = [o.id for o in ol._options]
+                assert "pack:last" in ids and "pack:rooms" in ids
+
+    async def test_no_offer_when_everything_is_already_running(self):
+        """The common restart. An offer with an empty list is a dialog that
+        costs a keystroke and says nothing."""
+        from claude_monitor import ResumeOnLaunch
+        import claude_monitor as cm
+        self._stage_pack()
+        with _mock_sessions([]), \
+                patch.object(cm, "_is_session_alive", return_value=True), \
+                patch.object(cm, "_a_monitor_is_running", return_value=False):
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                assert not isinstance(pilot.app.screen, ResumeOnLaunch)
+
+    async def test_no_offer_when_there_is_no_pack_at_all(self):
+        from claude_monitor import ResumeOnLaunch
+        with self._world():
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                assert not isinstance(pilot.app.screen, ResumeOnLaunch)
+
+    async def test_the_offer_can_be_switched_off_for_a_launch(self):
+        """What --no-resume sets."""
+        from claude_monitor import ResumeOnLaunch
+        import claude_monitor as cm
+        self._stage_pack()
+        with _mock_sessions([]), \
+                patch.object(cm, "_is_session_alive", return_value=False), \
+                patch.object(cm, "_a_monitor_is_running", return_value=False):
+            app = ClaudeMonitor()
+            app._resume_prompt = False
+            async with app.run_test() as pilot:
+                await settle(pilot)
+                assert not isinstance(pilot.app.screen, ResumeOnLaunch)
+
+    async def test_the_offer_fires_once_not_every_refresh(self):
+        from claude_monitor import ResumeOnLaunch
+        self._stage_pack()
+        with self._world():
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("escape")
+                await settle(pilot)
+                pilot.app.refresh_sessions()
+                await settle(pilot)
+                assert not isinstance(pilot.app.screen, ResumeOnLaunch)

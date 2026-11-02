@@ -4,6 +4,9 @@ thin and untestable without a display; everything decision-bearing is in
 the pure functions tested here: resolving AX tab titles to sessions,
 building the restore plan, and the pin union on save."""
 
+import json
+import time
+from pathlib import Path
 from unittest.mock import patch
 
 import claude_monitor as cm
@@ -770,7 +773,7 @@ class TestEveryEBCLandsInOneWindow:
 
     def test_no_roster_is_a_clean_no_not_a_crash(self, tmp_path):
         plan = cm.restore_families({}, live_sids=set())
-        assert plan["ok"] is False and "no saved roster" in plan["reason"]
+        assert plan["ok"] is False and "no pack named 'last'" in plan["reason"]
         assert plan["families"] == [] and plan["total"] == 0
 
 
@@ -850,3 +853,170 @@ class TestAMonitorIsSeenEvenWhereThePortCannotBeProbed:
         with patch.object(cm, "_a_monitor_is_running", return_value=False):
             running, how = cm._monitor_is_running_locally()
         assert (running, how) == (False, "")
+
+
+# ── Packs, and why opening the monitor must not destroy one ─────────────────
+# Max, 2026-10-27, on finding that `cm` wiped the snapshot: "build it modularly
+# so that I can open monitor with config packs for the sessions I want back,
+# and make it so that the default is just the last one that was active."
+
+
+def _sess(title, sid, tmp_path=None):
+    return make_session(session_id=sid, title=title, transcript_path=__file__,
+                        project_path=str(tmp_path or Path.home()))
+
+
+class TestOpeningTheMonitorDoesNotDestroyThePack:
+    """The founding bug, 2026-10-27. The roster was rewritten every refresh so
+    it would survive a crash, and a monitor opened AFTER a quit looks at a
+    world where every saved session is dead: it faithfully wrote down an empty
+    board and destroyed the snapshot three seconds into the launch. Measured
+    at the time: 3 saved sessions to 0. The cure is that a session is dropped
+    only when THIS process watched it running and then stop."""
+
+    def _stored(self, *titles, age_s=0.0):
+        cm.save_packs({"version": 2, "default_pack": "last", "packs": {"last": {
+            "saved_at": "2026-10-27T11:00:00-07:00", "reason": "quit", "label": "last active",
+            "sessions": [_entry(t, f"{i:04d}aaaa-0000-0000-0000-00000000000{i}")
+                         | {"last_seen": time.time() - age_s}
+                         for i, t in enumerate(titles)]}}})
+
+    def test_a_fresh_monitors_first_tick_keeps_what_is_waiting(self):
+        self._stored("EBC-Qantas", "EBC-UHG", "frontier-curve")
+        cm.save_restore_roster([], reason="tick", min_interval_s=0.0)
+        assert cm.restore_families(live_sids=set())["total"] == 3
+
+    def test_and_keeps_it_through_a_quit_too(self):
+        self._stored("EBC-Qantas", "EBC-UHG")
+        cm.save_restore_roster([], reason="tick", min_interval_s=0.0)
+        cm.save_restore_roster([], reason="quit", min_interval_s=0.0)
+        assert cm.restore_families(live_sids=set())["total"] == 2
+
+    def test_a_session_this_process_watched_die_is_dropped(self):
+        """Max closed it on purpose. Carrying it would resurrect a tab he
+        deliberately shut."""
+        s = _sess("EBC-Qantas", "aaaa0001-0000-0000-0000-000000000001")
+        with patch.object(cm, "_is_session_alive", return_value=True):
+            cm.save_restore_roster([s], reason="tick", min_interval_s=0.0)
+        assert cm.restore_families(live_sids=set())["total"] == 1
+        with patch.object(cm, "_is_session_alive", return_value=False):
+            cm.save_restore_roster([s], reason="tick", min_interval_s=0.0)
+        assert cm.restore_families(live_sids=set())["total"] == 0
+
+    def test_resuming_two_by_hand_does_not_lose_the_other_eight(self):
+        """The subtler half of the same bug: the fresh monitor DOES see some
+        sessions, so a plain 'write what is live' still drops the rest."""
+        self._stored(*[f"EBC-{i:02d}" for i in range(10)])
+        back = [_sess(e["title"], e["sid"])
+                for e in cm.load_restore_roster()["sessions"][:2]]
+        with patch.object(cm, "_is_session_alive",
+                          side_effect=lambda sid, t="": sid in {s.session_id for s in back}):
+            cm.save_restore_roster(back, reason="tick", min_interval_s=0.0)
+        roster = cm.load_restore_roster()
+        assert len(roster["sessions"]) == 10
+        assert cm.restore_families(roster, live_sids={s.session_id for s in back})["total"] == 8
+
+    def test_a_session_nobody_has_seen_in_a_fortnight_ages_out(self):
+        self._stored("EBC-Ancient", age_s=cm.PACK_CARRY_MAX_AGE_S + 60)
+        cm.save_restore_roster([], reason="tick", min_interval_s=0.0)
+        assert cm.restore_families(live_sids=set())["total"] == 0
+
+    def test_a_live_session_refreshes_its_own_last_seen(self):
+        self._stored("EBC-Qantas", age_s=cm.PACK_CARRY_MAX_AGE_S - 60)
+        e = cm.load_restore_roster()["sessions"][0]
+        with patch.object(cm, "_is_session_alive", return_value=True):
+            cm.save_restore_roster([_sess(e["title"], e["sid"])],
+                                   reason="tick", min_interval_s=0.0)
+        assert time.time() - cm.load_restore_roster()["sessions"][0]["last_seen"] < 5
+
+
+class TestPacksAreNamedSetsYouCanOpen:
+    def test_a_version_1_roster_becomes_the_last_pack(self):
+        cm.RESTORE_PATH.write_text(json.dumps(
+            {"version": 1, "saved_at": "2026-10-27T11:00:00-07:00", "reason": "quit",
+             "sessions": [_entry("EBC-Qantas", "aaaa0001-0000-0000-0000-000000000001")]}))
+        data = cm.load_packs()
+        assert data["version"] == 2
+        assert [p["title"] for p in data["packs"]["last"]["sessions"]] == ["EBC-Qantas"]
+        assert cm.restore_families(live_sids=set())["total"] == 1
+
+    def test_a_migrated_entry_does_not_age_out_on_arrival(self):
+        """v1 had no last_seen; defaulting it to 0 would make every migrated
+        session instantly a fortnight stale."""
+        cm.RESTORE_PATH.write_text(json.dumps(
+            {"version": 1, "sessions": [_entry("EBC-Qantas",
+                                               "aaaa0001-0000-0000-0000-000000000001")]}))
+        cm.save_restore_roster([], reason="tick", min_interval_s=0.0)
+        assert cm.restore_families(live_sids=set())["total"] == 1
+
+    def test_a_named_pack_snapshots_what_is_live(self):
+        sessions = [_sess("EBC-Qantas", "aaaa0001-0000-0000-0000-000000000001"),
+                    _sess("EBC-UHG", "aaaa0002-0000-0000-0000-000000000002")]
+        with patch.object(cm, "_is_session_alive", return_value=True):
+            r = cm.save_named_pack("rooms", sessions, label="the EBC board")
+        assert r["ok"] and r["claudes"] == 2
+        assert cm.restore_families(live_sids=set(), pack="rooms")["total"] == 2
+        assert cm.restore_families(live_sids=set(), pack="rooms")["label"] == "the EBC board"
+
+    def test_the_automatic_pack_name_is_not_available_to_take(self):
+        r = cm.save_named_pack("last", [])
+        assert not r["ok"] and "automatic" in r["reason"]
+        assert not cm.delete_pack("last")["ok"]
+
+    def test_a_refresh_never_rewrites_a_pack_you_made(self):
+        """A named pack is a thing Max made on purpose; a monitor running some
+        other set must not quietly fold its sessions into it."""
+        with patch.object(cm, "_is_session_alive", return_value=True):
+            cm.save_named_pack("rooms", [_sess("EBC-Qantas",
+                                               "aaaa0001-0000-0000-0000-000000000001")])
+            cm.save_restore_roster([_sess("something-else",
+                                          "bbbb0001-0000-0000-0000-000000000002")],
+                                   reason="tick", min_interval_s=0.0)
+        assert [e["title"] for e in cm.load_restore_roster("rooms")["sessions"]] == ["EBC-Qantas"]
+        assert [e["title"] for e in cm.load_restore_roster()["sessions"]] == ["something-else"]
+
+    def test_listing_puts_the_default_first_whatever_its_date(self):
+        with patch.object(cm, "_is_session_alive", return_value=True):
+            cm.save_named_pack("rooms", [_sess("EBC-Qantas",
+                                               "aaaa0001-0000-0000-0000-000000000001")])
+            cm.save_restore_roster([_sess("tools-monitor",
+                                          "bbbb0001-0000-0000-0000-000000000002")],
+                                   reason="quit", min_interval_s=0.0)
+        assert [p["name"] for p in cm.list_packs()][0] == "last"
+
+    def test_deleting_a_pack_leaves_the_others(self):
+        with patch.object(cm, "_is_session_alive", return_value=True):
+            cm.save_named_pack("rooms", [_sess("EBC-Qantas",
+                                               "aaaa0001-0000-0000-0000-000000000001")])
+            cm.save_named_pack("deep", [_sess("frontier-curve",
+                                              "bbbb0001-0000-0000-0000-000000000002")])
+        assert cm.delete_pack("rooms")["ok"]
+        assert [p["name"] for p in cm.list_packs()] == ["deep"]
+
+    def test_an_unknown_pack_is_a_clean_no(self):
+        plan = cm.restore_families(pack="nope")
+        assert plan["ok"] is False and "nope" in plan["reason"]
+
+
+class TestAPackBecomesRealWindows:
+    """The plan is pure; this is the one step that touches Ghostty. Only the
+    shape is testable without a display, and the shape is what drifts."""
+
+    def test_each_family_becomes_one_window_of_resume_commands(self, tmp_path):
+        shell = tmp_path / "cc-shell"
+        shell.write_text("#!/bin/zsh\n")
+        plan = cm.restore_families(_roster(
+            _entry("EBC-Qantas", "aaaa0001-0000-0000-0000-000000000001"),
+            _entry("EBC-UHG", "aaaa0002-0000-0000-0000-000000000002"),
+            _entry("frontier-curve", "bbbb0001-0000-0000-0000-000000000003"),
+            _entry("frontier-sweep", "bbbb0002-0000-0000-0000-000000000004"),
+        ), live_sids=set())
+        with patch.object(cm, "CC_SHELL", shell):
+            windows = cm._family_plan_to_windows(plan["families"])
+        assert [w["group"] for w in windows] == ["EBC", "frontier"]
+        assert all(len(w["tabs"]) == 2 for w in windows)
+        assert all("CC_RESUME=" in t["cmd"] for w in windows for t in w["tabs"])
+        assert all(w["stamp"] in w["tabs"][0]["cmd"] for w in windows), "unstamped window"
+
+    def test_an_empty_plan_builds_nothing(self):
+        assert cm._family_plan_to_windows([]) == []

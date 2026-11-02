@@ -3659,12 +3659,23 @@ def load_layout() -> dict | None:
 
 # ── The restore roster: which Claudes were open, and how to get them back ────
 
-RESTORE_ROSTER_VERSION = 1
+RESTORE_ROSTER_VERSION = 2
 RESTORE_TABS_PER_WINDOW = 8
+DEFAULT_PACK = "last"
+# How long a CARRIED session (one no monitor has seen running since) stays a
+# restore candidate. Without a limit, a conversation abandoned in March would
+# still be offered back in November.
+PACK_CARRY_MAX_AGE_S = 14 * 24 * 3600
 _roster_last_write: list = ["", 0.0]  # [fingerprint, monotonic seconds]
+# The sids THIS process has watched running. The difference between "I saw it
+# alive and then it went away" (Max closed it, drop it) and "it was already
+# gone when I started" (it is waiting to be restored, keep it) is the whole
+# reason the pack survives a relaunch, and a process-local set is the only
+# place that difference exists.
+_seen_alive: set[str] = set()
 
 
-def _roster_entry(s: Session) -> dict:
+def _roster_entry(s: Session, now: float | None = None) -> dict:
     """One session, reduced to what it takes to bring it back: the bare
     conversation id, the directory Claude hashes to find it, and the name
     the family grouping reads."""
@@ -3676,67 +3687,187 @@ def _roster_entry(s: Session) -> dict:
         "cwd": cwd,
         "transcript": s.transcript_path,
         "last_activity": s.last_activity,
+        "last_seen": time.time() if now is None else now,
     }
+
+
+def _empty_packs() -> dict:
+    return {"version": RESTORE_ROSTER_VERSION, "default_pack": DEFAULT_PACK, "packs": {}}
+
+
+def _migrate_packs(raw: dict | None) -> dict:
+    """Bring any shape of this file forward to the pack format.
+
+    Version 1 was a single flat roster: `{version, saved_at, reason,
+    sessions}`. It becomes the `last` pack unchanged, with `last_seen`
+    stamped now so nothing migrated ages out on the spot.
+    """
+    if not isinstance(raw, dict):
+        return _empty_packs()
+    if isinstance(raw.get("packs"), dict):
+        raw.setdefault("version", RESTORE_ROSTER_VERSION)
+        raw.setdefault("default_pack", DEFAULT_PACK)
+        return raw
+    if isinstance(raw.get("sessions"), list):
+        now = time.time()
+        for e in raw["sessions"]:
+            e.setdefault("last_seen", now)
+        return {"version": RESTORE_ROSTER_VERSION, "default_pack": DEFAULT_PACK,
+                "packs": {DEFAULT_PACK: {"saved_at": raw.get("saved_at", ""),
+                                         "reason": raw.get("reason", ""),
+                                         "label": "last active",
+                                         "sessions": raw["sessions"]}}}
+    return _empty_packs()
+
+
+def load_packs() -> dict:
+    try:
+        return _migrate_packs(json.loads(RESTORE_PATH.read_text()))
+    except (OSError, json.JSONDecodeError):
+        return _empty_packs()
+
+
+def save_packs(data: dict) -> bool:
+    """Atomic, because another process reads this file: the --restore-plan
+    CLI, and through it /monitor. A half-written pack must never be
+    readable."""
+    try:
+        tmp = RESTORE_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(tmp, RESTORE_PATH)
+        return True
+    except OSError as e:
+        mlog("restore", "pack_write_failed", error=str(e))
+        return False
+
+
+def get_pack(name: str = DEFAULT_PACK) -> dict | None:
+    return load_packs().get("packs", {}).get(name)
+
+
+def list_packs() -> list[dict]:
+    """Every pack, newest first, each with its size. The `last` pack sorts
+    first whatever its date: it is the one a bare launch offers."""
+    data = load_packs()
+    out = []
+    for name, body in (data.get("packs") or {}).items():
+        out.append({"name": name, "label": body.get("label", ""),
+                    "saved_at": body.get("saved_at", ""), "reason": body.get("reason", ""),
+                    "count": len(body.get("sessions") or []),
+                    "titles": [e.get("title", "") for e in (body.get("sessions") or [])]})
+    out.sort(key=lambda p: (p["name"] != DEFAULT_PACK, p["saved_at"]), reverse=False)
+    return out
+
+
+def save_named_pack(name: str, sessions: list[Session], label: str = "") -> dict:
+    """Snapshot the live set under a name of Max's choosing. Unlike the
+    `last` pack this is never touched again by a refresh: a named pack is a
+    thing he made on purpose, and a monitor that happens to be running a
+    different set must not quietly rewrite it."""
+    now = time.time()
+    entries = sorted((_roster_entry(s, now) for s in sessions
+                      if not s.is_subagent and s.session_id
+                      and _session_is_alive_quietly(s)),
+                     key=lambda e: (e["group"], e["title"]))
+    if name == DEFAULT_PACK:
+        return {"ok": False, "reason": f"'{DEFAULT_PACK}' is the automatic pack; pick another name"}
+    data = load_packs()
+    data.setdefault("packs", {})[name] = {
+        "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "reason": "named", "label": label or name, "sessions": entries}
+    if not save_packs(data):
+        return {"ok": False, "reason": f"could not write {RESTORE_PATH}"}
+    mlog("restore", "pack_saved", pack=name, claudes=len(entries))
+    return {"ok": True, "pack": name, "claudes": len(entries)}
+
+
+def delete_pack(name: str) -> dict:
+    if name == DEFAULT_PACK:
+        return {"ok": False, "reason": f"'{DEFAULT_PACK}' is maintained automatically"}
+    data = load_packs()
+    if name not in (data.get("packs") or {}):
+        return {"ok": False, "reason": f"no pack named '{name}'"}
+    del data["packs"][name]
+    if not save_packs(data):
+        return {"ok": False, "reason": f"could not write {RESTORE_PATH}"}
+    return {"ok": True, "pack": name}
+
+
+def _session_is_alive_quietly(s: Session) -> bool:
+    """_is_session_alive, but a probe that blows up never costs us a roster."""
+    try:
+        return bool(_is_session_alive(s.session_id, s.title))
+    except Exception:
+        return True
 
 
 def save_restore_roster(sessions: list[Session], reason: str = "tick",
-                        min_interval_s: float = 20.0) -> dict:
-    """Write the set of Claudes that are open right now, so a later /monitor
-    can bring them back.
+                        min_interval_s: float = 20.0,
+                        pack: str = DEFAULT_PACK) -> dict:
+    """Write the `last` pack: what is open now, plus what is still waiting to
+    be brought back.
 
-    Called on every refresh as well as on quit, and that is the point. The
-    quit Max actually performs is closing Ghostty or restarting the Mac,
-    which kills the monitor without ever reaching action_quit; a roster
-    written only at Ctrl+Q would be empty or months old exactly when it is
-    needed. Writing each tick costs one small JSON file and makes the worst
-    case "one refresh out of date" instead of "nothing".
+    Called on every refresh as well as on quit, because the quit Max
+    performs is closing Ghostty or restarting the Mac, and neither reaches
+    action_quit. That tick write is also what made the first cut of this
+    wrong, and the bug is worth stating because the fix looks arbitrary
+    without it: a monitor opened AFTER a quit looks at a world where every
+    saved session is dead, so it faithfully wrote down an empty board and
+    destroyed the snapshot three seconds into the launch (reproduced
+    2026-10-27, 3 saved sessions to 0).
 
-    Archived rows and subagents are left out: a subagent has no terminal of
-    its own and an archived row names a conversation nobody is in.
+    So a session is dropped only when THIS process watched it running and
+    then stop. One it never saw alive is carried: it was already gone when
+    this monitor started, which is precisely what "waiting to be restored"
+    looks like from here.
     """
-    live = []
+    now = time.time()
+    live, live_sids = [], set()
     for s in sessions:
         if s.is_subagent or not s.session_id:
             continue
-        try:
-            if not _is_session_alive(s.session_id, s.title):
-                continue
-        except Exception:  # never let a liveness probe cost us the roster
-            pass
-        live.append(_roster_entry(s))
-    live.sort(key=lambda e: (e["group"], e["title"]))
-    fingerprint = ",".join(e["sid"] for e in live)
-    now = time.monotonic()
+        if not _session_is_alive_quietly(s):
+            continue
+        e = _roster_entry(s, now)
+        live.append(e)
+        live_sids.add(e["sid"])
+    _seen_alive.update(live_sids)
+    data = load_packs()
+    stored = (data.get("packs", {}).get(pack) or {}).get("sessions") or []
+    carried = [e for e in stored
+               if e.get("sid") and e["sid"] not in live_sids
+               and e["sid"] not in _seen_alive
+               and now - float(e.get("last_seen") or 0) < PACK_CARRY_MAX_AGE_S]
+    entries = sorted(live + carried, key=lambda e: (e.get("group", ""), e.get("title", "")))
+    fingerprint = ",".join(e["sid"] for e in entries)
+    mono = time.monotonic()
     if (reason == "tick" and fingerprint == _roster_last_write[0]
-            and now - _roster_last_write[1] < min_interval_s):
-        return {"ok": True, "skipped": "unchanged", "claudes": len(live)}
-    roster = {
-        "version": RESTORE_ROSTER_VERSION,
+            and mono - _roster_last_write[1] < min_interval_s):
+        return {"ok": True, "skipped": "unchanged", "claudes": len(entries)}
+    data.setdefault("packs", {})[pack] = {
         "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "reason": reason,
-        "sessions": live,
-    }
-    try:
-        # Atomic: the file is read by a different process (the --restore-plan
-        # CLI, and through it /monitor), so a half-written roster must never
-        # be readable. Same discipline as the hook's own state writes.
-        tmp = RESTORE_PATH.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(roster, indent=2))
-        os.replace(tmp, RESTORE_PATH)
-    except OSError as e:
-        mlog("restore", "roster_write_failed", error=str(e))
-        return {"ok": False, "reason": str(e), "claudes": len(live)}
-    _roster_last_write[0], _roster_last_write[1] = fingerprint, now
+        "reason": reason, "label": "last active", "sessions": entries}
+    data.setdefault("version", RESTORE_ROSTER_VERSION)
+    data.setdefault("default_pack", DEFAULT_PACK)
+    if not save_packs(data):
+        return {"ok": False, "reason": f"could not write {RESTORE_PATH}", "claudes": len(entries)}
+    _roster_last_write[0], _roster_last_write[1] = fingerprint, mono
     if reason != "tick":
-        mlog("restore", "roster_saved", why=reason, claudes=len(live))
-    return {"ok": True, "claudes": len(live), "path": str(RESTORE_PATH)}
+        mlog("restore", "roster_saved", why=reason, claudes=len(entries),
+             live=len(live), carried=len(carried))
+    return {"ok": True, "claudes": len(entries), "live": len(live),
+            "carried": len(carried), "path": str(RESTORE_PATH)}
 
 
-def load_restore_roster() -> dict | None:
-    try:
-        return json.loads(RESTORE_PATH.read_text())
-    except (OSError, json.JSONDecodeError):
+def load_restore_roster(pack: str = DEFAULT_PACK) -> dict | None:
+    """The named pack in the flat shape the planner and the liveness probe
+    read."""
+    body = get_pack(pack)
+    if body is None:
         return None
+    return {"version": RESTORE_ROSTER_VERSION, "saved_at": body.get("saved_at", ""),
+            "reason": body.get("reason", ""), "label": body.get("label", ""),
+            "sessions": body.get("sessions") or []}
 
 
 def _fold_into_families(entries: list[dict],
@@ -3785,10 +3916,8 @@ def _monitor_is_running_locally() -> tuple[bool, str]:
     second one on top of the first.
 
     The second signal is a file mtime, which is readable anywhere: a live
-    monitor rewrites its scan cache every 3-second refresh and its roster
-    whenever the set of Claudes changes, so a stamp younger than a minute
-    says one is alive. A roster last written with reason "quit" is the
-    counter-signal: that monitor said goodbye.
+    monitor rewrites its scan cache every 3-second refresh, so a stamp
+    younger than a minute says one is alive.
     """
     try:
         if _a_monitor_is_running():
@@ -3796,22 +3925,19 @@ def _monitor_is_running_locally() -> tuple[bool, str]:
     except Exception:
         pass
     now = time.time()
-    for path in (RESTORE_PATH, SCAN_CACHE_PATH):
-        try:
-            if now - path.stat().st_mtime > MONITOR_HEARTBEAT_S:
-                continue
-        except OSError:
-            continue
-        if path is RESTORE_PATH and (load_restore_roster() or {}).get("reason") == "quit":
-            continue
-        return True, "heartbeat"
+    try:
+        if now - SCAN_CACHE_PATH.stat().st_mtime <= MONITOR_HEARTBEAT_S:
+            return True, "heartbeat"
+    except OSError:
+        pass
     return False, ""
 
 
 def restore_families(roster: dict | None = None,
                      live_sids: set[str] | None = None,
-                     per_window: int = RESTORE_TABS_PER_WINDOW) -> dict:
-    """Turn the saved roster into a per-family restore plan.
+                     per_window: int = RESTORE_TABS_PER_WINDOW,
+                     pack: str = DEFAULT_PACK) -> dict:
+    """Turn a saved pack into a per-family restore plan.
 
     Pure, and deliberately so: no Ghostty, no Accessibility, no osascript,
     no subprocess. A Claude session runs its Bash inside a sandbox that
@@ -3825,10 +3951,10 @@ def restore_families(roster: dict | None = None,
     Claude Code's single-instance guard kill a terminal), and ones whose
     transcript is gone are reported as missing rather than planned.
     """
-    roster = load_restore_roster() if roster is None else roster
+    roster = load_restore_roster(pack) if roster is None else roster
     if not roster or not isinstance(roster.get("sessions"), list):
-        return {"ok": False, "reason": f"no saved roster at {RESTORE_PATH}",
-                "families": [], "already_live": [], "missing": [], "total": 0}
+        return {"ok": False, "reason": f"no pack named '{pack}' in {RESTORE_PATH}",
+                "pack": pack, "families": [], "already_live": [], "missing": [], "total": 0}
     if live_sids is None:
         live_sids = set()
         for e in roster["sessions"]:
@@ -3852,12 +3978,52 @@ def restore_families(roster: dict | None = None,
             to_open.append(e)
     families = _fold_into_families(to_open, per_window=per_window)
     monitor_running, how = _monitor_is_running_locally()
-    return {"ok": True, "saved_at": roster.get("saved_at", ""),
+    return {"ok": True, "pack": pack, "label": roster.get("label", ""),
+            "saved_at": roster.get("saved_at", ""),
             "reason": roster.get("reason", ""), "monitor_running": monitor_running,
             "monitor_seen_by": how,
             "families": families, "already_live": sorted(already_live),
             "missing": sorted(missing),
             "total": sum(len(f["sessions"]) for f in families)}
+
+
+def _family_plan_to_windows(families: list[dict]) -> list[dict]:
+    """Turn the pure family plan into the window dicts _ghostty_build_window
+    takes. Shared by the launch prompt and --restore-pack so the two cannot
+    build different things from one plan."""
+    plan = []
+    for fam in families:
+        tabs = [{"cmd": _ghostty_surface_command(
+                    e.get("cwd") or str(Path.home()),
+                    _launch_command_for_resume(base_sid(e["sid"]))),
+                 "label": e.get("title", "")}
+                for e in fam["sessions"]]
+        if tabs:
+            plan.append({"frame": [0, 0, 0, 0], "active": 0, "tabs": tabs,
+                         "group": fam["group"]})
+    _stamp_plan(plan)
+    return plan
+
+
+def restore_pack_now(pack: str = DEFAULT_PACK) -> dict:
+    """Open the pack, here, through Ghostty. Only callable from a monitor
+    process or a terminal: it drives Apple Events, which a sandboxed Claude
+    session cannot. That is what /monitor's cc-spawn path is for."""
+    plan = restore_families(pack=pack)
+    if not plan["ok"]:
+        return plan
+    windows = _family_plan_to_windows(plan["families"])
+    built = 0
+    for window in windows:
+        if _ghostty_build_window(window) != "failed":
+            built += 1
+        time.sleep(0.5)
+    result = {"ok": built == len(windows), "pack": pack, "windows_built": built,
+              "windows_planned": len(windows), "tabs": plan["total"],
+              "already_live": plan["already_live"], "missing": plan["missing"]}
+    mlog("restore", "pack_restored", **{k: v for k, v in result.items()
+                                        if k not in ("already_live", "missing")})
+    return result
 
 
 LAYOUT_STAMP_PREFIX = "·layout-"
@@ -5294,6 +5460,90 @@ class SessionTable(DataTable):
             self.post_message(self.RowDoubleClicked(key))
 
 
+class ResumeOnLaunch(ModalScreen[str]):
+    """The offer at startup: here is what was open last time, shall I bring
+    it back? Lists the sessions by the window they would come back in, so
+    the answer is given with the consequence in view rather than from the
+    word "resume" alone. Picking a different pack re-reads the list, so one
+    screen covers both "put it back" and "put THAT set up"."""
+
+    BINDINGS = [
+        Binding("escape", "not_now", "Not now"),
+        Binding("q", "not_now", "Not now", show=False),
+        Binding("enter", "select", "Resume"),
+    ]
+    CSS = """
+    ResumeOnLaunch { background: rgba(0, 0, 0, 0.6); align: center middle; }
+    #resume-box {
+        width: 72; max-height: 26;
+        background: $surface; border: solid $primary; padding: 1 2;
+    }
+    #resume-title { text-align: center; text-style: bold; }
+    #resume-sub { text-align: center; color: $text-muted; padding-bottom: 1; }
+    #resume-body { height: auto; max-height: 12; padding-bottom: 1; }
+    #resume-options { height: auto; }
+    """
+
+    def __init__(self, plans: dict[str, dict], first: str = DEFAULT_PACK) -> None:
+        super().__init__()
+        self.plans = plans          # pack name -> restore_families() result
+        self.first = first
+
+    def _summary(self, pack: str) -> str:
+        p = self.plans.get(pack) or {}
+        lines = []
+        for fam in p.get("families", []):
+            titles = ", ".join(e.get("title", "") for e in fam["sessions"])
+            lines.append(f"  [bold]{fam['group']:<10}[/] {titles}")
+        if p.get("already_live"):
+            lines.append(f"  [dim]{len(p['already_live'])} already running, left alone[/]")
+        if p.get("missing"):
+            lines.append(f"  [dim]{len(p['missing'])} no longer resumable: "
+                         f"{', '.join(p['missing'])}[/]")
+        return "\n".join(lines) or "  [dim]nothing to bring back[/]"
+
+    def compose(self) -> ComposeResult:
+        first = self.plans.get(self.first) or {}
+        when = first.get("saved_at", "")[:16].replace("T", " ")
+        why = first.get("reason", "")
+        with Vertical(id="resume-box"):
+            yield Label("Resume where you left off?", id="resume-title")
+            yield Label(f"{first.get('label') or self.first} · saved {when}"
+                        f"{f' ({why})' if why else ''}", id="resume-sub")
+            yield Static(self._summary(self.first), id="resume-body")
+            options = []
+            for name, plan in self.plans.items():
+                if not plan.get("total"):
+                    continue
+                windows = len(plan["families"])
+                label = plan.get("label") or name
+                options.append(Option(
+                    f"▶   Resume {label}  ({plan['total']} session"
+                    f"{'s' if plan['total'] != 1 else ''} in {windows} window"
+                    f"{'s' if windows != 1 else ''})", id=f"pack:{name}"))
+            options.append(Option("─" * 54, id="sep", disabled=True))
+            options.append(Option("◀   Not now", id="close"))
+            yield OptionList(*options, id="resume-options")
+        yield Footer()
+
+    def on_option_list_option_highlighted(
+            self, event: OptionList.OptionHighlighted) -> None:
+        oid = event.option.id or ""
+        if oid.startswith("pack:"):
+            self.query_one("#resume-body", Static).update(self._summary(oid[5:]))
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(event.option.id or "close")
+
+    def action_select(self) -> None:
+        ol = self.query_one("#resume-options", OptionList)
+        if ol.highlighted is not None:
+            self.dismiss(ol.get_option_at_index(ol.highlighted).id or "close")
+
+    def action_not_now(self) -> None:
+        self.dismiss("close")
+
+
 class ClaudeMonitor(App):
     TITLE = "Claude Monitor"
     ENABLE_COMMAND_PALETTE = False
@@ -5441,6 +5691,11 @@ class ClaudeMonitor(App):
         self._hidden = set()
         self._pinned = set()
         self._selection = set()
+        # The launch offer fires once, after the first refresh has told us
+        # what is actually live. Set by --pack/--no-resume on the CLI.
+        self._resume_offered = False
+        self._resume_prompt = True
+        self._resume_pack = DEFAULT_PACK
 
     def notify(self, message, *, timeout: float | None = 5, **kwargs):
         """Override to log every toast notification."""
@@ -6198,6 +6453,68 @@ class ClaudeMonitor(App):
         self.query_one(StatsBar).update_stats(
             self.sessions, self.sort_mode, dark=sys_dark, inbox_mode=self.inbox_mode)
         self._refresh_generation += 1
+        # After the first refresh, not on mount: the offer has to know which
+        # of the saved sessions are actually live, and before the first scan
+        # it would offer to reopen things already on screen.
+        self._maybe_offer_resume()
+
+    def _maybe_offer_resume(self) -> None:
+        """Offer the saved pack once, after the first refresh.
+
+        Silent when there is nothing to bring back, which is the common case
+        on a restart where everything is still running: an offer with an
+        empty list is a dialog that only costs a keystroke.
+        """
+        if self._resume_offered:
+            return
+        self._resume_offered = True
+        if not self._resume_prompt:
+            return
+        try:
+            plans = {}
+            for name in [self._resume_pack] + [p["name"] for p in list_packs()]:
+                if name in plans:
+                    continue
+                plan = restore_families(pack=name)
+                if plan.get("ok") and plan.get("total"):
+                    plans[name] = plan
+        except Exception as e:
+            mlog("restore", "offer_failed", error=str(e))
+            return
+        if not plans:
+            return
+        first = self._resume_pack if self._resume_pack in plans else next(iter(plans))
+        mlog("restore", "offered", packs=",".join(plans), first=first,
+             total=plans[first]["total"])
+        self.push_screen(ResumeOnLaunch(plans, first), self._resume_answered)
+
+    def _resume_answered(self, choice: str | None) -> None:
+        if not choice or not choice.startswith("pack:"):
+            mlog("restore", "offer_declined")
+            return
+        pack = choice[5:]
+        self.notify(f"Bringing back {pack}…", timeout=4)
+        self.run_worker(lambda: self._restore_pack_worker(pack), thread=True,
+                        exit_on_error=False)
+
+    def _restore_pack_worker(self, pack: str) -> None:
+        """Ghostty work off the UI thread: each window is an Apple Event with
+        half a second of settling after it, which would freeze the table."""
+        try:
+            r = restore_pack_now(pack)
+        except Exception as e:
+            mlog("restore", "pack_restore_failed", pack=pack, error=str(e))
+            self.call_from_thread(self.notify, f"Restore failed: {e}", severity="error")
+            return
+        if not r.get("ok"):
+            msg = (f"{r.get('windows_built', 0)}/{r.get('windows_planned', 0)} windows"
+                   if "windows_built" in r else r.get("reason", "nothing restored"))
+            self.call_from_thread(self.notify, f"Restore incomplete: {msg}",
+                                  severity="warning")
+            return
+        self.call_from_thread(
+            self.notify,
+            f"Brought back {r['tabs']} session(s) in {r['windows_built']} window(s)")
 
     def _make_menu_handler(self, s: Session):
         """Build the SessionMenu dismiss callback for a session."""
@@ -7541,7 +7858,10 @@ def main():
         # Read-only and Ghostty-free by design: this is the one restore
         # entry point a sandboxed Claude session can run, and /monitor
         # drives cc-spawn from what it prints.
-        plan = restore_families()
+        plan = restore_families(pack=(sys.argv[sys.argv.index("--pack") + 1]
+                                      if "--pack" in sys.argv
+                                      and sys.argv.index("--pack") + 1 < len(sys.argv)
+                                      else DEFAULT_PACK))
         if "--json" in sys.argv:
             print(json.dumps(plan, indent=2))
             sys.exit(0 if plan["ok"] else 1)
@@ -7586,7 +7906,46 @@ def main():
         ok, message, _target = jump_to_next_actionable()
         mlog("jump", "cli_next", ok=ok, message=message)
         sys.exit(0 if ok else 1)
-    elif len(sys.argv) > 1 and sys.argv[1].startswith("-"):
+    elif len(sys.argv) > 1 and sys.argv[1] == "--packs":
+        packs = list_packs()
+        if not packs:
+            print(f"No saved packs in {RESTORE_PATH}")
+            sys.exit(0)
+        for p in packs:
+            star = " (default)" if p["name"] == DEFAULT_PACK else ""
+            print(f"{p['name']:<16} {p['count']:>3} session(s)  "
+                  f"{p['saved_at'][:16].replace('T', ' ')}  {p['label']}{star}")
+            print(f"{'':<16} {', '.join(p['titles'])}")
+        sys.exit(0)
+    elif len(sys.argv) > 2 and sys.argv[1] == "--save-pack":
+        r = save_named_pack(sys.argv[2],
+                            parse_sessions(include_archived=False, include_subagents=False,
+                                           pinned=load_pinned_sessions()),
+                            label=" ".join(sys.argv[3:]))
+        print(f"Saved pack '{r['pack']}' with {r['claudes']} session(s)"
+              if r.get("ok") else f"Not saved: {r.get('reason')}")
+        sys.exit(0 if r.get("ok") else 1)
+    elif len(sys.argv) > 2 and sys.argv[1] == "--delete-pack":
+        r = delete_pack(sys.argv[2])
+        print(f"Deleted pack '{sys.argv[2]}'" if r.get("ok") else r.get("reason"))
+        sys.exit(0 if r.get("ok") else 1)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--restore-pack":
+        # Opens windows, so it needs Apple Events: a terminal or a monitor
+        # process only, never a sandboxed session (that is /monitor's job).
+        name = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_PACK
+        r = restore_pack_now(name)
+        if not r.get("ok") and "reason" in r:
+            print(r["reason"])
+            sys.exit(1)
+        print(f"Brought back {r['tabs']} session(s) in "
+              f"{r['windows_built']}/{r['windows_planned']} window(s)")
+        for key, note in (("already_live", "already running"),
+                          ("missing", "no longer resumable")):
+            if r.get(key):
+                print(f"  {len(r[key])} {note}: {', '.join(r[key])}")
+        sys.exit(0 if r["ok"] else 1)
+    elif len(sys.argv) > 1 and sys.argv[1].startswith("-") and sys.argv[1] != "--pack" \
+            and sys.argv[1] != "--no-resume":
         # An unknown flag used to fall through to the TUI. That is fine at a
         # terminal and wrong everywhere else: a script asking an older build
         # for a subcommand it does not have got a full-screen app started
@@ -7594,10 +7953,21 @@ def main():
         print(f"claude-monitor: unknown option {sys.argv[1]}\n"
               "  --log [filter] --reconcile --restart --jump-next\n"
               "  --save-layout --restore-layout [--dry-run|--exact|--restore-pins]\n"
-              "  --save-roster --restore-plan [--json]", file=sys.stderr)
+              "  --save-roster --restore-plan [--pack <name>] [--json]\n"
+              "  --packs --save-pack <name> [label] --delete-pack <name>\n"
+              "  --restore-pack [<name>]        open a pack now, no TUI\n"
+              "  --pack <name>                  launch and offer that pack\n"
+              "  --no-resume                    launch without the offer",
+              file=sys.stderr)
         sys.exit(2)
     else:
         app = ClaudeMonitor()
+        if "--no-resume" in sys.argv:
+            app._resume_prompt = False
+        if "--pack" in sys.argv:
+            i = sys.argv.index("--pack")
+            if i + 1 < len(sys.argv):
+                app._resume_pack = sys.argv[i + 1]
         app.run()
         if app.return_code == RESTART_EXIT_CODE:
             os.execv(sys.executable, [sys.executable] + sys.argv)
