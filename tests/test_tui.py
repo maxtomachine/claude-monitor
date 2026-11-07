@@ -2158,3 +2158,135 @@ class TestTheLaunchOffer:
                 pilot.app.refresh_sessions()
                 await settle(pilot)
                 assert not isinstance(pilot.app.screen, ResumeOnLaunch)
+
+
+class TestEscapeClosesTheBoard:
+    """Escape is the deliberate way to end the day: it asks first, lists what
+    it would close, and never reaches for the board while a search is open."""
+
+    def _world(self, live=(), pids=None):
+        from contextlib import contextmanager
+        import claude_monitor as cm
+
+        @contextmanager
+        def _ctx():
+            with _mock_sessions(list(live)), \
+                    patch.object(cm, "_pid_map", dict(pids or {})), \
+                    patch.object(cm, "_refresh_pid_map", lambda: None), \
+                    patch.object(cm, "restore_families", return_value={"ok": False}), \
+                    patch.object(cm, "_a_monitor_is_running", return_value=False):
+                yield
+
+        return _ctx()
+
+    def _sessions(self, *pairs):
+        out, pids = [], {}
+        for i, (title, pid) in enumerate(pairs):
+            sid = f"sid-{i:04d}"
+            out.append(make_session(session_id=sid, title=title, status="working"))
+            pids[sid] = pid
+        return out, pids
+
+    async def test_escape_on_a_clean_screen_opens_the_dialog(self):
+        from claude_monitor import CloseAllSessions
+        live, pids = self._sessions(("EBC-UHG", 101), ("frontier-curve", 102))
+        with self._world(live, pids):
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("escape")
+                await settle(pilot)
+                assert isinstance(pilot.app.screen, CloseAllSessions)
+
+    async def test_the_dialog_lists_what_would_close(self):
+        from claude_monitor import CloseAllSessions
+        live, pids = self._sessions(("EBC-UHG", 101), ("EBC-Qantas", 103),
+                                    ("frontier-curve", 102))
+        with self._world(live, pids):
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("escape")
+                await settle(pilot)
+                text = pilot.app.screen._summary()
+                assert "EBC-UHG" in text and "EBC-Qantas" in text and "frontier-curve" in text
+                assert "EBC" in text and "frontier" in text   # grouped
+
+    async def test_escape_with_a_search_open_clears_the_search_not_the_board(self):
+        from claude_monitor import CloseAllSessions
+        live, pids = self._sessions(("EBC-UHG", 101))
+        with self._world(live, pids):
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("slash")
+                await pilot.press("e")
+                await settle(pilot)
+                await pilot.press("escape")
+                await settle(pilot)
+                assert not isinstance(pilot.app.screen, CloseAllSessions)
+                assert pilot.app._filter == ""
+
+    async def test_a_stray_return_in_the_dialog_closes_nothing(self):
+        import claude_monitor as cm
+        live, pids = self._sessions(("EBC-UHG", 101))
+        with self._world(live, pids), \
+                patch.object(cm, "close_all_sessions") as closer:
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("escape")
+                await settle(pilot)
+                await pilot.press("enter")     # whatever is highlighted first
+                await settle(pilot)
+        closer.assert_not_called()
+
+    async def test_escape_in_the_dialog_closes_nothing(self):
+        import claude_monitor as cm
+        live, pids = self._sessions(("EBC-UHG", 101))
+        with self._world(live, pids), \
+                patch.object(cm, "close_all_sessions") as closer:
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("escape")
+                await settle(pilot)
+                await pilot.press("escape")
+                await settle(pilot)
+        closer.assert_not_called()
+
+    async def test_choosing_close_all_closes_them(self):
+        import claude_monitor as cm
+        live, pids = self._sessions(("EBC-UHG", 101))
+        called = {}
+        with self._world(live, pids), patch.object(
+                cm, "close_all_sessions",
+                side_effect=lambda s, **k: called.setdefault("n", len(s)) or
+                {"ok": True, "pack": "last", "closed": ["EBC-UHG"], "refused": [],
+                 "gone": [], "planned": [], "total": 1}):
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("escape")
+                await settle(pilot)
+                await pilot.press("down")   # skips the separator, lands on Close all
+                await pilot.press("enter")
+                await settle(pilot)
+        assert called.get("n") == 1
+
+    async def test_nothing_running_means_no_dialog(self):
+        from claude_monitor import CloseAllSessions
+        live, _ = self._sessions(("EBC-UHG", 101))
+        with self._world(live, {}):          # no pids: nothing is live
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("escape")
+                await settle(pilot)
+                assert not isinstance(pilot.app.screen, CloseAllSessions)
+
+    async def test_the_close_saves_to_the_automatic_pack_not_a_named_one(self):
+        """A named pack is a set Max curated; closing the board must not
+        overwrite it, even when the monitor was launched with --pack rooms."""
+        from claude_monitor import CloseAllSessions, DEFAULT_PACK
+        live, pids = self._sessions(("EBC-UHG", 101))
+        with self._world(live, pids):
+            async with ClaudeMonitor().run_test() as pilot:
+                pilot.app._resume_pack = "rooms"
+                await settle(pilot)
+                await pilot.press("escape")
+                await settle(pilot)
+                assert pilot.app.screen.pack == DEFAULT_PACK

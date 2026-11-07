@@ -1020,3 +1020,146 @@ class TestAPackBecomesRealWindows:
 
     def test_an_empty_plan_builds_nothing(self):
         assert cm._family_plan_to_windows([]) == []
+
+
+class TestClosingTheBoardIsReversible:
+    """Escape closes every Claude on the machine. The only thing that makes
+    that a usable key rather than a loaded gun is that the board is written
+    down first and can be put back."""
+
+    def _live(self, tmp_path, *pairs, **kw):
+        """(title, pid) pairs -> sessions, with a pid map to match."""
+        import claude_monitor as cm
+        t = tmp_path / "x.jsonl"
+        t.write_text("{}")
+        sessions, pids = [], {}
+        for i, (title, pid) in enumerate(pairs):
+            sid = f"sid-{i:04d}"
+            sessions.append(make_session(session_id=sid, title=title,
+                                         transcript_path=str(t), **kw))
+            if pid:
+                pids[sid] = pid
+        return sessions, pids
+
+    def test_a_session_with_no_live_process_is_not_in_the_plan(self, tmp_path, monkeypatch):
+        import claude_monitor as cm
+        sessions, pids = self._live(tmp_path, ("EBC-Qantas", 101), ("closed-one", None))
+        monkeypatch.setattr(cm, "_pid_map", pids)
+        plan = cm.close_all_plan(sessions)
+        assert [e["title"] for e in plan] == ["EBC-Qantas"]
+
+    def test_a_subagent_is_never_signalled_on_its_own(self, tmp_path, monkeypatch):
+        import claude_monitor as cm
+        sessions, pids = self._live(tmp_path, ("worker", 101))
+        sessions[0].is_subagent = True
+        monkeypatch.setattr(cm, "_pid_map", pids)
+        assert cm.close_all_plan(sessions) == []
+
+    def test_the_plan_is_grouped_by_family(self, tmp_path, monkeypatch):
+        import claude_monitor as cm
+        sessions, pids = self._live(tmp_path, ("EBC-UHG", 101), ("frontier-curve", 102),
+                                    ("EBC-Qantas", 103))
+        monkeypatch.setattr(cm, "_pid_map", pids)
+        plan = cm.close_all_plan(sessions)
+        assert [e["group"] for e in plan] == ["EBC", "EBC", "frontier"]
+        assert [e["title"] for e in plan] == ["EBC-Qantas", "EBC-UHG", "frontier-curve"]
+
+    def test_the_pack_is_written_before_anything_is_signalled(self, tmp_path, monkeypatch):
+        import claude_monitor as cm
+        sessions, pids = self._live(tmp_path, ("EBC-UHG", 101), ("frontier-curve", 102))
+        monkeypatch.setattr(cm, "_pid_map", pids)
+        monkeypatch.setattr(cm, "_refresh_pid_map", lambda: None)
+        order = []
+        real_save = cm.save_restore_roster
+        monkeypatch.setattr(cm, "save_restore_roster",
+                            lambda *a, **k: order.append("save") or real_save(*a, **k))
+        monkeypatch.setattr(cm.os, "kill", lambda pid, sig: order.append(f"kill:{pid}"))
+        r = cm.close_all_sessions(sessions)
+        assert order[0] == "save", order
+        assert order[1:] == ["kill:101", "kill:102"]
+        assert r["ok"] and sorted(r["closed"]) == ["EBC-UHG", "frontier-curve"]
+
+    def test_a_pack_that_cannot_be_saved_stops_the_close(self, tmp_path, monkeypatch):
+        import claude_monitor as cm
+        sessions, pids = self._live(tmp_path, ("EBC-UHG", 101))
+        monkeypatch.setattr(cm, "_pid_map", pids)
+        monkeypatch.setattr(cm, "_refresh_pid_map", lambda: None)
+        monkeypatch.setattr(cm, "save_restore_roster",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+        killed = []
+        monkeypatch.setattr(cm.os, "kill", lambda pid, sig: killed.append(pid))
+        r = cm.close_all_sessions(sessions)
+        assert killed == [], "nothing may be closed once the record failed to land"
+        assert not r["ok"] and "nothing closed" in r["reason"]
+
+    def test_a_closed_session_stays_in_the_pack_after_the_next_tick(self, tmp_path, monkeypatch):
+        """The close is only reversible if the pack survives the refresh that
+        lands three seconds later, when every one of them reads as dead."""
+        import claude_monitor as cm
+        sessions, pids = self._live(tmp_path, ("EBC-UHG", 101), ("frontier-curve", 102))
+        monkeypatch.setattr(cm, "_pid_map", pids)
+        monkeypatch.setattr(cm, "_refresh_pid_map", lambda: None)
+        monkeypatch.setattr(cm.os, "kill", lambda pid, sig: None)
+        # The monitor has watched these two running for a while.
+        monkeypatch.setattr(cm, "_is_session_alive", lambda sid, title="": True)
+        cm.save_restore_roster(sessions, reason="tick", min_interval_s=0.0)
+        assert len(cm.load_restore_roster()["sessions"]) == 2
+
+        cm.close_all_sessions(sessions)
+        # ...and now the tick fires against a machine where they are gone.
+        monkeypatch.setattr(cm, "_is_session_alive", lambda sid, title="": False)
+        cm.save_restore_roster([], reason="tick", min_interval_s=0.0)
+        back = [e["title"] for e in cm.load_restore_roster()["sessions"]]
+        assert sorted(back) == ["EBC-UHG", "frontier-curve"], back
+
+    def test_a_process_that_already_exited_is_not_an_error(self, tmp_path, monkeypatch):
+        import claude_monitor as cm
+        sessions, pids = self._live(tmp_path, ("EBC-UHG", 101))
+        monkeypatch.setattr(cm, "_pid_map", pids)
+        monkeypatch.setattr(cm, "_refresh_pid_map", lambda: None)
+        monkeypatch.setattr(cm.os, "kill",
+                            lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError()))
+        r = cm.close_all_sessions(sessions)
+        assert r["ok"] and r["gone"] == ["EBC-UHG"] and r["closed"] == []
+
+    def test_a_refusal_is_reported_not_swallowed(self, tmp_path, monkeypatch):
+        import claude_monitor as cm
+        sessions, pids = self._live(tmp_path, ("EBC-UHG", 101))
+        monkeypatch.setattr(cm, "_pid_map", pids)
+        monkeypatch.setattr(cm, "_refresh_pid_map", lambda: None)
+        monkeypatch.setattr(cm.os, "kill",
+                            lambda pid, sig: (_ for _ in ()).throw(PermissionError("nope")))
+        r = cm.close_all_sessions(sessions)
+        assert not r["ok"] and "EBC-UHG" in r["refused"][0]
+
+    def test_a_dry_run_signals_nothing_and_saves_nothing(self, tmp_path, monkeypatch):
+        import claude_monitor as cm
+        sessions, pids = self._live(tmp_path, ("EBC-UHG", 101))
+        monkeypatch.setattr(cm, "_pid_map", pids)
+        monkeypatch.setattr(cm, "_refresh_pid_map", lambda: None)
+        touched = []
+        monkeypatch.setattr(cm.os, "kill", lambda p, s: touched.append(p))
+        monkeypatch.setattr(cm, "save_restore_roster",
+                            lambda *a, **k: touched.append("save"))
+        r = cm.close_all_sessions(sessions, dry_run=True)
+        assert touched == [] and r["total"] == 1
+
+    def test_it_really_does_close_a_real_process(self, tmp_path, monkeypatch):
+        """Everything above fakes os.kill. This one spawns a process, points
+        a session at it, and checks it is gone afterwards."""
+        import subprocess, claude_monitor as cm
+        proc = subprocess.Popen(["sleep", "30"])
+        try:
+            t = tmp_path / "x.jsonl"
+            t.write_text("{}")
+            s = make_session(session_id="sid-real", title="throwaway",
+                             transcript_path=str(t))
+            monkeypatch.setattr(cm, "_pid_map", {"sid-real": proc.pid})
+            monkeypatch.setattr(cm, "_refresh_pid_map", lambda: None)
+            r = cm.close_all_sessions([s])
+            assert r["ok"] and r["closed"] == ["throwaway"]
+            assert proc.wait(timeout=5) is not None
+            assert proc.poll() is not None, "the process outlived its close"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
