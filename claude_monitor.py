@@ -15,7 +15,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import NamedTuple
+from typing import Iterable, NamedTuple
 
 def _escape_markup(text: str) -> str:
     """Escape all [ for Textual markup (rich.markup.escape misses some)."""
@@ -4026,6 +4026,90 @@ def restore_pack_now(pack: str = DEFAULT_PACK) -> dict:
     return result
 
 
+def close_all_plan(sessions: list[Session],
+                   exclude_sids: Iterable[str] = ()) -> list[dict]:
+    """Which Claudes a close-all would signal, in the order the dialog shows
+    them.
+
+    Live, top-level sessions only. A subagent has no terminal of its own and
+    dies with the Claude that spawned it, so signalling one separately would
+    kill a worker out from under a session that is staying.
+    """
+    skip = {base_sid(s) for s in exclude_sids}
+    out: list[dict] = []
+    for s in sessions:
+        if s.is_subagent:
+            continue
+        sid = base_sid(s.session_id)
+        if sid in skip:
+            continue
+        pid = _pid_map.get(sid)
+        if not pid:
+            continue  # no live process: nothing to close
+        out.append({"sid": sid, "pid": pid, "title": s.title or sid[:8],
+                    "group": _group_key(s.title or ""), "status": s.status})
+    out.sort(key=lambda e: (e["group"], e["title"]))
+    return out
+
+
+def close_all_sessions(sessions: list[Session], *, pack: str = DEFAULT_PACK,
+                       exclude_sids: Iterable[str] = (),
+                       dry_run: bool = False,
+                       sig: int = signal.SIGTERM) -> dict:
+    """Close every live Claude, after writing down what was open.
+
+    The pack is saved FIRST, and a save that fails stops the close. This is
+    the one action in the monitor that takes the whole board down, and a
+    close whose record did not land is a close that cannot be undone: the
+    sessions are gone and nothing knows they existed. Saving first makes the
+    pair reversible, Escape to close and the launch offer to bring it back.
+
+    SIGTERM, not SIGKILL: Claude Code gets to flush its transcript and clear
+    its pid file, which is what lets the next monitor tell a closed session
+    from a crashed one.
+    """
+    _refresh_pid_map()
+    plan = close_all_plan(sessions, exclude_sids)
+    if dry_run:
+        return {"ok": True, "dry_run": True, "pack": pack, "planned": plan,
+                "closed": [], "refused": [], "gone": [], "total": len(plan)}
+    try:
+        save_restore_roster(sessions, reason="close-all", min_interval_s=0.0,
+                            pack=pack)
+    except Exception as e:
+        mlog("closeall", "pack_save_failed", pack=pack, error=str(e))
+        return {"ok": False, "pack": pack, "planned": plan, "total": len(plan),
+                "closed": [], "refused": [], "gone": [],
+                "reason": f"could not save the pack first ({e}); nothing closed"}
+
+    # These are no longer sessions this process watched stop; they are
+    # sessions it deliberately parked. Without this the carry rule drops
+    # every one of them from the pack on the next tick, three seconds after
+    # the close, and the record we just saved to make the close reversible
+    # is gone. Done BEFORE the signals, so a tick landing mid-close already
+    # sees them as carryable.
+    for e in plan:
+        _seen_alive.discard(e["sid"])
+
+    closed: list[str] = []
+    refused: list[str] = []
+    gone: list[str] = []
+    for e in plan:
+        try:
+            os.kill(e["pid"], sig)
+            closed.append(e["title"])
+        except ProcessLookupError:
+            gone.append(e["title"])      # it exited while we were asking
+        except OSError as err:
+            refused.append(f"{e['title']} ({err.strerror or err})")
+    result = {"ok": not refused, "pack": pack, "planned": plan,
+              "total": len(plan), "closed": closed, "refused": refused,
+              "gone": gone}
+    mlog("closeall", "closed", pack=pack, total=len(plan), closed=len(closed),
+         refused=len(refused), gone=len(gone))
+    return result
+
+
 LAYOUT_STAMP_PREFIX = "·layout-"
 
 
@@ -5544,6 +5628,74 @@ class ResumeOnLaunch(ModalScreen[str]):
         self.dismiss("close")
 
 
+class CloseAllSessions(ModalScreen[str]):
+    """Escape on a clean screen: close the whole board.
+
+    Deliberately the mirror of ResumeOnLaunch, down to the grouping, because
+    they are the two halves of one habit: this one takes the day down, that
+    one puts it back. The sessions are listed by the window they live in
+    rather than counted, so the answer is given with the consequence in
+    view. Cancel is highlighted first: on a dialog that closes everything,
+    a stray Return must do nothing.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("q", "cancel", "Cancel", show=False),
+        Binding("enter", "select", "Choose"),
+    ]
+    CSS = """
+    CloseAllSessions { background: rgba(0, 0, 0, 0.6); align: center middle; }
+    #close-box {
+        width: 72; max-height: 26;
+        background: $surface; border: solid $warning; padding: 1 2;
+    }
+    #close-title { text-align: center; text-style: bold; }
+    #close-sub { text-align: center; color: $text-muted; padding-bottom: 1; }
+    #close-body { height: auto; max-height: 12; padding-bottom: 1; }
+    #close-options { height: auto; }
+    """
+
+    def __init__(self, plan: list[dict], pack: str = DEFAULT_PACK) -> None:
+        super().__init__()
+        self.plan = plan
+        self.pack = pack
+
+    def _summary(self) -> str:
+        groups: dict[str, list[str]] = {}
+        for e in self.plan:
+            groups.setdefault(e["group"], []).append(e["title"])
+        lines = [f"  [bold]{g:<10}[/] {', '.join(titles)}"
+                 for g, titles in groups.items()]
+        return "\n".join(lines) or "  [dim]nothing is running[/]"
+
+    def compose(self) -> ComposeResult:
+        n = len(self.plan)
+        with Vertical(id="close-box"):
+            yield Label("Close all Claude sessions?", id="close-title")
+            yield Label(f"{n} session{'s' if n != 1 else ''} · saved to "
+                        f"'{self.pack}' first, so the next launch can offer "
+                        f"them back", id="close-sub")
+            yield Static(self._summary(), id="close-body")
+            yield OptionList(
+                Option("◀   Cancel", id="cancel"),
+                Option("─" * 54, id="sep", disabled=True),
+                Option(f"✕   Close all {n}", id="close-all"),
+                id="close-options")
+        yield Footer()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(event.option.id or "cancel")
+
+    def action_select(self) -> None:
+        ol = self.query_one("#close-options", OptionList)
+        if ol.highlighted is not None:
+            self.dismiss(ol.get_option_at_index(ol.highlighted).id or "cancel")
+
+    def action_cancel(self) -> None:
+        self.dismiss("cancel")
+
+
 class ClaudeMonitor(App):
     TITLE = "Claude Monitor"
     ENABLE_COMMAND_PALETTE = False
@@ -6829,6 +6981,53 @@ class ClaudeMonitor(App):
         search_bar = self.query_one("#search-bar", Input)
         if search_bar.display or self._filter:
             self._dismiss_search()
+            return
+        # Nothing left to cancel, so Escape means the other thing it means
+        # here: take the board down. Layered this way round so Escape never
+        # reaches for the board while you are mid-search, which is the whole
+        # reputation of that key.
+        self.action_close_all()
+
+    def action_close_all(self) -> None:
+        """Ask before closing every live Claude. Always asks: this is the
+        one keystroke that ends every conversation on the machine."""
+        _refresh_pid_map()
+        plan = close_all_plan(self.sessions)
+        if not plan:
+            self.notify("Nothing running to close", timeout=3)
+            return
+        # DEFAULT_PACK, never the pack this monitor launched with: a named
+        # pack is a set Max curated on purpose and nothing automatic may
+        # overwrite it.
+        self.push_screen(CloseAllSessions(plan, DEFAULT_PACK),
+                         self._close_all_answered)
+
+    def _close_all_answered(self, choice: str | None) -> None:
+        if choice != "close-all":
+            mlog("closeall", "declined")
+            return
+        self.notify("Closing every session…", timeout=4)
+        self.run_worker(self._close_all_worker, thread=True, exit_on_error=False)
+
+    def _close_all_worker(self) -> None:
+        """Signals off the UI thread: one os.kill per session, and the pack
+        write in front of them, would stutter the table."""
+        try:
+            r = close_all_sessions(self.sessions)
+        except Exception as e:
+            mlog("closeall", "failed", error=str(e))
+            self.call_from_thread(self.notify, f"Close failed: {e}", severity="error")
+            return
+        if not r.get("ok"):
+            self.call_from_thread(
+                self.notify,
+                r.get("reason") or f"Closed {len(r['closed'])}, "
+                f"{len(r['refused'])} refused: {', '.join(r['refused'][:3])}",
+                severity="warning")
+            return
+        self.call_from_thread(
+            self.notify,
+            f"Closed {len(r['closed'])} session(s); saved to '{r['pack']}'")
 
     def action_search_to_table(self) -> None:
         # Down while typing in the search box: keep the filter, drop focus into
@@ -7929,6 +8128,30 @@ def main():
         r = delete_pack(sys.argv[2])
         print(f"Deleted pack '{sys.argv[2]}'" if r.get("ok") else r.get("reason"))
         sys.exit(0 if r.get("ok") else 1)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--close-all":
+        # Prints the plan and stops unless --yes is given. Every other verb
+        # here is additive; this one ends conversations, so the confirmation
+        # is the flag rather than a prompt (it has to work from a script).
+        sessions = parse_sessions(include_archived=False, include_subagents=False,
+                                  pinned=load_pinned_sessions())
+        r = close_all_sessions(sessions, dry_run="--yes" not in sys.argv)
+        if r.get("dry_run"):
+            if not r["planned"]:
+                print("Nothing running to close")
+                sys.exit(0)
+            print(f"Would close {r['total']} session(s), after saving them "
+                  f"to '{r['pack']}':")
+            for e in r["planned"]:
+                print(f"  [{e['group']:<10}] {e['title']}")
+            print("Add --yes to do it.")
+            sys.exit(0)
+        if not r.get("ok"):
+            print(r.get("reason") or
+                  f"Closed {len(r['closed'])}; refused: {', '.join(r['refused'])}")
+            sys.exit(1)
+        print(f"Closed {len(r['closed'])} session(s), saved to '{r['pack']}'"
+              + (f"; {len(r['gone'])} had already exited" if r["gone"] else ""))
+        sys.exit(0)
     elif len(sys.argv) > 1 and sys.argv[1] == "--restore-pack":
         # Opens windows, so it needs Apple Events: a terminal or a monitor
         # process only, never a sandboxed session (that is /monitor's job).
@@ -7956,6 +8179,7 @@ def main():
               "  --save-roster --restore-plan [--pack <name>] [--json]\n"
               "  --packs --save-pack <name> [label] --delete-pack <name>\n"
               "  --restore-pack [<name>]        open a pack now, no TUI\n"
+              "  --close-all [--yes]            close every live session\n"
               "  --pack <name>                  launch and offer that pack\n"
               "  --no-resume                    launch without the offer",
               file=sys.stderr)
