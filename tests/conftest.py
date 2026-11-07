@@ -98,6 +98,7 @@ def _isolate_monitor_state_files(tmp_path, monkeypatch):
     # not decide the next test's roster.
     monkeypatch.setattr(cm, "_seen_alive", set())
     monkeypatch.setattr(cm, "_closed_on_purpose", set())
+    monkeypatch.setattr(cm, "_last_ax_drive_at", 0.0)
 
 
 @pytest.fixture
