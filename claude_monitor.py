@@ -1422,6 +1422,34 @@ def build_session(path: str, session_id: str, project: str, idx: dict,
 
 # PID map: built once per refresh cycle to avoid re-scanning ~/.claude/sessions/
 # per-session. Maps sessionId -> alive PID (int) or None (dead/not found).
+
+# Every osascript this app runs drives System Events, an app's menus, or the
+# Accessibility tree, and macOS delivers key events to the frontmost surface
+# while a menu opens and closes. The monitor is very often that surface, so it
+# receives keystrokes of its own making. Measured 2026-11-07 01:55:13: the
+# close-all arming toast fired in the SAME MILLISECOND the jump's JXA returned,
+# four times in ten minutes, each immediately after a cross-space jump, which
+# raises its window by reading and clicking Ghostty's Window menu. Nobody
+# pressed Escape. Stamping every such call is what lets a destructive key tell
+# an Escape the app injected into itself from one Max actually typed.
+_last_ax_drive_at: float = 0.0
+AX_SETTLE_S = 2.0
+
+
+def _run_osascript(args, **kwargs):
+    global _last_ax_drive_at
+    _last_ax_drive_at = time.monotonic()
+    try:
+        return subprocess.run(args, **kwargs)
+    finally:
+        _last_ax_drive_at = time.monotonic()
+
+
+def _ax_input_may_be_echoing() -> bool:
+    """True while a key arriving now is more likely ours than Max's."""
+    return time.monotonic() - _last_ax_drive_at < AX_SETTLE_S
+
+
 _pid_map: dict[str, int | None] = {}
 _pid_map_ts: float = 0
 
@@ -3178,7 +3206,7 @@ def _raise_window_by_content(session: Session, then_text: str = "") -> bool:
     }})()"""
 
     try:
-        result = subprocess.run(
+        result = _run_osascript(
             ["osascript", "-l", "JavaScript", "-e", jxa],
             capture_output=True, text=True, timeout=10,
         )
@@ -3412,7 +3440,7 @@ def _raise_monitor_window() -> None:
         return "no_raise";
     })()'''
     try:
-        subprocess.run(
+        _run_osascript(
             ["osascript", "-l", "JavaScript", "-e", script],
             capture_output=True, timeout=5,
         )
@@ -3492,7 +3520,7 @@ def _snapshot_ghostty_layout() -> list[dict] | None:
       return JSON.stringify(out);
     })()"""
     try:
-        r = subprocess.run(["osascript", "-l", "JavaScript", "-e", jxa],
+        r = _run_osascript(["osascript", "-l", "JavaScript", "-e", jxa],
                            capture_output=True, text=True, timeout=20)
     except (subprocess.SubprocessError, OSError) as e:
         mlog("layout", "snapshot_failed", error=str(e))
@@ -4353,7 +4381,7 @@ def _ghostty_build_window(window: dict) -> str:
       return framed ? "ok" : "ok_unframed";
     }})()"""
     try:
-        r = subprocess.run(["osascript", "-l", "JavaScript", "-e", jxa],
+        r = _run_osascript(["osascript", "-l", "JavaScript", "-e", jxa],
                            capture_output=True, text=True, timeout=60)
         out = r.stdout.strip()
         if r.returncode == 0 and out in ("ok", "ok_unframed"):
@@ -4419,7 +4447,7 @@ def _frontmost_terminal_title() -> str:
         return "";
     })()"""
     try:
-        r = subprocess.run(["osascript", "-l", "JavaScript", "-e", jxa],
+        r = _run_osascript(["osascript", "-l", "JavaScript", "-e", jxa],
                            capture_output=True, text=True, timeout=5)
         return r.stdout.strip()
     except (subprocess.TimeoutExpired, OSError):
@@ -4506,7 +4534,7 @@ def _snapshot_window_sids() -> set[str]:
         return JSON.stringify(sids);
     })()"""
     try:
-        result = subprocess.run(
+        result = _run_osascript(
             ["osascript", "-l", "JavaScript", "-e", jxa],
             capture_output=True, text=True, timeout=5,
         )
@@ -4590,7 +4618,7 @@ def _auto_rename_after_resume(old_name: str, expected_sid8: str) -> None:
         return "not_found:" + marker;
     }})()"""
     try:
-        result = subprocess.run(
+        result = _run_osascript(
             ["osascript", "-l", "JavaScript", "-e", jxa],
             capture_output=True, text=True, timeout=8,
         )
@@ -4699,7 +4727,7 @@ def _open_ghostty_window(zsh_cmd: str, fallback_cmd: str) -> str:
         return "Terminal";
     }})()"""
     try:
-        result = subprocess.run(
+        result = _run_osascript(
             ["osascript", "-l", "JavaScript", "-e", jxa],
             capture_output=True, text=True, timeout=10,
         )
@@ -6829,7 +6857,7 @@ class ClaudeMonitor(App):
                      front_before=front, front_after=after)
             else:
                 try:
-                    subprocess.run(
+                    _run_osascript(
                         ["osascript", "-l", "JavaScript", "-e",
                          '(() => { const se = Application("System Events"); '
                          'se.keystroke("exit"); delay(0.05); se.keyCode(36); })()'],
@@ -7031,9 +7059,13 @@ class ClaudeMonitor(App):
             self.notify("Nothing running to close", timeout=3)
             return
         now = time.monotonic()
+        if _ax_input_may_be_echoing():
+            # We just drove System Events, which opens and closes a menu and
+            # hands keystrokes to whatever is frontmost. That is usually this
+            # window. An Escape arriving now is this app's own echo, not Max.
+            mlog("closeall", "ignored_echo_of_our_own_ax_call")
+            return
         if now - self._app_focused_at < FOCUS_SETTLE_S:
-            # Just came back to this window: the terminal's own focus
-            # reporting can surface as a bare Escape. Never the real thing.
             mlog("closeall", "ignored_just_after_focus")
             return
         if now - self._close_all_armed_at > CLOSE_ALL_ARM_S:

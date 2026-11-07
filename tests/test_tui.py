@@ -2356,3 +2356,71 @@ class TestOneEscapeIsNotEnough:
                 await settle(pilot)
                 assert not isinstance(pilot.app.screen, CloseAllSessions)
                 assert pilot.app._close_all_armed_at == 0, "it did not even arm"
+
+
+class TestAnEscapeWeInjectedIntoOurselves:
+    """The jump raises a cross-space window by reading and clicking Ghostty's
+    Window menu. macOS hands keystrokes to whatever is frontmost while a menu
+    opens and closes, and that is usually this monitor, so the app delivers
+    itself an Escape. Measured 2026-11-07: the arming toast fired in the same
+    millisecond the jump's JXA returned, four times in ten minutes."""
+
+    def _world(self, live=(), pids=None):
+        from contextlib import contextmanager
+        import claude_monitor as cm
+
+        @contextmanager
+        def _ctx():
+            with _mock_sessions(list(live)), \
+                    patch.object(cm, "_pid_map", dict(pids or {})), \
+                    patch.object(cm, "_refresh_pid_map", lambda: None), \
+                    patch.object(cm, "restore_families", return_value={"ok": False}), \
+                    patch.object(cm, "_a_monitor_is_running", return_value=False):
+                yield
+
+        return _ctx()
+
+    def _one(self):
+        return ([make_session(session_id="sid-0000", title="EBC-UHG",
+                              status="working")], {"sid-0000": 101})
+
+    def test_running_osascript_stamps_the_clock(self):
+        import claude_monitor as cm
+        cm._last_ax_drive_at = 0.0
+        assert not cm._ax_input_may_be_echoing()
+        cm._run_osascript(["true"], capture_output=True, text=True)
+        assert cm._ax_input_may_be_echoing(), "an AX call must leave a mark"
+
+    def test_the_stamp_is_left_even_when_the_call_blows_up(self):
+        import claude_monitor as cm
+        cm._last_ax_drive_at = 0.0
+        with pytest.raises(FileNotFoundError):
+            cm._run_osascript(["/nonexistent/osascript"], capture_output=True)
+        assert cm._ax_input_may_be_echoing()
+
+    async def test_escape_right_after_our_own_ax_call_does_not_even_arm(self):
+        import time as _t
+        import claude_monitor as cm
+        from claude_monitor import CloseAllSessions
+        live, pids = self._one()
+        with self._world(live, pids):
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                cm._last_ax_drive_at = _t.monotonic()   # a jump just returned
+                await pilot.press("escape", "escape")
+                await settle(pilot)
+                assert not isinstance(pilot.app.screen, CloseAllSessions)
+                assert pilot.app._close_all_armed_at == 0
+
+    async def test_escape_works_again_once_the_echo_window_passes(self):
+        import time as _t
+        import claude_monitor as cm
+        from claude_monitor import CloseAllSessions
+        live, pids = self._one()
+        with self._world(live, pids):
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                cm._last_ax_drive_at = _t.monotonic() - cm.AX_SETTLE_S - 0.1
+                await pilot.press("escape", "escape")
+                await settle(pilot)
+                assert isinstance(pilot.app.screen, CloseAllSessions)
