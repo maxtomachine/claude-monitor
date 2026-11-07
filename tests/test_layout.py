@@ -1163,3 +1163,62 @@ class TestClosingTheBoardIsReversible:
         finally:
             if proc.poll() is None:
                 proc.kill()
+
+
+class TestAClosedBoardSurvivesTheNextTick:
+    """The close is only reversible if the pack outlives the refresh that
+    lands a second later, while the sessions are still dying."""
+
+    def _world(self, tmp_path, monkeypatch, *titles):
+        import claude_monitor as cm
+        t = tmp_path / "x.jsonl"
+        t.write_text("{}")
+        sessions = [make_session(session_id=f"sid-{i:04d}", title=n,
+                                 transcript_path=str(t))
+                    for i, n in enumerate(titles)]
+        monkeypatch.setattr(cm, "_pid_map", {s.session_id: 100 + i
+                                             for i, s in enumerate(sessions)})
+        monkeypatch.setattr(cm, "_refresh_pid_map", lambda: None)
+        monkeypatch.setattr(cm.os, "kill", lambda pid, sig: None)
+        return sessions
+
+    def test_a_session_still_dying_when_the_tick_lands_stays_in_the_pack(
+            self, tmp_path, monkeypatch):
+        import claude_monitor as cm
+        sessions = self._world(tmp_path, monkeypatch, "EBC-UHG", "frontier-curve")
+        monkeypatch.setattr(cm, "_is_session_alive", lambda sid, title="": True)
+        cm.save_restore_roster(sessions, reason="tick", min_interval_s=0.0)
+
+        cm.close_all_sessions(sessions)
+        # SIGTERM is not instant. The next tick still sees them running.
+        cm.save_restore_roster(sessions, reason="tick", min_interval_s=0.0)
+        # ...and the one after that does not.
+        monkeypatch.setattr(cm, "_is_session_alive", lambda sid, title="": False)
+        cm.save_restore_roster([], reason="tick", min_interval_s=0.0)
+        cm.save_restore_roster([], reason="tick", min_interval_s=0.0)
+
+        back = sorted(e["title"] for e in cm.load_restore_roster()["sessions"])
+        assert back == ["EBC-UHG", "frontier-curve"], back
+
+    def test_an_ordinary_close_by_hand_still_drops_the_session(
+            self, tmp_path, monkeypatch):
+        """The deliberate-close mark must not turn into 'carry everything
+        forever': closing one terminal yourself still means drop it."""
+        import claude_monitor as cm
+        sessions = self._world(tmp_path, monkeypatch, "EBC-UHG")
+        monkeypatch.setattr(cm, "_is_session_alive", lambda sid, title="": True)
+        cm.save_restore_roster(sessions, reason="tick", min_interval_s=0.0)
+        monkeypatch.setattr(cm, "_is_session_alive", lambda sid, title="": False)
+        cm.save_restore_roster([], reason="tick", min_interval_s=0.0)
+        assert cm.load_restore_roster()["sessions"] == []
+
+    def test_the_mark_is_dropped_once_the_session_is_really_gone(
+            self, tmp_path, monkeypatch):
+        import claude_monitor as cm
+        sessions = self._world(tmp_path, monkeypatch, "EBC-UHG")
+        monkeypatch.setattr(cm, "_is_session_alive", lambda sid, title="": True)
+        cm.close_all_sessions(sessions)
+        assert cm._closed_on_purpose == {"sid-0000"}
+        monkeypatch.setattr(cm, "_is_session_alive", lambda sid, title="": False)
+        cm.save_restore_roster([], reason="tick", min_interval_s=0.0)
+        assert cm._closed_on_purpose == set(), "the mark outlived the dying"
