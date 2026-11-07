@@ -3666,6 +3666,8 @@ DEFAULT_PACK = "last"
 # restore candidate. Without a limit, a conversation abandoned in March would
 # still be offered back in November.
 PACK_CARRY_MAX_AGE_S = 14 * 24 * 3600
+CLOSE_ALL_ARM_S = 2.5     # Escape, then Escape again within this, to open the dialog
+FOCUS_SETTLE_S = 1.0      # Escapes arriving this soon after the window regains focus
 _roster_last_write: list = ["", 0.0]  # [fingerprint, monotonic seconds]
 # The sids THIS process has watched running. The difference between "I saw it
 # alive and then it went away" (Max closed it, drop it) and "it was already
@@ -3673,6 +3675,15 @@ _roster_last_write: list = ["", 0.0]  # [fingerprint, monotonic seconds]
 # reason the pack survives a relaunch, and a process-local set is the only
 # place that difference exists.
 _seen_alive: set[str] = set()
+# Sids this process closed ON PURPOSE that have not died yet. SIGTERM is not
+# instant, so the tick landing a second later still sees them running and
+# would put them straight back into _seen_alive; the carry rule would then
+# drop them the moment they finally exited. That is what happened on
+# 2026-11-07 at 01:23: ten sessions closed, the pack saved, and every one of
+# them gone from it by the next refresh, so the close was not reversible
+# after all. A sid leaves this set as soon as it is seen dead, which is when
+# the ordinary rules can take over again.
+_closed_on_purpose: set[str] = set()
 
 
 def _roster_entry(s: Session, now: float | None = None) -> dict:
@@ -3831,7 +3842,14 @@ def save_restore_roster(sessions: list[Session], reason: str = "tick",
         e = _roster_entry(s, now)
         live.append(e)
         live_sids.add(e["sid"])
-    _seen_alive.update(live_sids)
+    # A session closed on purpose is in that set only while it is dying. Once
+    # it is actually gone, forget both facts: it is an ordinary entry waiting
+    # to be restored, which is what the carry rule is for.
+    done_dying = _closed_on_purpose - live_sids
+    if done_dying:
+        _seen_alive.difference_update(done_dying)
+        _closed_on_purpose.difference_update(done_dying)
+    _seen_alive.update(live_sids - _closed_on_purpose)
     data = load_packs()
     stored = (data.get("packs", {}).get(pack) or {}).get("sessions") or []
     carried = [e for e in stored
@@ -4090,6 +4108,7 @@ def close_all_sessions(sessions: list[Session], *, pack: str = DEFAULT_PACK,
     # sees them as carryable.
     for e in plan:
         _seen_alive.discard(e["sid"])
+        _closed_on_purpose.add(e["sid"])
 
     closed: list[str] = []
     refused: list[str] = []
@@ -5848,6 +5867,8 @@ class ClaudeMonitor(App):
         self._resume_offered = False
         self._resume_prompt = True
         self._resume_pack = DEFAULT_PACK
+        self._close_all_armed_at = 0.0
+        self._app_focused_at = 0.0
 
     def notify(self, message, *, timeout: float | None = 5, **kwargs):
         """Override to log every toast notification."""
@@ -6988,14 +7009,40 @@ class ClaudeMonitor(App):
         # reputation of that key.
         self.action_close_all()
 
+    def on_app_focus(self, event) -> None:
+        self._app_focused_at = time.monotonic()
+
     def action_close_all(self) -> None:
-        """Ask before closing every live Claude. Always asks: this is the
-        one keystroke that ends every conversation on the machine."""
+        """Ask before closing every live Claude, and make Escape earn it.
+
+        One Escape is not enough. Escape is the key every terminal habit
+        reaches for after anything at all, and jumping to another window and
+        back delivers one by itself often enough to matter: on 2026-11-07 the
+        dialog opened by itself four times in ten minutes, each time a few
+        seconds after a jump, and before that it took the whole board down.
+        So the first Escape only arms the action and says so, and the second
+        within a couple of seconds opens the dialog. A stray one is then a
+        line in the corner that expires, which is what a stray keystroke
+        should cost.
+        """
         _refresh_pid_map()
         plan = close_all_plan(self.sessions)
         if not plan:
             self.notify("Nothing running to close", timeout=3)
             return
+        now = time.monotonic()
+        if now - self._app_focused_at < FOCUS_SETTLE_S:
+            # Just came back to this window: the terminal's own focus
+            # reporting can surface as a bare Escape. Never the real thing.
+            mlog("closeall", "ignored_just_after_focus")
+            return
+        if now - self._close_all_armed_at > CLOSE_ALL_ARM_S:
+            self._close_all_armed_at = now
+            self.notify(f"Escape again to close all {len(plan)} session"
+                        f"{'s' if len(plan) != 1 else ''}",
+                        timeout=CLOSE_ALL_ARM_S)
+            return
+        self._close_all_armed_at = 0.0
         # DEFAULT_PACK, never the pack this monitor launched with: a named
         # pack is a set Max curated on purpose and nothing automatic may
         # overwrite it.

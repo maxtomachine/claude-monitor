@@ -97,6 +97,7 @@ def _isolate_monitor_state_files(tmp_path, monkeypatch):
     # decides what a tick carries forward, so one test's sightings must
     # not decide the next test's roster.
     monkeypatch.setattr(cm, "_seen_alive", set())
+    monkeypatch.setattr(cm, "_closed_on_purpose", set())
 
 
 @pytest.fixture

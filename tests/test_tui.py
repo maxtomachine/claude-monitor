@@ -2195,6 +2195,8 @@ class TestEscapeClosesTheBoard:
                 await settle(pilot)
                 await pilot.press("escape")
                 await settle(pilot)
+                await pilot.press("escape")
+                await settle(pilot)
                 assert isinstance(pilot.app.screen, CloseAllSessions)
 
     async def test_the_dialog_lists_what_would_close(self):
@@ -2204,7 +2206,7 @@ class TestEscapeClosesTheBoard:
         with self._world(live, pids):
             async with ClaudeMonitor().run_test() as pilot:
                 await settle(pilot)
-                await pilot.press("escape")
+                await pilot.press("escape", "escape")
                 await settle(pilot)
                 text = pilot.app.screen._summary()
                 assert "EBC-UHG" in text and "EBC-Qantas" in text and "frontier-curve" in text
@@ -2231,7 +2233,7 @@ class TestEscapeClosesTheBoard:
                 patch.object(cm, "close_all_sessions") as closer:
             async with ClaudeMonitor().run_test() as pilot:
                 await settle(pilot)
-                await pilot.press("escape")
+                await pilot.press("escape", "escape")
                 await settle(pilot)
                 await pilot.press("enter")     # whatever is highlighted first
                 await settle(pilot)
@@ -2244,7 +2246,7 @@ class TestEscapeClosesTheBoard:
                 patch.object(cm, "close_all_sessions") as closer:
             async with ClaudeMonitor().run_test() as pilot:
                 await settle(pilot)
-                await pilot.press("escape")
+                await pilot.press("escape", "escape")
                 await settle(pilot)
                 await pilot.press("escape")
                 await settle(pilot)
@@ -2261,7 +2263,7 @@ class TestEscapeClosesTheBoard:
                  "gone": [], "planned": [], "total": 1}):
             async with ClaudeMonitor().run_test() as pilot:
                 await settle(pilot)
-                await pilot.press("escape")
+                await pilot.press("escape", "escape")
                 await settle(pilot)
                 await pilot.press("down")   # skips the separator, lands on Close all
                 await pilot.press("enter")
@@ -2287,6 +2289,70 @@ class TestEscapeClosesTheBoard:
             async with ClaudeMonitor().run_test() as pilot:
                 pilot.app._resume_pack = "rooms"
                 await settle(pilot)
-                await pilot.press("escape")
+                await pilot.press("escape", "escape")
                 await settle(pilot)
                 assert pilot.app.screen.pack == DEFAULT_PACK
+
+
+class TestOneEscapeIsNotEnough:
+    """Escape is the key every terminal reflex reaches for, and a jump to
+    another window and back delivers one by itself. It arms, it does not
+    fire."""
+
+    def _world(self, live=(), pids=None):
+        from contextlib import contextmanager
+        import claude_monitor as cm
+
+        @contextmanager
+        def _ctx():
+            with _mock_sessions(list(live)), \
+                    patch.object(cm, "_pid_map", dict(pids or {})), \
+                    patch.object(cm, "_refresh_pid_map", lambda: None), \
+                    patch.object(cm, "restore_families", return_value={"ok": False}), \
+                    patch.object(cm, "_a_monitor_is_running", return_value=False):
+                yield
+
+        return _ctx()
+
+    def _one(self):
+        return ([make_session(session_id="sid-0000", title="EBC-UHG",
+                              status="working")], {"sid-0000": 101})
+
+    async def test_one_escape_only_arms_it(self):
+        from claude_monitor import CloseAllSessions
+        live, pids = self._one()
+        with self._world(live, pids):
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("escape")
+                await settle(pilot)
+                assert not isinstance(pilot.app.screen, CloseAllSessions)
+                assert pilot.app._close_all_armed_at > 0
+
+    async def test_a_second_escape_long_after_the_first_only_rearms(self):
+        import claude_monitor as cm
+        from claude_monitor import CloseAllSessions
+        live, pids = self._one()
+        with self._world(live, pids):
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                await pilot.press("escape")
+                await settle(pilot)
+                # the arming expires
+                pilot.app._close_all_armed_at -= cm.CLOSE_ALL_ARM_S + 1
+                await pilot.press("escape")
+                await settle(pilot)
+                assert not isinstance(pilot.app.screen, CloseAllSessions)
+
+    async def test_an_escape_just_after_the_window_regains_focus_is_ignored(self):
+        import time as _t
+        from claude_monitor import CloseAllSessions
+        live, pids = self._one()
+        with self._world(live, pids):
+            async with ClaudeMonitor().run_test() as pilot:
+                await settle(pilot)
+                pilot.app._app_focused_at = _t.monotonic()
+                await pilot.press("escape", "escape")
+                await settle(pilot)
+                assert not isinstance(pilot.app.screen, CloseAllSessions)
+                assert pilot.app._close_all_armed_at == 0, "it did not even arm"
