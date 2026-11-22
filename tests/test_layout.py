@@ -18,6 +18,21 @@ from claude_monitor import (
 )
 from tests.helpers import make_session
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _cc_shell_installed(tmp_path_factory, monkeypatch):
+    """Restore-plan commands depend on whether cc-shell is installed, and
+    only Max's work machine has the real one, so asserts written against the
+    CC_RESUME= form ran the fallback path everywhere else: CI was red from
+    the day they landed (runs 69-71) and the personal machine failed the
+    same four. Pin an installed launcher so the suite answers the same on
+    every machine; tests of the fallback re-patch CC_SHELL themselves."""
+    shell = tmp_path_factory.mktemp("launcher") / "cc-shell"
+    shell.write_text("#!/bin/zsh\n")
+    monkeypatch.setattr(cm, "CC_SHELL", shell)
+
 
 def _raw(*windows):
     return list(windows)
@@ -779,9 +794,10 @@ class TestEveryEBCLandsInOneWindow:
 
 class TestARestoredSessionNeverLandsInTheCloud:
     """Max, 2026-10-21 and again 2026-10-26: every launch runs on this Mac.
-    cc-shell carries --local on both of its exec lines and cc-spawn refuses
-    a launcher that has lost it; the monitor's own resume was still building
-    a bare `claude --resume`, which takes the cloud default."""
+    The spelling changed on 2026-11-22: the CLI split local and cloud, local
+    became the default and `--local` stopped being a flag, so the explicit
+    fallback crashed every respawn ("error: unknown option '--local'").
+    A bare `claude --resume` is now the local launch."""
 
     def test_resume_goes_through_the_one_launcher(self, tmp_path):
         shell = tmp_path / "cc-shell"
@@ -789,24 +805,14 @@ class TestARestoredSessionNeverLandsInTheCloud:
         with patch.object(cm, "CC_SHELL", shell):
             cmd = cm._launch_command_for_resume("cafecafe-0000-0000-0000-000000000000")
         assert cmd == f"CC_RESUME=cafecafe-0000-0000-0000-000000000000 exec {shell}"
-        assert "claude --resume" not in cmd  # never the bare, cloud-defaulting form
+        assert "claude --resume" not in cmd  # cc-shell owns the flags when installed
 
-    def test_without_cc_shell_the_local_flag_is_spelled_out(self, tmp_path):
+    def test_without_cc_shell_the_fallback_is_a_plain_resume(self, tmp_path):
+        """--local is not a flag the CLI knows anymore; it must not reappear."""
         with patch.object(cm, "CC_SHELL", tmp_path / "not-installed"):
             cmd = cm._launch_command_for_resume("cafecafe-0000-0000-0000-000000000000")
-        assert "--local" in cmd
-        assert cmd == "claude --local --resume cafecafe-0000-0000-0000-000000000000"
-
-    def test_the_real_cc_shell_still_carries_the_local_flag(self):
-        """Guards the launcher itself, not just our call into it: if someone
-        edits cc-shell and drops --local, every resume goes to the cloud and
-        nothing else in this repo would notice."""
-        if not cm.CC_SHELL.exists():
-            return
-        execs = [ln for ln in cm.CC_SHELL.read_text().splitlines()
-                 if ln.strip().startswith("exec claude")]
-        assert execs, "cc-shell has no exec claude line"
-        assert all("--local" in ln for ln in execs), execs
+        assert "--local" not in cmd
+        assert cmd == "claude --resume cafecafe-0000-0000-0000-000000000000"
 
     def test_a_sibling_row_still_resumes_the_bare_conversation_id(self, tmp_path):
         shell = tmp_path / "cc-shell"
