@@ -1803,7 +1803,7 @@ class TestResumeCommandForSiblingRows:
         cmd, cwd = _resume_command_for(sib)
         assert "cafecafe-0000@12345" not in cmd
         assert cmd.startswith("CC_RESUME=cafecafe-0000 ") or \
-            cmd == "claude --local --resume cafecafe-0000"
+            cmd == "claude --resume cafecafe-0000"
         assert cwd == str(Path.home())
 
     def test_resume_falls_back_to_home_when_every_cwd_candidate_is_gone(self):

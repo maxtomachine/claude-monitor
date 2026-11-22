@@ -124,7 +124,7 @@ RESTORE_PATH = _STATE_HOME / "monitor-restore.json"
 SCAN_CACHE_PATH = _STATE_HOME / "monitor-scan-cache.json"
 # The one launcher: cc-spawn hands every surface it opens to this script, and
 # the monitor's own resumes go through it too so the two cannot drift apart
-# on flags (--local above all; see _launch_command_for_resume).
+# on flags (see _launch_command_for_resume).
 CC_SHELL = Path.home() / ".local" / "bin" / "cc-shell"
 BELL_DECAY_S = 300
 
@@ -4640,20 +4640,22 @@ def _launch_command_for_resume(sid: str) -> str:
 
     Goes through cc-shell, the single launcher cc-spawn hands every surface
     it opens to, so a resume started from the monitor carries exactly the
-    flags a resume started from /spawn carries. The one that matters is
-    `--local`: Max's ruling of 2026-10-21, restated 2026-10-26, is that
-    every launch runs on this Mac. A bare `claude --resume` takes the cloud
-    default, and a cloud session has none of his skills, memory store or
-    ~/EBCs -- the Trafigura room of 2026-10-16 was lost that way. This path
-    was still building a bare `claude --resume`, so the monitor's Resume and
-    its layout restore were the last two routes that could put a session in
-    the cloud. Falling back to an explicit `claude --local --resume` when
-    cc-shell is not installed keeps the flag either way.
+    flags a resume started from /spawn carries. The flag history matters:
+    Max's ruling of 2026-10-21, restated 2026-10-26, was that every launch
+    runs on this Mac, spelled `claude --local --resume` when cc-shell is
+    not installed (a cloud session has none of his skills, memory store or
+    ~/EBCs -- the Trafigura room of 2026-10-16 was lost that way). The CLI
+    has since split local and cloud: local is the default and `--local` is
+    no longer a flag at all, so on a machine without cc-shell the fallback
+    died on every respawn with "error: unknown option '--local'" (Max,
+    2026-11-22: "an artifact of my work set up ... remove the local flag").
+    A bare `claude --resume` IS the local launch now; the ruling holds,
+    the spelling changed.
     """
     quoted = shlex.quote(sid)
     if CC_SHELL.exists():
         return f"CC_RESUME={quoted} exec {shlex.quote(str(CC_SHELL))}"
-    return f"claude --local --resume {quoted}"
+    return f"claude --resume {quoted}"
 
 
 def _resume_command_for(session: Session) -> tuple[str, str]:
